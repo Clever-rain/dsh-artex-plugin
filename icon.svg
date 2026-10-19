@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="ARTEX orchestration">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#111827"/>
+  <path d="M19 22 H37" stroke="#f59e0b" stroke-width="3" stroke-linecap="round" opacity="0.9"/>
+  <path d="M19 22 L27 43" stroke="#60a5fa" stroke-width="3" stroke-linecap="round" opacity="0.85"/>
+  <path d="M37 22 L27 43" stroke="#34d399" stroke-width="3" stroke-linecap="round" opacity="0.85"/>
+  <circle cx="17" cy="21" r="7" fill="#f59e0b"/>
+  <circle cx="38" cy="21" r="5.5" fill="#60a5fa"/>
+  <circle cx="27" cy="45" r="6.5" fill="#34d399"/>
+  <circle cx="17" cy="21" r="2.4" fill="#111827"/>
+  <circle cx="38" cy="21" r="2.0" fill="#111827"/>
+  <circle cx="27" cy="45" r="2.2" fill="#111827"/>
+</svg>

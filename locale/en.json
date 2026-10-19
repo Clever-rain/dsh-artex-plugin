@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ARTEX Orchestration",
+    "description": "Dual-graph planner/worker orchestration for DSH: an event-driven planner dispatches intents, concurrent workers execute and write evidence back, and goals complete only when proven."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ARTEX 编排",
+    "description": "把 ARTEX 的双图 planner/worker 编排带进 DSH：事件驱动的规划者派发意图，多个执行者并发执行并写回证据，目标被证明后任务才完成。"
+  }
+}

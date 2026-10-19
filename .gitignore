@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# runtime data produced by the plugin
+.artex/
+
+# deps (the plugin itself has none)
+node_modules/
+
+# logs / temp
+*.log
+*.tmp

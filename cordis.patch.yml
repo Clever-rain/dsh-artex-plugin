@@ -1,0 +1,15 @@
+- insert:
+    - id: artex-orchestration
+      name: '@local/dsh-artex'
+      config:
+        provider: spawn
+        maxWorkers: 3
+        maxRounds: 24
+        maxStalls: 2
+        debounceMs: 800
+        heartbeatMs: 600000
+        workerTimeoutMs: 1200000
+        plannerTimeoutMs: 900000
+        settleGraceMs: 90000
+        budgetMs: 0
+        isolateWorkdir: false
