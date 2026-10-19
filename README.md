@@ -103,9 +103,11 @@ DSH 没有 "Go goroutine + Postgres"，但有三样正好够用的原语：**子
 
 ## 4. 安装与使用
 
+本目录是一个**独立仓库**，同时就是插件包根目录（`package.json` 里的 `dsh.bundle.patch` 指向本目录的 `cordis.patch.yml`）。
+
 ```powershell
-# 在本 profile 里安装（绝对路径指向本目录）
-# plugin_manager action: install_bundle, target: <repo>/dsh-artex-plugin
+# 在本 profile 里安装：target 指向本仓库根目录
+# plugin_manager action: install_bundle, target: <path>/dsh-artex-plugin
 ```
 
 安装后新会话即可看到 `artex_*` 工具。示例：
