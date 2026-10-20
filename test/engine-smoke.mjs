@@ -36,6 +36,7 @@ const subagents = {
           },
         )
         if (isPlanner) {
+          engine.setBrief(task, `## 已确认\n- 事实 ${task.facts.length} 条\n## 下一步\n- 推进目标`, [])
           const unusedFact = task.facts.find(f => !task.goals.some(g => g.evidence === f.id))
           const unusedFinding = task.findings.find(f => !task.goals.some(g => g.evidence === f.id))
           if (unusedFact) engine.proveGoal(task, task.goals[0].id, unusedFact.id, '事实证明')
@@ -43,7 +44,7 @@ const subagents = {
           const busy = task.intents.some(i => i.state === 'open' || i.state === 'running')
           const unmet = task.goals.filter(g => g.status !== 'met')
           if (unmet.length > 0 && !busy) {
-            engine.addIntents(task, [{ summary: `推进：${unmet[0].text}` }])
+            engine.addIntents(task, [{ summary: `推进：${unmet[0].text}`, kind: 'pursue' }])
           }
         } else {
           // 模拟一个 worker 的工具调用过程，验证过程索引
@@ -56,7 +57,7 @@ const subagents = {
             { type: 'tool/result', data: { message: { toolCallId: 'c1', content: [{ type: 'text', text: 'hello-trace output' }] } } },
           )
           if (task.facts.length === 0) {
-            engine.recordFacts(task, [{ summary: '证据 A', evidence: 'bash echo', confidence: 'observed' }], role.intentId)
+            engine.recordFacts(task, [{ summary: '证据 A', evidence: 'bash echo', confidence: 'observed', outcome: 'found' }], role.intentId)
           } else {
             engine.recordFinding(task, { title: '成果 B', severity: 'high', evidence: 'repro', intentId: role.intentId })
           }
@@ -99,6 +100,8 @@ try {
   const task = await Promise.race([rt.done, sleep(8000).then(() => null)])
   assert.ok(task, 'engine did not finish in time')
   assert.equal(task.status, 'completed', `status=${task.status} detail=${task.finishDetail}`)
+  assert.equal(task.mode, 'objective')
+  assert.ok(task.brief?.text, 'planner brief 未写入')
   assert.equal(task.goals.every(g => g.status === 'met'), true)
   assert.equal(task.facts.length, 1)
   assert.equal(task.findings.length, 1)

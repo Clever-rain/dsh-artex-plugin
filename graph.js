@@ -34,6 +34,9 @@ export function createTask(input) {
     cwd: input.cwd,
     outDir: input.outDir,
     status: 'created',
+    mode: input.mode === 'audit' ? 'audit' : 'objective',
+    brief: undefined,
+    lastPlannerRoundAt: 0,
     createdAt: now(),
     updatedAt: now(),
     limits: { ...input.limits },
@@ -121,7 +124,11 @@ export function addIntents(task, items, options = {}) {
     const intent = {
       id: nextNodeId(task),
       summary,
-      state: 'open',
+      state: raw?.state === 'blueprint' ? 'blueprint' : 'open',
+      kind: raw?.kind === 'enumerate' || raw?.kind === 'pursue'
+        ? raw.kind
+        : (task.mode === 'audit' ? 'enumerate' : 'pursue'),
+      pathParent: normalizeIntentRef(task, raw?.path_parent ?? raw?.pathParent),
       priority: Number.isFinite(raw?.priority) ? raw.priority : 5,
       resourceIds: normalizeIds(raw?.resource_ids),
       parents: normalizeIds(raw?.parents),
@@ -131,14 +138,22 @@ export function addIntents(task, items, options = {}) {
       worker: undefined,
       output: undefined,
       writes: { facts: 0, findings: 0, resources: 0 },
+      outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 },
       reason: undefined,
     }
     task.intents.push(intent)
     task.stats.intents += 1
-    out.push({ id: intent.id, summary })
+    out.push({ id: intent.id, summary, state: intent.state, kind: intent.kind })
   }
   task.updatedAt = now()
   return out
+}
+
+/** 只接受本任务里已存在的意图 id；非法值归 null。 */
+function normalizeIntentRef(task, value) {
+  const id = Number(value)
+  if (!Number.isFinite(id) || id <= 0) return null
+  return task.intents.some(i => i.id === id) ? id : null
 }
 
 function normalizeIds(value) {
@@ -176,6 +191,7 @@ export function recordFact(task, input) {
     detail: input.detail ? String(input.detail) : '',
     evidence: input.evidence ? String(input.evidence) : '',
     confidence: input.confidence === 'inferred' ? 'inferred' : 'observed',
+    outcome: ['found', 'none', 'inconclusive', 'blueprint'].includes(input.outcome) ? input.outcome : undefined,
     intentId: input.intentId ? Number(input.intentId) : null,
     resourceIds: normalizeIds(input.resourceIds),
     createdAt: now(),
@@ -184,7 +200,11 @@ export function recordFact(task, input) {
   task.stats.facts += 1
   if (fact.intentId) {
     const intent = intentById(task, fact.intentId)
-    if (intent) intent.writes.facts += 1
+    if (intent) {
+      intent.writes.facts += 1
+      if (!intent.outcomes) intent.outcomes = { found: 0, none: 0, inconclusive: 0, blueprint: 0 }
+      if (fact.outcome) intent.outcomes[fact.outcome] += 1
+    }
   }
   task.updatedAt = now()
   return fact
@@ -231,8 +251,31 @@ export function setTodos(task, items) {
   return task.todos
 }
 
-export function proveGoal(task, goalId, evidenceId, reason) {
-  const goal = task.goals.find(g => g.id === Number(goalId))
+/** 规划者维护的全局认知：整体替换、按轮次版本化（与 todos 同为"综合"而非"追加"）。 */
+export function setBrief(task, text, citations = []) {
+  const clean = String(text || '').trim()
+  if (!clean) return undefined
+  task.brief = {
+    text: truncate(clean, 2000),
+    round: task.round,
+    updatedAt: now(),
+    citations: normalizeIds(citations),
+  }
+  task.updatedAt = now()
+  return task.brief
+}
+
+/** 把 blueprint 提升为 open，进入 frontier。 */
+export function promoteIntent(task, id) {
+  const intent = intentById(task, id)
+  if (!intent) return { ok: false, error: `意图 #${id} 不存在` }
+  if (intent.state !== 'blueprint') return { ok: false, error: `意图 #${id} 不是 blueprint（当前 ${intent.state}）` }
+  intent.state = 'open'
+  task.updatedAt = now()
+  return { ok: true, intent }
+}
+
+export function proveGoal(task, goalId, evidenceId, reason) {  const goal = task.goals.find(g => g.id === Number(goalId))
   if (!goal) return { ok: false, error: `goal #${goalId} 不存在` }
   const evidence = nodeById(task, evidenceId)
   const evidenceKind = nodeKind(task, evidenceId)
@@ -339,24 +382,82 @@ export function overview(task, options = {}) {
   }
 }
 
+/** 确定性事实底数：不产生判断，只统计，供规划者校准 brief。 */
+export function digestOf(task) {
+  const byOutcome = { found: 0, none: 0, inconclusive: 0, blueprint: 0, unset: 0 }
+  for (const f of task.facts) {
+    const key = f.outcome || 'unset'
+    byOutcome[key] = (byOutcome[key] || 0) + 1
+  }
+  const states = {}
+  for (const i of task.intents) states[i.state] = (states[i.state] || 0) + 1
+  return {
+    mode: task.mode,
+    facts: { total: task.facts.length, by_outcome: byOutcome },
+    findings: task.findings.length,
+    intents: states,
+    failed_paths: task.intents
+      .filter(i => i.state === 'failed')
+      .slice(-6)
+      .map(i => ({ id: i.id, summary: truncate(i.summary, 100), reason: i.reason })),
+    resources: task.stats.resources,
+  }
+}
+
+/** 本轮增量：上一次规划之后新增的事实/发现/结束的意图。 */
+export function deltaOf(task, since) {
+  const at = Number(since) || 0
+  return {
+    since: at > 0 ? new Date(at).toISOString() : '(任务开始)',
+    facts: task.facts.filter(f => f.createdAt > at).slice(-10).map(f => ({
+      id: f.id,
+      summary: truncate(f.summary, 120),
+      confidence: f.confidence,
+      outcome: f.outcome,
+      intent_id: f.intentId,
+    })),
+    findings: task.findings.filter(f => f.createdAt > at).slice(-5).map(f => ({
+      id: f.id,
+      title: truncate(f.title, 100),
+      severity: f.severity,
+      intent_id: f.intentId,
+    })),
+    intents: task.intents.filter(i => i.endedAt && i.endedAt > at).slice(-8).map(i => ({
+      id: i.id,
+      state: i.state,
+      summary: truncate(i.summary, 100),
+      reason: i.reason,
+    })),
+  }
+}
+
 /**
  * 规划者视图：只保留"派意图 / 判目标"需要的字段。
- * 去掉与提示词正文重复的 task/constraints/todos，省略空血缘与零写回计数。
+ * brief 由提示词正文单独渲染，不在这里重复；digest/delta 由引擎注入。
  */
 export function plannerView(task, options = {}) {
-  const factsLimit = Math.max(1, Math.min(50, options.factsLimit ?? 12))
+  const factsLimit = Math.max(1, Math.min(50, options.factsLimit ?? 5))
   const q = options.factsQ ? String(options.factsQ).toLowerCase() : ''
   const facts = q ? task.facts.filter(f => `${f.summary}\n${f.detail}`.toLowerCase().includes(q)) : task.facts
-  const brief = (intent, withState = false) => {
+  const briefRow = (intent, withState = false) => {
     const row = { id: intent.id, summary: truncate(intent.summary, 160) }
+    if (intent.kind === 'pursue') row.kind = 'pursue'
+    if (intent.pathParent) row.path_parent = intent.pathParent
     if (intent.parents.length > 0) row.parents = intent.parents
     const yields = intentYields(task, intent.id)
     if (yields.length > 0) row.yields = yields
     if (intent.writes.facts || intent.writes.findings || intent.writes.resources) row.writes = intent.writes
-    if (withState) row.state = intent.state
+    if (withState) {
+      row.state = intent.state
+      if (intent.reason) row.reason = intent.reason
+    }
     return row
   }
   return {
+    mode: task.mode,
+    stale_brief: options.staleBrief === true,
+    digest: options.digest || digestOf(task),
+    delta: options.delta,
     goals: task.goals.map(g => ({
       id: g.id,
       text: g.text,
@@ -364,13 +465,14 @@ export function plannerView(task, options = {}) {
       ...(g.evidence ? { evidence: g.evidence } : {}),
     })),
     intents: {
-      open: openIntents(task).map(i => brief(i)),
-      running: runningIntents(task).map(i => brief(i)),
+      open: openIntents(task).map(i => briefRow(i)),
+      running: runningIntents(task).map(i => briefRow(i)),
+      blueprints: task.intents.filter(i => i.state === 'blueprint').slice(-10).map(i => briefRow(i)),
       recent_done: task.intents
-        .filter(i => ['done', 'exhausted', 'blocked', 'stopped'].includes(i.state))
+        .filter(i => ['done', 'failed', 'exhausted', 'blocked', 'stopped'].includes(i.state))
         .slice(-6)
         .reverse()
-        .map(i => brief(i, true)),
+        .map(i => briefRow(i, true)),
     },
     facts: {
       total: task.facts.length,
@@ -378,6 +480,7 @@ export function plannerView(task, options = {}) {
         id: f.id,
         summary: truncate(f.summary, 160),
         confidence: f.confidence,
+        outcome: f.outcome,
         intent_id: f.intentId,
       })),
     },
@@ -392,28 +495,35 @@ export function plannerView(task, options = {}) {
 }
 
 /**
- * 执行者视图：只保留"别重复、别越界"所需的最小态势。
- * 目标是给方向感而不是给全图；别人的完整意图只留一句摘要。
+ * 执行者视图：只保留"别重复、别越界"所需的最小态势，外加共享的全局认知摘要。
  */
 export function workerView(task, intent, options = {}) {
   const factsLimit = Math.max(1, Math.min(20, options.factsLimit ?? 5))
   const others = task.intents.filter(i => i.state === 'running' && i.id !== intent.id)
-  const done = task.intents.filter(i => ['done', 'exhausted', 'blocked', 'stopped'].includes(i.state)).slice(-3)
+  const done = task.intents.filter(i => ['done', 'failed', 'exhausted', 'blocked', 'stopped'].includes(i.state)).slice(-3)
   const view = {
+    mode: task.mode,
+    kind: intent.kind,
     goals: task.goals.map(g => `${g.id}.[${g.status}] ${truncate(g.text, 80)}`),
     facts_total: task.facts.length,
     findings_total: task.findings.length,
-    facts_recent: task.facts.slice(-factsLimit).reverse().map(f => `#${f.id} [${f.confidence}] ${truncate(f.summary, 80)}`),
+    facts_recent: task.facts.slice(-factsLimit).reverse().map(f => `#${f.id} [${f.confidence}${f.outcome ? `/${f.outcome}` : ''}] ${truncate(f.summary, 80)}`),
     findings: task.findings.slice(-8).map(f => `#${f.id} ${truncate(f.title, 60)}`),
   }
-  if (others.length > 0) view.running_others = others.map(i => `#${i.id} ${truncate(i.summary, 90)}`)
+  if (intent.pathParent) {
+    const parent = intentById(task, intent.pathParent)
+    if (parent) view.path = `#${parent.id} ${truncate(parent.summary, 100)}`
+  }
+  if (task.brief?.text) view.brief = truncate(task.brief.text, 600)
+  if (others.length > 0) view.running_others = others.map(i => `#${i.id} ${truncate(i.summary, 70)}`)
   if (done.length > 0) view.recent_done = done.map(i => `#${i.id} ${i.state} ${truncate(i.summary, 60)}`)
   if (task.hints.length > 0) view.hints = task.hints.map(h => truncate(h.text, 100))
   return view
 }
 
 /** Full node content for node_detail. */
-export function detail(task, id) {  const n = nodeById(task, id)
+export function detail(task, id) {
+  const n = nodeById(task, id)
   if (!n) return undefined
   const kind = nodeKind(task, id)
   const base = { ...n, kind }

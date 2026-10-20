@@ -20,9 +20,10 @@ import {
   createTask, addIntents as graphAddIntents, addActivity as graphAddActivity, addHint as graphAddHint,
   claimIntent, finishIntent, allGoalsMet, plannerView, workerView, recordFact as graphRecordFact,
   reportFinding as graphReportFinding, setTodos as graphSetTodos, proveGoal as graphProveGoal,
+  digestOf, deltaOf, setBrief as graphSetBrief, promoteIntent as graphPromoteIntent,
   openIntents, runningIntents,
 } from './graph.js'
-import { plannerPrompt, workerPrompt, settlePrompt, formatReport } from './prompts.js'
+import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
 
 export const DEFAULTS = {
   /** ctx.subagents provider；默认 in-process spawn。 */
@@ -41,8 +42,12 @@ export const DEFAULTS = {
   workerTimeoutMs: 1200000,
   /** 单轮 planner 的墙钟预算（ARTEX planner 自身不限，这里给安全阀）。 */
   plannerTimeoutMs: 900000,
+  /** 默认任务模式：objective=达成目的；audit=覆盖评估。 */
+  mode: 'objective',
   /** 预算耗尽后的收尾宽限（ARTEX settleDrainGrace 90s）。 */
   settleGraceMs: 90000,
+  /** 突破后等待兄弟路径写回现场的宽限。 */
+  breakthroughGraceMs: 30000,
   /** 任务级预算；0 = 不限。 */
   budgetMs: 0,
   /** worker/planner 是否在任务目录下的独立 cwd 里工作（ARTEX 语义）；默认继承工作区。 */
@@ -58,7 +63,7 @@ export const PLANNER_DENY = [
 /** worker 不该拥有的规划/控制型工具（ARTEX：worker 不产意图、不判目标）。 */
 export const WORKER_DENY = [
   'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
-  'artex_add_intent', 'artex_prove_goal', 'artex_set_todos',
+  'artex_add_intent', 'artex_prove_goal', 'artex_set_todos', 'artex_set_brief', 'artex_promote_intent',
 ]
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(ms, 2 ** 31 - 1))))
@@ -154,7 +159,7 @@ export class ArtexEngine {
 
   /* --------------------------------------------------------------- lifecycle */
 
-  async startTask({ agent, goal, description, goals, constraints, limits = {}, signal }) {
+  async startTask({ agent, goal, description, goals, constraints, mode, limits = {}, signal }) {
     if (this.disposed) throw new Error('ARTEX 插件已卸载')
     if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
     if (!String(goal || '').trim()) throw new Error('goal 不能为空')
@@ -172,6 +177,7 @@ export class ArtexEngine {
       goal: String(goal).trim(),
       goals,
       constraints,
+      mode: mode === 'audit' ? 'audit' : 'objective',
       ownerSession: agent.id,
       cwd,
       outDir: stores.tasks.taskDir(id),
@@ -184,6 +190,7 @@ export class ArtexEngine {
         workerTimeoutMs: Math.max(0, Number(merged.workerTimeoutMs) || 0),
         plannerTimeoutMs: Math.max(0, Number(merged.plannerTimeoutMs) || 0),
         settleGraceMs: Math.max(0, Number(merged.settleGraceMs) || 0),
+        breakthroughGraceMs: Math.max(0, Number(merged.breakthroughGraceMs) || 0),
         budgetMs: Math.max(0, Number(merged.budgetMs) || 0),
       },
     })
@@ -197,6 +204,8 @@ export class ArtexEngine {
       children: new Map(),
       stalls: 0,
       settling: false,
+      completing: false,
+      siblingStops: new Set(),
       finished: false,
       startedAt: Date.now(),
       done: undefined,
@@ -277,7 +286,7 @@ export class ArtexEngine {
           break
         }
         if (allGoalsMet(t)) {
-          this.finish(rt, 'completed', '全部目标已证明')
+          await this.completeGracefully(rt, '全部目标已证明')
           break
         }
         this.dispatchWorkers(rt)
@@ -290,7 +299,7 @@ export class ArtexEngine {
           await this.plannerRound(rt, rt.events.splice(0))
           if (rt.abort.signal.aborted || rt.finished) break
           if (allGoalsMet(t)) {
-            this.finish(rt, 'completed', '全部目标已证明')
+            await this.completeGracefully(rt, '全部目标已证明')
             break
           }
           if (t.limits.maxWorkers === 0) {
@@ -316,7 +325,7 @@ export class ArtexEngine {
         if (t.round >= t.limits.maxRounds) continue
         await this.plannerRound(rt, triggers)
         if (allGoalsMet(t)) {
-          this.finish(rt, 'completed', '全部目标已证明')
+          await this.completeGracefully(rt, '全部目标已证明')
           break
         }
       }
@@ -356,13 +365,54 @@ export class ArtexEngine {
     void this.persist(rt)
   }
 
+  /**
+   * 目标达成后的"突破收尾"：先停兄弟 pursue，给它们一个写回现场的宽限，
+   * 再硬停并收官。顺序不能反——finish() 之后写操作会被拒绝。
+   */
+  async completeGracefully(rt, detail) {
+    if (rt.completing || rt.finished) return
+    rt.completing = true
+    const t = rt.task
+    const runningIds = [...rt.running.keys()]
+    if (runningIds.length > 0) {
+      rt.siblingStops = new Set(runningIds)
+      for (const intentId of runningIds) {
+        const childId = rt.children.get(`intent-${intentId}`)
+        if (!childId) continue
+        this.addActivity(rt, {
+          intentId,
+          worker: 'engine',
+          kind: 'system',
+          summary: '目标已由其它路径达成，发送"停止并回报现场"指令',
+        })
+        void this.nudge(rt, childId, siblingStopPrompt())
+      }
+      const grace = Number(t.limits.breakthroughGraceMs) || 0
+      await Promise.race([Promise.allSettled([...rt.running.values()]), sleep(grace)])
+      if (rt.running.size > 0) {
+        for (const intentId of [...rt.running.keys()]) {
+          const childId = rt.children.get(`intent-${intentId}`)
+          if (childId) this.interruptChild(rt, childId)
+        }
+        await Promise.race([Promise.allSettled([...rt.running.values()]), sleep(15000)])
+      }
+    }
+    // 队列里尚未领取的意图：目标已达成，不再执行（blueprint 保留为候选记录）。
+    for (const intent of t.intents) {
+      if (intent.state === 'open') {
+        finishIntent(t, intent.id, { state: 'stopped', output: intent.output, reason: 'goal_met', writes: intent.writes })
+      }
+    }
+    this.finish(rt, 'completed', detail)
+  }
+
   beginSettling(rt) {
     if (rt.finished || rt.settling) return
     rt.settling = true
     for (const [childId, role] of this.roles) {
       if (role.taskId !== rt.task.id) continue
       this.addActivity(rt, { intentId: role.intentId, worker: 'engine', kind: 'system', summary: '任务预算耗尽，向子会话发送收尾指令' })
-      void this.nudge(rt, childId, settlePrompt(role.role))
+      void this.nudge(rt, childId, settlePrompt(role.role, role.kind))
     }
     this.pushEvent(rt, { kind: 'budget', summary: '任务级预算耗尽' })
   }
@@ -384,7 +434,20 @@ export class ArtexEngine {
     if (t.round >= t.limits.maxRounds) return
     t.round += 1
     const round = t.round
-    const prompt = plannerPrompt({ task: t, view: plannerView(t, { factsLimit: 12 }), triggers, round })
+    const since = t.lastPlannerRoundAt
+    t.lastPlannerRoundAt = Date.now()
+    const staleBrief = Boolean(t.brief) && (round - t.brief.round) > 1
+    const prompt = plannerPrompt({
+      task: t,
+      view: plannerView(t, {
+        factsLimit: 5,
+        digest: digestOf(t),
+        delta: deltaOf(t, since),
+        staleBrief,
+      }),
+      triggers,
+      round,
+    })
     this.addActivity(rt, {
       intentId: null,
       worker: 'planner',
@@ -426,7 +489,7 @@ export class ArtexEngine {
   /* ---------------------------------------------------------------- worker */
 
   dispatchWorkers(rt) {
-    if (rt.finished || rt.settling || rt.abort.signal.aborted) return
+    if (rt.finished || rt.settling || rt.completing || rt.abort.signal.aborted) return
     const t = rt.task
     while (rt.running.size < t.limits.maxWorkers) {
       const intent = t.intents.find(i => i.state === 'open')
@@ -457,6 +520,7 @@ export class ArtexEngine {
         role: 'worker',
         key: `intent-${intent.id}`,
         intentId: intent.id,
+        kind: intent.kind,
         label: `ARTEX worker · intent #${intent.id}`,
         prompt,
         timeoutMs: t.limits.workerTimeoutMs,
@@ -468,7 +532,7 @@ export class ArtexEngine {
         text: '',
         stopReason: 'error',
         timedOut: false,
-        writes: { facts: 0, findings: 0, resources: 0 },
+        writes: { facts: 0, findings: 0, resources: 0, outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 } },
         error: String(error?.message || error),
       })
       return
@@ -478,14 +542,41 @@ export class ArtexEngine {
 
   finishWorker(rt, intent, outcome) {
     const t = rt.task
-    const state = outcome.error ? 'blocked'
-      : outcome.timedOut ? 'exhausted'
-        : outcome.stopReason === 'completed' ? 'done'
-          : outcome.stopReason === 'aborted' ? 'stopped'
-            : outcome.stopReason === 'max-tokens' ? 'exhausted'
-              : 'blocked'
-    const reason = outcome.error || (outcome.timedOut ? 'worker 预算耗尽' : outcome.stopReason)
-    finishIntent(t, intent.id, { state, output: outcome.text, reason, writes: outcome.writes })
+    const writes = outcome.writes || { facts: 0, findings: 0, resources: 0 }
+    const outcomes = writes.outcomes || { found: 0, none: 0, inconclusive: 0, blueprint: 0 }
+    let state
+    let reason
+    if (outcome.error) {
+      state = 'blocked'
+      reason = outcome.error
+    } else if (rt.siblingStops?.has(intent.id)) {
+      state = 'stopped'
+      reason = 'sibling_breakthrough'
+    } else if (outcome.timedOut) {
+      state = 'exhausted'
+      reason = 'worker 预算耗尽'
+    } else if (outcome.stopReason === 'aborted') {
+      state = 'stopped'
+      reason = 'aborted'
+    } else if (outcome.stopReason === 'max-tokens') {
+      state = 'exhausted'
+      reason = 'max_tokens'
+    } else if (intent.kind === 'pursue') {
+      if (outcomes.found > 0 || writes.findings > 0) {
+        state = 'done'
+        reason = 'path_success'
+      } else if (outcomes.none > 0) {
+        state = 'failed'
+        reason = 'path_dead'
+      } else {
+        state = 'exhausted'
+        reason = 'no_evidence'
+      }
+    } else {
+      state = 'done'
+      reason = 'enumerated'
+    }
+    finishIntent(t, intent.id, { state, output: outcome.text, reason, writes })
     this.addActivity(rt, {
       intentId: intent.id,
       worker: intent.worker,
@@ -536,8 +627,9 @@ export class ArtexEngine {
     const role = {
       taskId: rt.task.id,
       role: spec.role,
+      kind: spec.kind || null,
       intentId: spec.intentId ?? null,
-      writes: { facts: 0, findings: 0, resources: 0 },
+      writes: { facts: 0, findings: 0, resources: 0, outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 } },
       pending: new Map(),
     }
     this.roles.set(childId, role)
@@ -589,7 +681,7 @@ export class ArtexEngine {
       text: textOf(result?.output),
       stopReason: result?.stopReason || 'completed',
       timedOut,
-      writes: { ...role.writes },
+      writes: { ...role.writes, outcomes: { ...role.writes.outcomes } },
     }
   }
 
@@ -754,6 +846,39 @@ export class ArtexEngine {
     return todos
   }
 
+  /** 规划者维护全局认知：整体替换、按轮次版本化。 */
+  setBrief(task, text, citations) {
+    const rt = this.runtimeForTask(task)
+    const brief = graphSetBrief(rt.task, text, citations)
+    if (brief) {
+      this.addActivity(rt, {
+        intentId: null,
+        worker: 'planner',
+        kind: 'brief',
+        summary: `更新全局认知（第 ${brief.round} 轮）`,
+        detail: brief.text,
+      })
+      void this.persist(rt)
+    }
+    return brief
+  }
+
+  /** 把 blueprint 提升为 open，进入 frontier。 */
+  promoteIntent(task, intentId) {
+    const rt = this.runtimeForTask(task)
+    const result = graphPromoteIntent(rt.task, intentId)
+    if (result.ok) {
+      this.addActivity(rt, {
+        intentId: result.intent.id,
+        worker: 'planner',
+        kind: 'promote',
+        summary: `蓝图提升为 open：#${result.intent.id}`,
+      })
+      void this.persist(rt)
+    }
+    return result
+  }
+
   roleForIntent(taskId, intentId) {
     if (!intentId) return undefined
     for (const role of this.roles.values()) {
@@ -769,12 +894,21 @@ export class ArtexEngine {
       detail: entry.detail,
       evidence: entry.evidence,
       confidence: entry.confidence,
+      outcome: entry.outcome,
       resourceIds: entry.resourceIds ?? entry.resource_ids,
       intentId: entry.intentId ?? entry.intent_id ?? intentId,
     }))
     if (facts.length > 0) {
       const role = this.roleForIntent(task.id, facts[0].intentId)
-      if (role) role.writes.facts += facts.length
+      if (role) {
+        role.writes.facts += facts.length
+        for (const fact of facts) {
+          if (fact.outcome) {
+            role.writes.outcomes = role.writes.outcomes || { found: 0, none: 0, inconclusive: 0, blueprint: 0 }
+            role.writes.outcomes[fact.outcome] += 1
+          }
+        }
+      }
       this.addActivity(rt, {
         intentId: intentId ?? facts[0].intentId,
         worker: 'worker',
@@ -940,10 +1074,14 @@ export class ArtexEngine {
       task_id: task.id,
       status: task.status,
       live: Boolean(live && !live.finished),
+      mode: task.mode || 'objective',
       description: task.description,
       goal: task.goal,
       rounds: task.round,
       limits: task.limits,
+      brief: task.brief?.text || undefined,
+      brief_round: task.brief?.round ?? undefined,
+      digest: digestOf(task),
       goals: task.goals.map(g => ({ id: g.id, text: g.text, status: g.status, evidence: g.evidence })),
       intents: {
         total: task.intents.length,

@@ -124,6 +124,7 @@ const LIMIT_KEYS = {
   worker_timeout_ms: 'workerTimeoutMs',
   planner_timeout_ms: 'plannerTimeoutMs',
   settle_grace_ms: 'settleGraceMs',
+  breakthrough_grace_ms: 'breakthroughGraceMs',
   budget_ms: 'budgetMs',
 }
 
@@ -140,6 +141,7 @@ const RUN_PARAMETERS = {
   description: describe('任务短标题（用于列表与日志），缺省截取 goal。'),
   goals: strings('可选：把总目标拆成 1..N 条"可独立判定是否达成"的验收目标；缺省时总目标本身作为唯一目标。规划者用 artex_prove_goal 逐条证明，全部证明后任务自动完成。'),
   constraints: strings('可选：硬约束（安全边界、禁止项、范围限制）。会以最高优先级注入 planner 与每个 worker，凌驾于一切探索偏好。'),
+  mode: { type: 'string', enum: ['objective', 'audit'], description: 'objective=达成目的（首个充分突破即收官，可并行铺多条 pursue）；audit=发现风险（覆盖最大化，枚举验证、正负结果都要有证据）。默认 objective。' },
   max_workers: integer('并发 worker 数（默认 3）。0 = 只做规划不执行（用于先看方案）。'),
   max_rounds: integer('规划轮次上限（默认 24），达到后结束任务。'),
   max_stalls: integer('连续多少轮规划没有产出可执行方向就停止（默认 2）。'),
@@ -149,6 +151,7 @@ const RUN_PARAMETERS = {
   heartbeat_ms: integer('无任何变动时的巡检间隔（毫秒，默认 600000）。'),
   debounce_ms: integer('图变动合并窗口（毫秒，默认 800）。'),
   settle_grace_ms: integer('预算耗尽后等待收尾的宽限期（毫秒，默认 90000）。'),
+  breakthrough_grace_ms: integer('突破后等待其它 pursue 写回现场的宽限期（毫秒，默认 30000），到期硬停。'),
 }
 
 /* ------------------------------------------------------------- factories */
@@ -165,7 +168,8 @@ export function createTools({ engine, config }) {
 
 行为：**阻塞**直到任务结束（完成/超时/停止/无新方向），返回结构化报告。内部会为每一轮规划、每条意图各开一个子会话（真实 subagent，${engineNote}），因此会产生多次模型调用。过程中可以用 artex_task_status 另开任务查看进度，但本调用本身不返回中间状态。
 
-写回模型：worker 通过 artex_record_fact（结论，带证据与 confidence）、artex_report_finding（已验证成果）、artex_add_resource（新实体）把产出写进任务图谱；规划者只能派意图/证明目标，不能亲自干活。`,
+写回模型：worker 通过 artex_record_fact（结论，带 evidence/confidence/outcome）、artex_report_finding（已验证成果）、artex_add_resource（新实体）把产出写进任务图谱；规划者只维护 brief、派意图、证明目标。
+mode：objective（默认，首个充分突破即收官，可并行 pursue）或 audit（覆盖最大化，enumerate 逐项验证，正负结果都算覆盖）。`,
       parameters: { type: 'object', properties: RUN_PARAMETERS, required: ['goal'], additionalProperties: false },
       async execute(args, exec) {
         const { agent } = callerOf(engine, exec)
@@ -175,6 +179,7 @@ export function createTools({ engine, config }) {
           description: args.description || args.goal,
           goals: args.goals,
           constraints: args.constraints,
+          mode: args.mode,
           limits: pickLimits(args),
           signal: exec.signal,
         })
@@ -201,10 +206,11 @@ export function createTools({ engine, config }) {
           description: args.description || args.goal,
           goals: args.goals,
           constraints: args.constraints,
+          mode: args.mode,
           limits: pickLimits(args),
           signal: exec.signal,
         })
-        return `ARTEX 任务已在后台启动：${rt.task.id}
+        return `ARTEX 任务已在后台启动：${rt.task.id}（${rt.task.mode} 模式）
 目标：${rt.task.goal}
 验收目标：${rt.task.goals.map(g => `\n  - [goal#${g.id}] ${g.text}`).join('')}
 并发 worker：${rt.task.limits.maxWorkers} · 轮次上限：${rt.task.limits.maxRounds}${rt.task.limits.budgetMs ? ` · 预算：${Math.round(rt.task.limits.budgetMs / 1000)}s` : ''}
@@ -226,8 +232,8 @@ export function createTools({ engine, config }) {
       async execute(args, exec) {
         if (args.task_id) {
           const snapshot = await engine.status(String(args.task_id))
-          return `${snapshot.task_id} [${snapshot.status}] ${snapshot.goal}
-轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings.length} · 资源 ${snapshot.resources}
+          return `${snapshot.task_id} [${snapshot.status}] (${snapshot.mode}) ${snapshot.goal}
+轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings.length} · 资源 ${snapshot.resources}${snapshot.brief_round ? ` · brief@r${snapshot.brief_round}` : ''}
 用时 ${Math.round(snapshot.elapsed_ms / 1000)}s${snapshot.finish_detail ? ` · ${snapshot.finish_detail}` : ''}
 
 ${JSON.stringify(snapshot)}`
@@ -380,9 +386,11 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
 
     artifact({
       name: 'artex_add_intent',
-      description: `规划者专用：向 frontier 批量提交探索意图（最多 4 条）。意图 = 一句话的开放探索方向（"对什么做什么、为什么"），不是固定分类。
-提交前先与 open/running/recent_done 去重：已被覆盖的不再派；recent_done 里 done 的方向只有出现材料性新机理才重派，exhausted/blocked 的先看 trace 再决定接续还是换打法。
-强依赖的串行链用 artex_set_todos 记整条链，每轮只派"前置已满足"的那一步，不要把一条链并行拆散。
+      description: `规划者专用：向 frontier 批量提交意图（最多 4 条）。意图 = 一句话方向（"对什么做什么、为什么"）。
+- kind：\`pursue\`=追一条路径（成功即停、失败写 none 并回溯）；\`enumerate\`=枚举验证一批候选（命中也不停）。
+- state：\`open\` 进入队列；\`blueprint\` 只登记为候选，之后可用 artex_promote_intent 提升。
+- path_parent：pursue 在路径树里的上级意图，用于失败回溯。
+提交前与 open/running/blueprint/recent_done 去重；已判死（failed）的方向不要原样重派。
 只读任务所有者与 planner 可调用。`,
       parameters: {
         type: 'object',
@@ -395,6 +403,9 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
               type: 'object',
               properties: {
                 summary: { type: 'string', required: true, description: '一句话方向' },
+                kind: { type: 'string', enum: ['pursue', 'enumerate'], description: 'pursue=追一条路径；enumerate=枚举验证（默认按任务 mode 继承）' },
+                state: { type: 'string', enum: ['open', 'blueprint'], description: 'open=进入队列；blueprint=只登记候选（默认 open）' },
+                path_parent: integer('可选：pursue 的上级意图 id（路径树/回溯点）'),
                 priority: integer('优先级 0-10，默认 5'),
                 parents: { type: 'array', items: { type: 'integer' }, description: '派生自哪些 fact/finding 节点 id' },
                 resource_ids: { type: 'array', items: { type: 'integer' }, description: '锚定的资源 id' },
@@ -404,6 +415,9 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
             },
           },
           summary: describe('[单条] 意图方向'),
+          kind: { type: 'string', enum: ['pursue', 'enumerate'], description: '[单条] 意图类型' },
+          state: { type: 'string', enum: ['open', 'blueprint'], description: '[单条] open 或 blueprint' },
+          path_parent: integer('[单条] 路径上级意图 id'),
           parents: { type: 'array', items: { type: 'integer' }, description: '[单条] 上游节点 id' },
         },
         additionalProperties: false,
@@ -414,7 +428,9 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
         liveRuntime(engine, task)
         const items = Array.isArray(args.intents) && args.intents.length > 0
           ? args.intents
-          : args.summary ? [{ summary: args.summary, parents: args.parents }] : []
+          : args.summary
+            ? [{ summary: args.summary, parents: args.parents, kind: args.kind, state: args.state, path_parent: args.path_parent }]
+            : []
         if (items.length === 0) throw new Error('intents 或 summary 至少给一个')
         const results = engine.addIntents(task, items)
         const created = results.filter(r => r.id > 0)
@@ -489,9 +505,59 @@ status: pending | in_progress | completed。`,
     }),
 
     artifact({
+      name: 'artex_set_brief',
+      description: `规划者专用：整体替换**全局认知 brief**（每次全量替换，不是追加）。brief 是跨轮保留、覆盖全任务历史的综合认知，不是本轮摘要。
+必须包含：已确认结论（带 fact#id）、未解决的问题（缺什么证据）、覆盖地图（audit）或路径树（objective）、当前策略。
+与态势冲突时以事实为准，并更新这里。` + `\n建议 ≤1200 字符，超长会被截断。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          text: { type: 'string', required: true, description: 'brief 全文（Markdown，建议按模板组织）' },
+          citations: { type: 'array', items: { type: 'integer' }, description: '可选：支撑 brief 的 fact/finding 节点 id' },
+        },
+        required: ['text'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRole(agent, role, task, ['planner'])
+        liveRuntime(engine, task)
+        if (!String(args.text || '').trim()) throw new Error('text 不能为空')
+        const brief = engine.setBrief(task, args.text, args.citations)
+        return brief
+          ? `全局认知已更新（第 ${brief.round} 轮，${brief.text.length} 字符，引用 ${brief.citations.length} 个节点）`
+          : '更新失败：text 为空'
+      },
+    }),
+
+    artifact({
+      name: 'artex_promote_intent',
+      description: '规划者专用：把一条 blueprint 意图提升为 open，进入 frontier 等待执行。用于回溯或调整优先级后启用之前只登记为候选的路径。',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          intent_id: { type: 'integer', required: true, description: 'blueprint 意图 id' },
+        },
+        required: ['intent_id'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRole(agent, role, task, ['planner'])
+        liveRuntime(engine, task)
+        const result = engine.promoteIntent(task, args.intent_id)
+        if (!result.ok) throw new Error(result.error)
+        return `蓝图 #${result.intent.id} 已提升为 open：${result.intent.summary}`
+      },
+    }),
+
+    artifact({
       name: 'artex_record_fact',
       description: `执行者写回：把本意图得到的**结论/观察/判断**写进探索图（不是资源，也不是已验证成果）。
-纪律：多个观察汇总成**一条**事实（summary 一句话 + detail 展开），默认就写一条；只写增量（不要换措辞重记已有事实）；只写真实看到的——给 evidence（一行：做了什么 + 最能证明的一两行结果），标 confidence（observed=直接看到 / inferred=据现象推断）。否定/存疑结论也写，但用 inferred 并说明用了哪些手段。
+纪律：多个观察汇总成**一条**事实（summary 一句话 + detail 展开），默认就写一条；只写增量；只写真实看到的——给 evidence，标 confidence。
+outcome 用于覆盖/路径判定：found=发现/验证成功；none=按方法测过但未命中（负结果，算覆盖）；inconclusive=无法判定；blueprint=其它可行路径的蓝图（不执行）。
 task 所有者与 worker 可调用。`,
       parameters: {
         type: 'object',
@@ -502,6 +568,7 @@ task 所有者与 worker 可调用。`,
           detail: describe('对 summary 的展开：观察到的细节、过程、推理'),
           evidence: describe('一行证据：命令/操作 + 关键输出'),
           confidence: { type: 'string', enum: ['observed', 'inferred'], description: 'observed=直接看到；inferred=据现象推断（默认 observed）' },
+          outcome: { type: 'string', enum: ['found', 'none', 'inconclusive', 'blueprint'], description: 'found=命中；none=测过未命中（算覆盖）；inconclusive=无法判定；blueprint=备选路径蓝图' },
           resource_ids: { type: 'array', items: { type: 'integer' }, description: '这条结论锚定的资源 id' },
           facts: {
             type: 'array',
@@ -513,6 +580,7 @@ task 所有者与 worker 可调用。`,
                 detail: describe('展开'),
                 evidence: describe('证据'),
                 confidence: { type: 'string', enum: ['observed', 'inferred'] },
+                outcome: { type: 'string', enum: ['found', 'none', 'inconclusive', 'blueprint'] },
               },
               required: ['summary'],
               additionalProperties: false,
@@ -537,12 +605,13 @@ task 所有者与 worker 可调用。`,
             detail: args.detail,
             evidence: args.evidence,
             confidence: args.confidence,
+            outcome: args.outcome,
             intentId,
             resourceIds: args.resource_ids,
           }]
         if (!entries[0].summary) throw new Error('summary 不能为空')
         const facts = engine.recordFacts(task, entries, intentId)
-        return `已写回 ${facts.length} 条事实：${facts.map(f => `#${f.id}`).join(' ')}（confidence=${facts.map(f => f.confidence).join(',')}）`
+        return `已写回 ${facts.length} 条事实：${facts.map(f => `#${f.id}`).join(' ')}（confidence=${facts.map(f => f.confidence).join(',')}${facts.some(f => f.outcome) ? `, outcome=${facts.map(f => f.outcome || '-').join(',')}` : ''}）`
       },
     }),
 

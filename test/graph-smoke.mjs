@@ -6,6 +6,7 @@ import {
   TaskStore, ResourceStore, createTask, addIntents, claimIntent, finishIntent, recordFact,
   reportFinding, addHint, setTodos, proveGoal, allGoalsMet, overview, detail, addActivity,
   listTraces, searchTraces, getTrace, plannerView, workerView,
+  digestOf, deltaOf, setBrief, promoteIntent,
 } from '../graph.js'
 import { plannerPrompt, workerPrompt, settlePrompt, formatReport } from '../prompts.js'
 import { createTools } from '../tools.js'
@@ -25,22 +26,31 @@ try {
     limits: { ...DEFAULTS },
   })
   assert.equal(task.goals.length, 2)
+  assert.equal(task.mode, 'objective')
 
   const intents = addIntents(task, [
-    { summary: '方向一：读 A', parents: [] },
-    { summary: '方向二：读 B', priority: 8 },
+    { summary: '方向一：读 A', kind: 'pursue' },
+    { summary: '方向二：读 B', kind: 'enumerate', priority: 8 },
+    { summary: '备选蓝图：读 C', state: 'blueprint' },
     { summary: '方向一：读 A' }, // duplicate
   ])
-  assert.equal(intents.filter(r => r.id > 0).length, 2)
+  assert.equal(intents.filter(r => r.id > 0).length, 3)
   assert.equal(intents.filter(r => r.duplicate).length, 1)
+  const bpId = intents.find(r => r.state === 'blueprint').id
+  assert.equal(task.intents.find(i => i.id === bpId).state, 'blueprint')
+  assert.equal(promoteIntent(task, bpId).ok, true, 'blueprint 应可提升为 open')
+  assert.equal(task.intents.find(i => i.id === bpId).state, 'open')
+  assert.equal(promoteIntent(task, bpId).ok, false, 'open 不应再次提升')
 
   const id = intents[0].id
   claimIntent(task, id, 'work#1')
-  const fact = recordFact(task, { summary: 'A 可读', detail: '细节', evidence: 'cat A', intentId: id })
+  const fact = recordFact(task, { summary: 'A 可读', detail: '细节', evidence: 'cat A', outcome: 'found', intentId: id })
   const finding = reportFinding(task, { title: 'B 缺陷', severity: 'high', evidence: 'proof', intentId: id })
+  assert.equal(fact.outcome, 'found')
   assert.equal(task.stats.facts, 1)
   assert.equal(task.intents.find(i => i.id === id).writes.facts, 1)
   assert.equal(task.intents.find(i => i.id === id).writes.findings, 1)
+  assert.equal(task.intents.find(i => i.id === id).outcomes.found, 1)
 
   addActivity(task, { intentId: id, worker: 'work#1', kind: 'step', tool: 'cat', summary: 'cat A', detail: 'A 可读 content' })
   assert.equal(listTraces(task).length, 1)
@@ -78,23 +88,34 @@ try {
   assert.equal(loaded.facts.length, 1)
   assert.equal(loaded.status, 'created')
 
-  // 提示词渲染：v0.2 用角色投影 + 紧凑 JSON
-  const pView = plannerView(loaded)
+  // 提示词渲染：角色投影 + 紧凑 JSON + brief/delta/digest
+  setBrief(loaded, '## 已确认结论\n- A 可读（fact#1）\n## 下一步\n- 读 B', [fact.id])
+  assert.equal(loaded.brief.round, loaded.round)
+  const digest = digestOf(loaded)
+  assert.equal(digest.facts.by_outcome.found, 1)
+  const delta = deltaOf(loaded, 0)
+  assert.equal(delta.facts.length >= 1, true)
+  const pView = plannerView(loaded, { digest, delta, staleBrief: true })
   const wView = workerView(loaded, loaded.intents[0])
   const planner = plannerPrompt({ task: loaded, view: pView, triggers: [{ kind: 'done', intentId: id, state: 'done', summary: '完成 A' }], round: 1 })
   assert.match(planner, /ARTEX 规划者/)
   assert.match(planner, /t-test-1/)
+  assert.match(planner, /全局认知/)
+  assert.match(planner, /A 可读/)
+  assert.match(planner, /brief 已过期/)
   assert.equal(planner.includes('"tasks"'), false)
   const worker = workerPrompt({ task: loaded, intent: loaded.intents[0], view: wView })
   assert.match(worker, /ARTEX 执行者/)
+  assert.match(worker, /pursue/)
   assert.equal(worker.includes('"todos"'), false, 'worker 视图不应含 planner 待办')
   assert.equal(worker.includes('"constraints"'), false, 'worker 视图不应重复 constraints')
   assert.equal(worker.includes('\n "'), false, 'JSON 应为紧凑格式')
-  assert.ok(worker.length < 3500, `worker prompt 过长: ${worker.length}`)
+  assert.ok(worker.length < 4500, `worker prompt 过长: ${worker.length}`)
   assert.match(worker, new RegExp(`意图 #${loaded.intents[0].id}`))
   assert.equal(pView.constraints, undefined)
   assert.equal(pView.todos, undefined)
-  assert.match(settlePrompt('worker'), /写回/)
+  assert.equal(typeof pView.intents.blueprints, 'object')
+  assert.match(settlePrompt('worker', 'enumerate'), /none/)
   assert.match(formatReport(loaded), /冒烟任务/)
 
   // 工具 schema：必须是标准 JSON Schema（无属性级 required:true），且根 required 正确

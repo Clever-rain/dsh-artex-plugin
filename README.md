@@ -92,10 +92,12 @@ DSH 没有 "Go goroutine + Postgres"，但有三样正好够用的原语：**子
 | `artex_graph_overview` | 态势快照（目标/意图/事实/发现/血缘） | 任意 |
 | `artex_node_detail` | 某节点的完整内容与证据 | 任意 |
 | `artex_trace` | 列出 work / 关键字检索过程 / 取某几步原文 | 任意 |
-| `artex_add_intent` | 批量派意图（≤4） | planner / 所有者 |
+| `artex_add_intent` | 批量派意图（≤4；kind=pursue/enumerate，state=open/blueprint） | planner / 所有者 |
+| `artex_promote_intent` | 把 blueprint 提升为 open | planner / 所有者 |
+| `artex_set_brief` | 整体替换跨轮全局认知 brief | planner / 所有者 |
 | `artex_prove_goal` | 用 fact/finding 证明目标 | planner / 所有者 |
 | `artex_set_todos` | 整体替换跨轮规划待办 | planner / 所有者 |
-| `artex_record_fact` | 写回结论（evidence + confidence） | worker / 所有者 |
+| `artex_record_fact` | 写回结论（evidence + confidence + outcome） | worker / 所有者 |
 | `artex_report_finding` | 登记已验证成果 | worker / 所有者 |
 | `artex_add_resource` | 登记跨任务复用的资源/实体 | worker / planner / 所有者 |
 
@@ -178,6 +180,42 @@ v0.1 把整份 `overview` 以美化 JSON 同时塞给 planner 和每个 worker�
 - 行为上两端都完成了同一目标、各写回 1 条事实；v0.2 把"主统计 + netstat 交叉核对"拆成了 2 条意图（完成时第 2 条仍 open），v0.1 合并成 1 条。单次运行不足以断言行为差异，只能说明"无回归"。
 
 已知小问题：任务在目标全部证明后完成时，队列里未领取的 open 意图不会被置为 stopped，报告里会同时出现 `done` 与 `open`。计划在 v0.2.1 处理。
+
+## 4.6 双模式与全局认知（v0.3）
+
+### 两种成功语义
+
+| mode | 目标函数 | 意图类型 | 完成判据 |
+|---|---|---|---|
+| `objective`（默认） | 首个充分突破 | `pursue`：追一条路径，成功即停；失败写 `outcome=none` 并回溯 | 目标被证据证明 |
+| `audit` | 覆盖最大化 | `enumerate`：逐项验证，命中也不停，正/负结果都写回 | 覆盖维度（goals）都有证据 |
+
+**objective 的路径树与回溯**：pursue 可带 `path_parent`；某条判死（`failed`）后，规划者从它向上找最近的、仍有未尝试 `blueprint` 的祖先，派下一条。`blueprint` 是候选池，可直接 `state:"open"` 创建，或用 `artex_promote_intent` 提升。
+
+**突破即停、保留现场**：任一条 pursue 证明目标后，引擎先冻结派发 → 给其它在跑的 pursue 发"停止并回报"指令 → 等 `breakthrough_grace_ms`（默认 30s）让它们写回进度 → 到期硬停。这些意图记为 `stopped/sibling_breakthrough`，它们的 facts/findings/输出保留，报告单列"被中止或判死的路径"。
+
+### 全局认知（brief）
+
+planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体替换），引擎同时注入：
+
+- `delta`：上次规划之后新增/变化的事实、发现、结束的意图；
+- `digest`：确定性的 outcome 计数、意图状态分布、失败路径列表。
+
+`brief` 必须覆盖全任务历史（audit 写覆盖地图，objective 写路径树），已确认结论要带 `fact#id`；落后超过 1 轮会在下一轮提示"已过期"。这样历史信息有固定大小的载体，事实列表不必随轮次线性膨胀。
+
+### 新增参数
+
+| 位置 | 参数 |
+|---|---|
+| `artex_run_task` / `artex_start_task` | `mode`：`objective` / `audit`；`breakthrough_grace_ms` |
+| `artex_add_intent` | `kind`：`pursue` / `enumerate`；`state`：`open` / `blueprint`；`path_parent` |
+| `artex_record_fact` | `outcome`：`found` / `none` / `inconclusive` / `blueprint` |
+
+### 已知边界
+
+- `audit` 的"覆盖闭合才允许完成"目前是**提示词级约束**（通过 goals 证据实现），不是引擎硬门禁；真正的覆盖清单工具（含未覆盖项报告）留给后续版本。
+- 专职 `analyst`（周期性只读重综合）只预留了接口与触发点，v0.3 未实现；当前由 planner 自维护 brief + 引擎 digest 承担。
+- 单进程内任务状态在插件重载后清空，历史快照仍在 `.artex/tasks/<id>/`。
 
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
