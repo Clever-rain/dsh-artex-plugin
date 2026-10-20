@@ -263,6 +263,15 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 
 > **为什么默认改成 hybrid（v0.3.4）**：一次 3 维度、5 轮、64 次调用的长审计实测里，planner 的 brief 出现了 4 类失真——维度状态过时（已写回的维度仍标"0 条证据/运行中"）、建议重复证明已达成目标、`fact` 之间双栈措辞矛盾、同一主机资源锚点不一致。analyst 一次运行（6 次调用 / 22.3k token，占该任务 132.4k 的 **16.9%**）就逐条指出了这些问题，planner 在 brief 里明确记录了采纳/驳回。对长审计来说，这份开销换来的纠错价值高于成本；短任务或成本敏感场景可用 `view_mode: "planner"` 关掉。
 
+## 4.8 数据、索引与权限（v0.3.6）
+
+- **快照不再重复存过程日志**：`task.json` 只存图与状态，`activities` 以 `activity.jsonl` 为权威副本；`load` 时回填最近 4000 条。实测 96 步任务的快照从 153 KB 降到约 10 KB 级。
+- **紧凑 + 合并写**：快照用单行 JSON，运行中的高频 mutation 走 `saveDebounceMs`（默认 200ms）合并写；收官/停止/插件卸载时强制 flush，避免丢最近状态。
+- **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd`，换一个工作区/会话也能按 id 查询历史任务；索引最多保留 500 条。
+- **去重语义修正**：`failed` / `stopped` 的方向允许用同一 summary 重试；重复的 `blueprint` 返回已有 id 与状态，便于直接 promote。
+- **读权限收紧**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
+- **配置默认值生效**：`config.mode` 现在作为任务默认模式（任务参数优先）。
+
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
 **有意的简化**

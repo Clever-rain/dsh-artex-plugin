@@ -13,6 +13,7 @@
 
 import { mkdir, readFile, writeFile, appendFile, rename, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 
 export const GRAPH_DIR = '.artex'
 
@@ -118,9 +119,10 @@ export function addIntents(task, items, options = {}) {
   for (const raw of items.slice(0, limit)) {
     const summary = String(raw?.summary ?? raw?.text ?? '').trim()
     if (!summary) continue
-    const dup = task.intents.some(i => i.summary === summary && i.state !== 'cancelled')
+    // 失败/中止的方向允许用同一 summary 重试；blueprint 返回已有 id 供 promote。
+    const dup = task.intents.find(i => i.summary === summary && !['failed', 'stopped'].includes(i.state))
     if (dup && options.allowDuplicate !== true) {
-      out.push({ id: 0, duplicate: true, summary })
+      out.push({ id: dup.id, duplicate: true, state: dup.state, summary })
       continue
     }
     const intent = {
@@ -616,19 +618,27 @@ export class ResourceStore {
     this.counter = 0
     this.items = []
     this.loaded = false
+    this.loadPromise = undefined
     this.saving = Promise.resolve()
+    this.lastError = undefined
   }
 
+  /** 单飞加载：并发 upsert 不会看到"已标记 loaded 但 items 仍为空"的中间态。 */
   async load() {
-    if (this.loaded) return
-    this.loaded = true
-    try {
-      const raw = JSON.parse(await readFile(this.path, 'utf8'))
-      this.counter = Number(raw.counter) || 0
-      this.items = Array.isArray(raw.items) ? raw.items : []
-    } catch {
-      // 首次运行：空资源图。
+    if (!this.loadPromise) {
+      this.loadPromise = (async () => {
+        try {
+          const raw = JSON.parse(await readFile(this.path, 'utf8'))
+          this.counter = Number(raw.counter) || 0
+          this.items = Array.isArray(raw.items) ? raw.items : []
+        } catch (error) {
+          if (error?.code !== 'ENOENT') this.lastError = error
+        } finally {
+          this.loaded = true
+        }
+      })()
     }
+    return this.loadPromise
   }
 
   static keyOf(item) {
@@ -680,11 +690,13 @@ export class ResourceStore {
   }
 
   save() {
-    const payload = JSON.stringify({ counter: this.counter, items: this.items }, null, 2)
+    const payload = JSON.stringify({ counter: this.counter, items: this.items })
     this.saving = this.saving.then(async () => {
       await mkdir(this.dir, { recursive: true })
       await writeAtomic(this.path, payload)
-    }).catch(() => undefined)
+    }).catch((error) => {
+      this.lastError = error
+    })
     return this.saving
   }
 }
@@ -699,10 +711,13 @@ async function writeAtomic(path, content) {
 }
 
 export class TaskStore {
-  constructor(cwd) {
+  constructor(cwd, options = {}) {
     this.cwd = cwd
     this.root = join(cwd, GRAPH_DIR)
     this.paths = new Map()
+    this.pending = new Map()
+    this.onError = options.onError
+    this.lastError = undefined
   }
 
   taskDir(taskId) {
@@ -713,17 +728,57 @@ export class TaskStore {
     return join(this.taskDir(taskId), 'task.json')
   }
 
-  /** Persist the whole graph snapshot (small, atomic rename). */
+  /** 快照不重复存过程日志：activities 已有 activity.jsonl 作为权威副本。 */
+  snapshotPayload(task) {
+    const { activities, ...rest } = task
+    return JSON.stringify(rest)
+  }
+
+  /** Persist the graph snapshot (atomic rename, compact JSON, no activities). */
   save(task) {
     const path = this.pathOf(task.id)
-    const payload = JSON.stringify(task, null, 2)
+    const payload = this.snapshotPayload(task)
     const prev = this.paths.get(task.id) ?? Promise.resolve()
     const next = prev.then(async () => {
       await mkdir(dirname(path), { recursive: true })
       await writeAtomic(path, payload)
-    }).catch(() => undefined)
+    }).catch((error) => {
+      this.lastError = error
+      this.onError?.(error)
+    })
     this.paths.set(task.id, next)
     return next
+  }
+
+  /**
+   * 合并写：高频 mutation 只安排一次延迟落盘，flush 时序列化最新状态。
+   * 返回的 promise 在真正写完后 resolve。
+   */
+  scheduleSave(task, delay = 200) {
+    const id = task.id
+    const existing = this.pending.get(id)
+    if (existing) {
+      existing.task = task
+      return existing.promise
+    }
+    const entry = { task, timer: undefined, resolve: undefined, promise: undefined }
+    entry.promise = new Promise((resolve) => { entry.resolve = resolve })
+    entry.timer = setTimeout(() => { void this.flush(id) }, Math.max(0, delay))
+    this.pending.set(id, entry)
+    return entry.promise
+  }
+
+  async flush(id) {
+    const entry = this.pending.get(id)
+    if (!entry) return
+    clearTimeout(entry.timer)
+    this.pending.delete(id)
+    await this.save(entry.task)
+    entry.resolve()
+  }
+
+  async flushAll() {
+    await Promise.all([...this.pending.keys()].map(id => this.flush(id)))
   }
 
   /** Append-only process log, so long runs survive the in-memory activity cap. */
@@ -734,14 +789,39 @@ export class TaskStore {
     const next = prev.then(async () => {
       await mkdir(dirname(path), { recursive: true })
       await appendFile(path, line, 'utf8')
-    }).catch(() => undefined)
+    }).catch((error) => {
+      this.lastError = error
+      this.onError?.(error)
+    })
     this.paths.set(`${task.id}:activity`, next)
     return next
+  }
+
+  /** 从 JSONL 回填过程日志（最多 4000 条，与内存上限一致）。 */
+  async readActivities(taskId) {
+    try {
+      const text = await readFile(join(this.taskDir(taskId), 'activity.jsonl'), 'utf8')
+      const out = []
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue
+        try { out.push(JSON.parse(line)) } catch { /* 跳过损坏行 */ }
+      }
+      return out.slice(-4000)
+    } catch {
+      return []
+    }
   }
 
   async load(taskId) {
     const raw = JSON.parse(await readFile(this.pathOf(taskId), 'utf8'))
     if (!raw || typeof raw !== 'object') throw new Error('task snapshot 损坏')
+    if (!Array.isArray(raw.activities) || raw.activities.length === 0) {
+      const activities = await this.readActivities(taskId)
+      if (activities.length > 0) {
+        raw.activities = activities
+        raw.activitySeq = Math.max(Number(raw.activitySeq) || 0, ...activities.map(a => Number(a.id) || 0))
+      }
+    }
     return raw
   }
 
@@ -753,5 +833,54 @@ export class TaskStore {
     } catch {
       return []
     }
+  }
+}
+
+/**
+ * 全局任务索引：taskId → cwd。
+ * 快照仍在各自工作区的 .artex 下，索引只解决"换一个 cwd 也能按 id 找到任务"。
+ */
+export class TaskIndex {
+  constructor(path = join(homedir(), '.dsh', 'artex-index.json'), options = {}) {
+    this.path = path
+    this.items = {}
+    this.loadPromise = undefined
+    this.onError = options.onError
+  }
+
+  async load() {
+    if (!this.loadPromise) {
+      this.loadPromise = (async () => {
+        try {
+          const raw = JSON.parse(await readFile(this.path, 'utf8'))
+          this.items = raw?.items && typeof raw.items === 'object' ? raw.items : {}
+        } catch (error) {
+          if (error?.code !== 'ENOENT') this.onError?.(error)
+        }
+      })()
+    }
+    return this.loadPromise
+  }
+
+  async register(task) {
+    if (!task?.id || !task?.cwd) return
+    await this.load()
+    this.items[task.id] = { cwd: task.cwd, updatedAt: now() }
+    const ids = Object.keys(this.items)
+    if (ids.length > 500) {
+      for (const id of ids.sort((a, b) => (this.items[a].updatedAt || 0) - (this.items[b].updatedAt || 0)).slice(0, ids.length - 500)) {
+        delete this.items[id]
+      }
+    }
+    try {
+      await writeAtomic(this.path, JSON.stringify({ items: this.items }))
+    } catch (error) {
+      this.onError?.(error)
+    }
+  }
+
+  async lookup(taskId) {
+    await this.load()
+    return this.items[String(taskId)]?.cwd
   }
 }

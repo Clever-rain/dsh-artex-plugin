@@ -34,8 +34,11 @@ try {
     { summary: '备选蓝图：读 C', state: 'blueprint' },
     { summary: '方向一：读 A' }, // duplicate
   ])
-  assert.equal(intents.filter(r => r.id > 0).length, 3)
+  assert.equal(intents.filter(r => !r.duplicate).length, 3)
   assert.equal(intents.filter(r => r.duplicate).length, 1)
+  const duplicate = intents.find(r => r.duplicate)
+  assert.ok(duplicate.id > 0, '重复项应返回已有意图 id')
+  assert.equal(duplicate.state, 'open')
   const bpId = intents.find(r => r.state === 'blueprint').id
   assert.equal(task.intents.find(i => i.id === bpId).state, 'blueprint')
   assert.equal(promoteIntent(task, bpId).ok, true, 'blueprint 应可提升为 open')

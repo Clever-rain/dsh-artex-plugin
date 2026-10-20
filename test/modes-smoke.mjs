@@ -76,7 +76,7 @@ async function runObjective() {
   const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
   engine = new ArtexEngine({
     ctx,
-    config: { ...DEFAULTS, debounceMs: 10, heartbeatMs: 500, maxRounds: 5, maxWorkers: 2, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 200, breakthroughGraceMs: 500 },
+    config: { ...DEFAULTS, indexPath: join(root, 'index.json'), debounceMs: 10, heartbeatMs: 500, maxRounds: 5, maxWorkers: 2, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 200, breakthroughGraceMs: 500 },
     logger: { warn: (...a) => warnings.push(a.join(' ')) },
   })
   const agent = { id: 'owner-obj', session: { header: { cwd: root } } }
@@ -149,7 +149,7 @@ async function runAudit() {
   const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
   engine = new ArtexEngine({
     ctx,
-    config: { ...DEFAULTS, debounceMs: 10, heartbeatMs: 500, maxRounds: 5, maxWorkers: 2, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 200 },
+    config: { ...DEFAULTS, indexPath: join(root, 'index.json'), debounceMs: 10, heartbeatMs: 500, maxRounds: 5, maxWorkers: 2, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 200 },
     logger: { warn: (...a) => warnings.push(a.join(' ')) },
   })
   const agent = { id: 'owner-audit', session: { header: { cwd: root } } }
@@ -215,7 +215,7 @@ async function runFinalProof() {
   const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
   engine = new ArtexEngine({
     ctx,
-    config: { ...DEFAULTS, debounceMs: 10, heartbeatMs: 500, maxRounds: 1, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 100 },
+    config: { ...DEFAULTS, indexPath: join(root, 'index.json'), debounceMs: 10, heartbeatMs: 500, maxRounds: 1, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 100 },
     logger: { warn: (...a) => warnings.push(a.join(' ')) },
   })
   const agent = { id: 'owner-final', session: { header: { cwd: root } } }
@@ -276,7 +276,7 @@ async function runSettlingProof() {
   const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
   engine = new ArtexEngine({
     ctx,
-    config: { ...DEFAULTS, debounceMs: 400, heartbeatMs: 500, maxRounds: 5, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 500 },
+    config: { ...DEFAULTS, indexPath: join(root, 'index.json'), debounceMs: 400, heartbeatMs: 500, maxRounds: 5, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 500 },
     logger: { warn: (...a) => warnings.push(a.join(' ')) },
   })
   const agent = { id: 'owner-settle', session: { header: { cwd: root } } }
@@ -352,6 +352,7 @@ async function runAnalyst() {
     ctx,
     config: {
       ...DEFAULTS,
+      indexPath: join(root, 'index.json'),
       viewMode: 'hybrid', analystEveryRounds: 1, analystFactThreshold: 1, analystCooldownMs: 0, analystMaxRuns: 3, analystTimeoutMs: 2000,
       debounceMs: 10, heartbeatMs: 500, maxRounds: 4, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 100,
     },
@@ -424,6 +425,7 @@ async function runAnalystDisabled() {
     ctx,
     config: {
       ...DEFAULTS,
+      indexPath: join(root, 'index.json'),
       enableHybrid: false,
       viewMode: 'hybrid',
       debounceMs: 10, heartbeatMs: 500, maxRounds: 4, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 100,

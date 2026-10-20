@@ -76,6 +76,7 @@ engine = new ArtexEngine({
   ctx,
   config: {
     ...DEFAULTS,
+    indexPath: join(root, 'index.json'),
     viewMode: 'planner',
     debounceMs: 10,
     heartbeatMs: 500,

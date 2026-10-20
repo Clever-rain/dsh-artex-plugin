@@ -107,6 +107,14 @@ function requireRole(agent, role, task, allowed) {
   throw new Error(`该操作只允许任务所有者或 ${allowed.join('/')} 角色调用`)
 }
 
+/** 读权限：默认只允许 owner 与任务自己的子会话；跨任务读取需显式开启。 */
+function requireRead(agent, role, task, config) {
+  if (config?.allowCrossTaskRead === true) return
+  if (isOwner(agent, task)) return
+  if (role && String(role.taskId) === String(task.id)) return
+  throw new Error(`无权读取任务 ${task.id}：仅任务所有者或其子会话可读（可在插件配置开启 allowCrossTaskRead）`)
+}
+
 function liveRuntime(engine, task) {
   const rt = engine.liveTask(task.id)
   if (!rt || rt.finished) {
@@ -236,19 +244,22 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
       },
       concurrent: true,
       async execute(args, exec) {
+        const { agent, role } = callerOf(engine, exec)
         if (args.task_id) {
-          const snapshot = await engine.status(String(args.task_id))
+          const task = await engine.resolveTask(String(args.task_id))
+          requireRead(agent, role, task, config)
+          const snapshot = await engine.status(String(task.id))
           return `${snapshot.task_id} [${snapshot.status}] (${snapshot.mode}/${snapshot.view_mode}) ${snapshot.goal}
 轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings.length} · 资源 ${snapshot.resources}${snapshot.brief_round ? ` · brief@r${snapshot.brief_round}` : ''}
 用时 ${Math.round(snapshot.elapsed_ms / 1000)}s${snapshot.finish_detail ? ` · ${snapshot.finish_detail}` : ''}
 
 ${JSON.stringify(snapshot)}`
         }
-        const live = await engine.status()
-        const { agent } = callerOf(engine, exec)
+        const all = await engine.status()
+        const live = all.filter(s => String(s.owner_session) === String(agent.id) || (role && String(s.task_id) === String(role.taskId)))
         const cwd = await engine.cwdFor(agent, exec.signal)
         const onDisk = await engine.storeFor(cwd).tasks.ids()
-        const liveIds = new Set(live.map(t => t.task_id))
+        const liveIds = new Set(all.map(t => t.task_id))
         const listing = live.length > 0
           ? live.map(t => `- ${t.task_id} [${t.status}] rounds=${t.rounds} facts=${t.facts} findings=${t.findings.length} · ${t.goal}`).join('\n')
           : '- （本进程内没有活动任务）'
@@ -326,7 +337,8 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
       },
       concurrent: true,
       async execute(args, exec) {
-        const { task } = await resolve(engine, exec, args.task_id)
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRead(agent, role, task, config)
         return JSON.stringify(overview(task, {
           factsLimit: args.facts_limit ?? 20,
           factsQ: args.facts_q,
@@ -348,7 +360,8 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
       },
       concurrent: true,
       async execute(args, exec) {
-        const { task } = await resolve(engine, exec, args.task_id)
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRead(agent, role, task, config)
         const node = detail(task, args.id)
         if (!node) throw new Error(`节点 #${args.id} 不存在于任务 ${task.id}`)
         return JSON.stringify(node)
@@ -375,7 +388,8 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
       },
       concurrent: true,
       async execute(args, exec) {
-        const { task, role } = await resolve(engine, exec, args.task_id)
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRead(agent, role, task, config)
         if (args.q) {
           const hits = searchTraces(task, args.q, {
             limit: args.limit ?? 20,
@@ -442,7 +456,7 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
         const created = results.filter(r => r.id > 0)
         const duplicates = results.filter(r => r.duplicate)
         return `已创建 ${created.length} 条意图：${created.map(r => `#${r.id} ${r.summary}`).join('；') || '（无）'}`
-          + (duplicates.length > 0 ? `\n跳过重复 ${duplicates.length} 条：${duplicates.map(d => d.summary).join('；')}` : '')
+          + (duplicates.length > 0 ? `\n跳过重复 ${duplicates.length} 条：${duplicates.map(d => `${d.summary}（已有 #${d.id}，${d.state}）`).join('；')}` : '')
       },
     }),
 

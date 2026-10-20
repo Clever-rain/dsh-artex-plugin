@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-artex",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "private": true,
   "type": "module",
   "description": "ARTEX-style dual-graph planner/worker orchestration for DeepSeek Harness",
@@ -21,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs",
+    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs",
     "bench": "node test/prompt-size.mjs"
   },
   "dsh": {

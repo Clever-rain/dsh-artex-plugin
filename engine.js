@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import {
-  TaskStore, ResourceStore,
+  TaskStore, ResourceStore, TaskIndex,
   createTask, addIntents as graphAddIntents, addActivity as graphAddActivity, addHint as graphAddHint,
   claimIntent, finishIntent, allGoalsMet, plannerView, workerView, recordFact as graphRecordFact,
   reportFinding as graphReportFinding, setTodos as graphSetTodos, proveGoal as graphProveGoal,
@@ -67,6 +67,12 @@ export const DEFAULTS = {
   analystTimeoutMs: 180000,
   /** worker/planner 是否在任务目录下的独立 cwd 里工作（ARTEX 语义）；默认继承工作区。 */
   isolateWorkdir: false,
+  /** 快照合并写延迟（毫秒）。 */
+  saveDebounceMs: 200,
+  /** 是否允许非 owner/角色的会话按 task_id 读取任务（默认 false）。 */
+  allowCrossTaskRead: false,
+  /** 全局任务索引路径；默认 ~/.dsh/artex-index.json。 */
+  indexPath: undefined,
 }
 
 /** planner 不该拥有的执行型工具（ARTEX：planner 不写 fact/asset）。 */
@@ -91,6 +97,12 @@ export const ANALYST_DENY = [
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(ms, 2 ** 31 - 1))))
 
+/** 任务模式优先级：任务参数 > 插件配置 > objective。 */
+export function resolveTaskMode(taskMode, configMode) {
+  if (taskMode) return taskMode === 'audit' ? 'audit' : 'objective'
+  return configMode === 'audit' ? 'audit' : 'objective'
+}
+
 function textOf(blocks) {
   if (!Array.isArray(blocks)) return ''
   return blocks
@@ -114,6 +126,9 @@ export class ArtexEngine {
     this.tasks = new Map() // taskId -> runtime
     this.roles = new Map() // child sessionId -> { taskId, role, intentId, writes, pending }
     this.stores = new Map() // cwd -> { tasks: TaskStore, resources: ResourceStore }
+    this.index = new TaskIndex(this.config.indexPath, {
+      onError: (error) => this.logger.warn?.(`[artex] task index error: ${error?.message || error}`),
+    })
     this.providerName = this.config.provider
     this.disposed = false
   }
@@ -127,7 +142,10 @@ export class ArtexEngine {
   storeFor(cwd) {
     let entry = this.stores.get(cwd)
     if (!entry) {
-      entry = { tasks: new TaskStore(cwd), resources: new ResourceStore(cwd) }
+      entry = {
+        tasks: new TaskStore(cwd, { onError: (error) => this.logger.warn?.(`[artex] snapshot save failed: ${error?.message || error}`) }),
+        resources: new ResourceStore(cwd),
+      }
       this.stores.set(cwd, entry)
     }
     return entry
@@ -162,9 +180,19 @@ export class ArtexEngine {
   }
 
   async loadTask(taskId) {
+    const id = String(taskId)
+    // 先查全局索引（跨 cwd），再回退到本进程已知的 workspace。
+    const cwd = await this.index.lookup(id)
+    if (cwd) {
+      try {
+        return await this.storeFor(cwd).tasks.load(id)
+      } catch {
+        // 索引过期（目录被删/移动），继续回退。
+      }
+    }
     for (const entry of this.stores.values()) {
       try {
-        return await entry.tasks.load(String(taskId))
+        return await entry.tasks.load(id)
       } catch {
         // 换下一个 workspace 根。
       }
@@ -198,6 +226,7 @@ export class ArtexEngine {
     const cwd = await this.cwdFor(agent, signal)
     const stores = this.storeFor(cwd)
     const id = `t${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
+    const effectiveMode = resolveTaskMode(mode, this.config.mode)
     const merged = {
       ...this.config,
       ...Object.fromEntries(Object.entries(limits).filter(([, v]) => v !== undefined && v !== null)),
@@ -208,7 +237,7 @@ export class ArtexEngine {
       goal: String(goal).trim(),
       goals,
       constraints,
-      mode: mode === 'audit' ? 'audit' : 'objective',
+      mode: effectiveMode,
       viewMode: effectiveView,
       ownerSession: agent.id,
       cwd,
@@ -257,6 +286,7 @@ export class ArtexEngine {
     this.tasks.set(id, rt)
     this.evictOld()
     await stores.tasks.save(task)
+    await this.index.register(task).catch(() => undefined)
     rt.loop = this.runLoop(rt).catch((error) => {
       this.logger.warn?.(`[artex] task ${id} loop failed: ${error?.message || error}`)
       if (!rt.finished) this.finish(rt, 'failed', String(error?.message || error))
@@ -296,6 +326,11 @@ export class ArtexEngine {
       Promise.allSettled([...this.tasks.values()].map(rt => rt.done)),
       sleep(3000),
     ])
+    // 把合并写队列里尚未落盘的快照刷掉，避免插件卸载丢最近状态。
+    await Promise.race([
+      Promise.allSettled([...this.stores.values()].map(entry => entry.tasks.flushAll())),
+      sleep(2000),
+    ])
   }
 
   interruptChildren(rt) {
@@ -320,7 +355,7 @@ export class ArtexEngine {
       while (!rt.abort.signal.aborted && !rt.finished) {
         if (rt.settling) {
           await this.drain(rt, t.limits.settleGraceMs)
-          if (!rt.finished && !rt.finalProofDone && t.facts.length > 0 && t.goals.some(g => g.status !== 'met')) {
+          if (!rt.finished && !rt.finalProofDone && (t.facts.length > 0 || t.findings.length > 0) && t.goals.some(g => g.status !== 'met')) {
             // 收尾证明轮：预算已耗尽，但已有事实时用宽限时间做最后一次目标判定。
             rt.finalProofDone = true
             const timeoutMs = Math.max(1000, Math.min(
@@ -396,7 +431,7 @@ export class ArtexEngine {
     } finally {
       await this.drain(rt, 15000)
       this.finish(rt, rt.finishedStatus || 'stopped', rt.finishDetail || '引擎退出')
-      await this.persist(rt)
+      await this.flushPersist(rt)
       rt.doneResolve(t)
       this.cleanupRoles(rt)
     }
@@ -546,7 +581,7 @@ export class ArtexEngine {
       summary: `规划第 ${round} 轮结论`,
       detail: outcome.text,
     })
-    await this.persist(rt)
+    void this.persist(rt)
   }
 
   /* --------------------------------------------------------------- analyst */
@@ -620,7 +655,7 @@ export class ArtexEngine {
         summary: `独立分析第 ${t.round} 轮结论`,
         detail: outcome.text,
       })
-      await this.persist(rt)
+      void this.persist(rt)
       return outcome
     } catch (error) {
       this.addActivity(rt, {
@@ -717,7 +752,7 @@ export class ArtexEngine {
       reason = outcome.error
     } else if (rt.siblingStops?.has(intent.id)) {
       state = 'stopped'
-      reason = 'sibling_breakthrough'
+      reason = t.mode === 'audit' ? 'goal_met' : 'sibling_breakthrough'
     } else if (outcome.timedOut) {
       state = 'exhausted'
       reason = 'worker 预算耗尽'
@@ -954,7 +989,12 @@ export class ArtexEngine {
   }
 
   persist(rt) {
-    return this.storeFor(rt.task.cwd).tasks.save(rt.task)
+    return this.storeFor(rt.task.cwd).tasks.scheduleSave(rt.task, Number(this.config.saveDebounceMs) || 200)
+  }
+
+  /** 立即落盘（收官/停止时用），并清掉合并写队列。 */
+  async flushPersist(rt) {
+    await this.storeFor(rt.task.cwd).tasks.flush(rt.task.id)
   }
 
   addIntents(task, items) {
@@ -1238,6 +1278,7 @@ export class ArtexEngine {
     const endsAt = task.endedAt ?? Date.now()
     return {
       task_id: task.id,
+      owner_session: task.ownerSession,
       status: task.status,
       live: Boolean(live && !live.finished),
       mode: task.mode || 'objective',
