@@ -234,15 +234,15 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 
 | `viewMode` | 行为 | 成本 |
 |---|---|---|
-| `planner`（默认） | 不启用 analyst，沿用 v0.3.2 | 最低 |
-| `hybrid` | 按触发运行：audit 每 3 轮或新增事实 ≥8；objective 出现 `failed` 路径；brief 过期 | 中 |
+| `hybrid`（默认，v0.3.4 起） | 按触发运行：audit 每 3 轮或新增事实 ≥8；objective 出现 `failed` 路径；brief 过期 | 中 |
+| `planner` | 不启用 analyst，沿用 v0.3.2 | 最低 |
 | `analyst` | 每个规划轮都跑一次 | 最高 |
 
 触发与预算（config）：`analystMaxRuns=4`、`analystEveryRounds=3`、`analystFactThreshold=8`、`analystCooldownMs=30000`、`analystTimeoutMs=180000`。单任务可用 `artex_run_task({ view_mode })` 覆盖。
 
 analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**：不能写 fact/finding、不能派意图、不能证明目标、不能改 brief。它的输出建议包含：一致性检查（brief 与事实的矛盾）、被忽略的线索（带 trace id）、覆盖缺口或路径重排、下一步建议。
 
-> 默认仍是 `planner`。是否把 `hybrid` 设为默认，取决于长审计实测中 planner brief 是否出现明显失真（如把"没测"写成"已测"、忘记失败路径、覆盖地图与事实矛盾）。
+> **为什么默认改成 hybrid（v0.3.4）**：一次 3 维度、5 轮、64 次调用的长审计实测里，planner 的 brief 出现了 4 类失真——维度状态过时（已写回的维度仍标"0 条证据/运行中"）、建议重复证明已达成目标、`fact` 之间双栈措辞矛盾、同一主机资源锚点不一致。analyst 一次运行（6 次调用 / 22.3k token，占该任务 132.4k 的 **16.9%**）就逐条指出了这些问题，planner 在 brief 里明确记录了采纳/驳回。对长审计来说，这份开销换来的纠错价值高于成本；短任务或成本敏感场景可用 `view_mode: "planner"` 关掉。
 
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 

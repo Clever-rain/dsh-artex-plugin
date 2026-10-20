@@ -76,6 +76,7 @@ engine = new ArtexEngine({
   ctx,
   config: {
     ...DEFAULTS,
+    viewMode: 'planner',
     debounceMs: 10,
     heartbeatMs: 500,
     maxRounds: 10,

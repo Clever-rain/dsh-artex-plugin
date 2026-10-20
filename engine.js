@@ -51,8 +51,8 @@ export const DEFAULTS = {
   breakthroughGraceMs: 30000,
   /** 任务级预算；0 = 不限。 */
   budgetMs: 0,
-  /** 全局视野策略：planner=只用 planner brief（默认）；hybrid=按触发跑 analyst；analyst=每轮都跑。 */
-  viewMode: 'planner',
+  /** 全局视野策略：hybrid=按触发跑 analyst（默认）；planner=只用 planner brief；analyst=每轮都跑。 */
+  viewMode: 'hybrid',
   /** hybrid/analyst：最多触发多少次独立分析。 */
   analystMaxRuns: 4,
   /** hybrid：至少间隔多少轮触发一次（audit）。 */
