@@ -238,7 +238,26 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 | `planner` | 不启用 analyst，沿用 v0.3.2 | 最低 |
 | `analyst` | 每个规划轮都跑一次 | 最高 |
 
-触发与预算（config）：`analystMaxRuns=4`、`analystEveryRounds=3`、`analystFactThreshold=8`、`analystCooldownMs=30000`、`analystTimeoutMs=180000`。单任务可用 `artex_run_task({ view_mode })` 覆盖。
+触发与预算（config）：`analystMaxRuns=4`、`analystEveryRounds=3`、`analystFactThreshold=8`、`analystCooldownMs=30000`、`analystTimeoutMs=180000`。
+
+### 开关
+
+| 层级 | 字段 | 默认 | 作用 |
+|---|---|---|---|
+| 插件 | `enableHybrid` | `true` | 总开关；`false` 强制 `planner`（传统模式），忽略 `viewMode` |
+| 插件 | `viewMode` | `hybrid` | 精细策略：`planner` / `hybrid` / `analyst` |
+| 任务 | `analyst` | 继承 | `false` 关闭本任务的 analyst（等价 `view_mode: "planner"`） |
+| 任务 | `view_mode` | 继承 | 覆盖本任务的 `viewMode` |
+
+生效优先级：`analyst:false` 或 `enableHybrid:false` → `planner`；否则 `view_mode` > `viewMode` > `hybrid`。
+
+**传统非审计模式** = `mode:"objective"` + `analyst:false`（不跑 analyst；保留 v0.3.1/0.3.2 的收尾证明修复）：
+
+```json
+artex_run_task({ "goal": "...", "mode": "objective", "analyst": false, "view_mode": "planner" })
+```
+
+只想关 analyst、保留 audit 覆盖语义时用 `mode:"audit" + analyst:false`。
 
 analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**：不能写 fact/finding、不能派意图、不能证明目标、不能改 brief。它的输出建议包含：一致性检查（brief 与事实的矛盾）、被忽略的线索（带 trace id）、覆盖缺口或路径重排、下一步建议。
 

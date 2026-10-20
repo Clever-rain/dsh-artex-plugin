@@ -385,9 +385,80 @@ async function runAnalyst() {
   }
 }
 
+async function runAnalystDisabled() {
+  const root = await mkdtemp(join(tmpdir(), 'artex-nohybrid-'))
+  const warnings = []
+  const prompts = []
+  let engine
+  let seq = 0
+  const subagents = {
+    list: () => ['spawn'],
+    getProvider: () => ({ capabilities: { agentOptions: true } }),
+    async startActivation(spec) {
+      const childId = `child-${++seq}`
+      prompts.push(spec.label)
+      const isPlanner = spec.label.includes('planner')
+      const result = new Promise((resolve) => {
+        setTimeout(() => {
+          const r = engine.roles.get(childId)
+          const task = engine.liveTask(r.taskId).task
+          if (isPlanner) {
+            if (task.facts.length > 0 && task.goals[0].status !== 'met') {
+              engine.proveGoal(task, task.goals[0].id, task.facts[0].id, '证据足够')
+            } else if (task.intents.length === 0) {
+              engine.addIntents(task, [{ summary: '采证', kind: 'pursue' }])
+            }
+          } else {
+            engine.recordFacts(task, [{ summary: '证据', evidence: 'x', outcome: 'found' }], r.intentId)
+          }
+          resolve({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' })
+        }, 10)
+      })
+      return { childId, result, dispose: async () => undefined }
+    },
+    async sendMessage() {},
+    interrupt() {},
+  }
+  const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
+  engine = new ArtexEngine({
+    ctx,
+    config: {
+      ...DEFAULTS,
+      enableHybrid: false,
+      viewMode: 'hybrid',
+      debounceMs: 10, heartbeatMs: 500, maxRounds: 4, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 100,
+    },
+    logger: { warn: (...a) => warnings.push(a.join(' ')) },
+  })
+  const agent = { id: 'owner-nohybrid', session: { header: { cwd: root } } }
+  try {
+    const rt = await engine.startTask({
+      agent,
+      goal: '验证 hybrid 总开关',
+      description: 'no hybrid',
+      goals: ['拿到证据'],
+      constraints: [],
+      mode: 'objective',
+      limits: { maxWorkers: 1, maxRounds: 4, debounceMs: 10, heartbeatMs: 500, settleGraceMs: 100 },
+    })
+    const task = await Promise.race([rt.done, sleep(8000).then(() => null)])
+    assert.ok(task, '禁用 hybrid 任务超时')
+    assert.equal(task.status, 'completed')
+    assert.equal(task.viewMode, 'planner')
+    assert.equal(task.analysis, undefined)
+    assert.equal(prompts.some(label => label.includes('analyst')), false, '总开关关闭后不应启动 analyst')
+    assert.equal(warnings.length, 0, `unexpected warnings: ${warnings.join(' | ')}`)
+    console.log('OK no-hybrid', { viewMode: task.viewMode })
+  } finally {
+    await engine.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
 await runObjective()
 await runAudit()
 await runFinalProof()
 await runSettlingProof()
 await runAnalyst()
+await runAnalystDisabled()
 console.log('OK modes')

@@ -142,7 +142,8 @@ const RUN_PARAMETERS = {
   goals: strings('可选：把总目标拆成 1..N 条"可独立判定是否达成"的验收目标；缺省时总目标本身作为唯一目标。规划者用 artex_prove_goal 逐条证明，全部证明后任务自动完成。'),
   constraints: strings('可选：硬约束（安全边界、禁止项、范围限制）。会以最高优先级注入 planner 与每个 worker，凌驾于一切探索偏好。'),
   mode: { type: 'string', enum: ['objective', 'audit'], description: 'objective=达成目的（首个充分突破即收官，可并行铺多条 pursue）；audit=发现风险（覆盖最大化，枚举验证、正负结果都要有证据）。默认 objective。' },
-  view_mode: { type: 'string', enum: ['planner', 'hybrid', 'analyst'], description: '全局视野策略：planner=规划者自维护 brief（默认）；hybrid=按触发跑 analyst；analyst=每轮都跑独立分析。' },
+  view_mode: { type: 'string', enum: ['planner', 'hybrid', 'analyst'], description: '全局视野策略：hybrid=按触发跑 analyst（默认）；planner=只用 planner brief；analyst=每轮都跑。' },
+  analyst: { type: 'boolean', description: 'hybrid 开关（默认继承插件配置，通常为 true）：false=关闭 analyst，回到传统 planner-only 模式；与 mode:"objective" 组合即传统非审计模式。' },
   max_workers: integer('并发 worker 数（默认 3）。0 = 只做规划不执行（用于先看方案）。'),
   max_rounds: integer('规划轮次上限（默认 24），达到后结束任务。'),
   max_stalls: integer('连续多少轮规划没有产出可执行方向就停止（默认 2）。'),
@@ -182,6 +183,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           constraints: args.constraints,
           mode: args.mode,
           viewMode: args.view_mode,
+          analyst: args.analyst,
           limits: pickLimits(args),
           signal: exec.signal,
         })
@@ -210,6 +212,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           constraints: args.constraints,
           mode: args.mode,
           viewMode: args.view_mode,
+          analyst: args.analyst,
           limits: pickLimits(args),
           signal: exec.signal,
         })
@@ -235,7 +238,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
       async execute(args, exec) {
         if (args.task_id) {
           const snapshot = await engine.status(String(args.task_id))
-          return `${snapshot.task_id} [${snapshot.status}] (${snapshot.mode}) ${snapshot.goal}
+          return `${snapshot.task_id} [${snapshot.status}] (${snapshot.mode}/${snapshot.view_mode}) ${snapshot.goal}
 轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings.length} · 资源 ${snapshot.resources}${snapshot.brief_round ? ` · brief@r${snapshot.brief_round}` : ''}
 用时 ${Math.round(snapshot.elapsed_ms / 1000)}s${snapshot.finish_detail ? ` · ${snapshot.finish_detail}` : ''}
 

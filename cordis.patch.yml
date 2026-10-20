@@ -13,6 +13,8 @@
         settleGraceMs: 90000
         budgetMs: 0
         isolateWorkdir: false
+        # hybrid 总开关：默认开启；false=强制传统 planner-only（可在单任务用 analyst:false 覆盖）
+        enableHybrid: true
         # 全局视野策略：hybrid（默认，按触发跑 analyst）/ planner（只用 brief）/ analyst（每轮都跑）
         viewMode: hybrid
         analystMaxRuns: 4

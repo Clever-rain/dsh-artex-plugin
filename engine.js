@@ -51,6 +51,8 @@ export const DEFAULTS = {
   breakthroughGraceMs: 30000,
   /** 任务级预算；0 = 不限。 */
   budgetMs: 0,
+  /** hybrid 总开关：true=按 viewMode 启用 analyst（默认）；false=强制 planner（传统模式）。 */
+  enableHybrid: true,
   /** 全局视野策略：hybrid=按触发跑 analyst（默认）；planner=只用 planner brief；analyst=每轮都跑。 */
   viewMode: 'hybrid',
   /** hybrid/analyst：最多触发多少次独立分析。 */
@@ -180,11 +182,19 @@ export class ArtexEngine {
 
   /* --------------------------------------------------------------- lifecycle */
 
-  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, limits = {}, signal }) {
+  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, signal }) {
     if (this.disposed) throw new Error('ARTEX 插件已卸载')
     if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
     if (!String(goal || '').trim()) throw new Error('goal 不能为空')
     this.providerName = this.resolveProvider()
+    // 开关优先级：任务级 analyst / 插件级 enableHybrid 任一关闭 → planner；
+    // 否则按任务 view_mode > 插件 viewMode > hybrid 生效。
+    const requestedView = ['planner', 'hybrid', 'analyst'].includes(viewMode)
+      ? viewMode
+      : this.config.viewMode
+    const effectiveView = (this.config.enableHybrid === false || analyst === false)
+      ? 'planner'
+      : (['planner', 'hybrid', 'analyst'].includes(requestedView) ? requestedView : 'hybrid')
     const cwd = await this.cwdFor(agent, signal)
     const stores = this.storeFor(cwd)
     const id = `t${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
@@ -199,7 +209,7 @@ export class ArtexEngine {
       goals,
       constraints,
       mode: mode === 'audit' ? 'audit' : 'objective',
-      viewMode: ['planner', 'hybrid', 'analyst'].includes(viewMode) ? viewMode : undefined,
+      viewMode: effectiveView,
       ownerSession: agent.id,
       cwd,
       outDir: stores.tasks.taskDir(id),
@@ -229,7 +239,7 @@ export class ArtexEngine {
       completing: false,
       finalProofDone: false,
       siblingStops: new Set(),
-      viewMode: ['planner', 'hybrid', 'analyst'].includes(viewMode) ? viewMode : this.config.viewMode,
+      viewMode: effectiveView,
       analystRuns: 0,
       lastAnalystAt: 0,
       lastAnalystFactCount: 0,
