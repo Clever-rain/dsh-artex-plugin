@@ -302,8 +302,92 @@ async function runSettlingProof() {
   }
 }
 
+async function runAnalyst() {
+  const root = await mkdtemp(join(tmpdir(), 'artex-analyst-'))
+  const warnings = []
+  const prompts = []
+  let engine
+  let seq = 0
+  const subagents = {
+    list: () => ['spawn'],
+    getProvider: () => ({ capabilities: { agentOptions: true } }),
+    async startActivation(spec) {
+      const childId = `child-${++seq}`
+      const prompt = spec.request.prompt[0].text
+      prompts.push({ label: spec.label, prompt })
+      const isAnalyst = spec.label.includes('analyst')
+      const isPlanner = spec.label.includes('planner')
+      const result = new Promise((resolve) => {
+        setTimeout(() => {
+          const r = engine.roles.get(childId)
+          const task = engine.liveTask(r.taskId).task
+          engine.handleSessionEvent(
+            { header: { id: childId } },
+            {
+              type: 'assistant/message',
+              data: { message: { content: [{ type: 'text', text: 'step' }] }, usage: { inputTokens: 100, outputTokens: 50 } },
+            },
+          )
+          if (isAnalyst) {
+            engine.setAnalysis(task, '## 一致性检查\n- brief 与事实一致（fact#1）\n## 建议\n- 直接证明目标', [])
+          } else if (isPlanner) {
+            if (task.facts.length > 0 && task.goals[0].status !== 'met') {
+              engine.proveGoal(task, task.goals[0].id, task.facts[0].id, '证据足够')
+            } else if (task.intents.length === 0) {
+              engine.addIntents(task, [{ summary: '采证', kind: 'pursue' }])
+            }
+          } else {
+            engine.recordFacts(task, [{ summary: '证据', evidence: 'x', outcome: 'found' }], r.intentId)
+          }
+          resolve({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' })
+        }, 10)
+      })
+      return { childId, result, dispose: async () => undefined }
+    },
+    async sendMessage() {},
+    interrupt() {},
+  }
+  const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
+  engine = new ArtexEngine({
+    ctx,
+    config: {
+      ...DEFAULTS,
+      viewMode: 'hybrid', analystEveryRounds: 1, analystFactThreshold: 1, analystCooldownMs: 0, analystMaxRuns: 3, analystTimeoutMs: 2000,
+      debounceMs: 10, heartbeatMs: 500, maxRounds: 4, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 100,
+    },
+    logger: { warn: (...a) => warnings.push(a.join(' ')) },
+  })
+  const agent = { id: 'owner-analyst', session: { header: { cwd: root } } }
+  try {
+    const rt = await engine.startTask({
+      agent,
+      goal: '验证 analyst 触发与分析注入',
+      description: 'analyst',
+      goals: ['拿到证据'],
+      constraints: [],
+      mode: 'objective',
+      limits: { maxWorkers: 1, maxRounds: 4, debounceMs: 10, heartbeatMs: 500, settleGraceMs: 100 },
+    })
+    const task = await Promise.race([rt.done, sleep(8000).then(() => null)])
+    assert.ok(task, 'analyst 任务超时')
+    assert.equal(task.status, 'completed', `status=${task.status} detail=${task.finishDetail}`)
+    assert.ok(task.analysis?.text, 'analysis 未写入')
+    assert.match(task.analysis.text, /一致性检查/)
+    assert.ok((task.analysisRuns || 0) >= 1)
+    assert.ok(task.usage.by_role?.analyst?.calls >= 1, 'analyst usage 未统计')
+    assert.ok(prompts.some(p => p.label.includes('analyst')), 'analyst 子会话未启动')
+    assert.ok(prompts.some(p => p.label.includes('planner') && p.prompt.includes('独立分析（analyst')), 'planner 未拿到分析')
+    assert.equal(warnings.length, 0, `unexpected warnings: ${warnings.join(' | ')}`)
+    console.log('OK analyst', { runs: task.analysisRuns, calls: task.usage.by_role.analyst.calls })
+  } finally {
+    await engine.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
 await runObjective()
 await runAudit()
 await runFinalProof()
 await runSettlingProof()
+await runAnalyst()
 console.log('OK modes')

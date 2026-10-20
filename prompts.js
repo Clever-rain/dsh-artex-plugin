@@ -70,6 +70,7 @@ export function plannerPrompt({ task, view, triggers, round }) {
     ? task.constraints.map(c => `- ${c}`).join('\n')
     : '（无额外约束）'
   const briefText = task.brief?.text?.trim() || '（尚未建立——本轮必须创建）'
+  const analysisText = task.analysis?.text?.trim()
   const stale = view?.stale_brief === true
   const modeRules = mode === 'audit'
     ? `## audit 模式规则
@@ -109,6 +110,14 @@ ${stale ? '\n⚠ **brief 已过期（落后超过 1 轮），本轮必须更新�
 \`\`\`markdown
 ${BRIEF_TEMPLATE[mode]}
 \`\`\`
+
+${analysisText ? `## 独立分析（analyst，只读输入）
+
+\`\`\`markdown
+${analysisText}
+\`\`\`
+
+> 它**不具决策权**：采纳或驳回由你决定，并在 brief 里写清采纳了哪条、为什么；分析里引用的事实需你自行核对。` : ''}
 
 ${modeRules}
 
@@ -212,6 +221,58 @@ ${json({ ...view, kind })}
 用**一句纯文本**总结：做了什么、这条路径/这批候选的结论是什么、写回了什么。`
 }
 
+/* --------------------------------------------------------------- analyst */
+
+export function analystPrompt({ task, view }) {
+  const mode = task.mode === 'audit' ? 'audit' : 'objective'
+  const briefText = task.brief?.text?.trim() || '（planner 尚未建立 brief）'
+  const constraints = task.constraints.length > 0
+    ? task.constraints.map(c => `- ${c}`).join('\n')
+    : '（无额外约束）'
+  return `# 你的身份：ARTEX 独立分析者（analyst）
+
+你不做决策、不执行、不写事实，也不直接修改 planner 的 brief。你唯一的输出是一份**独立分析**，通过 \`artex_set_analysis\` 提交给 planner 参考。
+
+任务：#${task.id}「${task.description}」（${mode} 模式）
+总目标：${task.goal}
+操作约束：
+${constraints}
+
+## planner 当前的全局认知（brief）
+
+\`\`\`markdown
+${briefText}
+\`\`\`
+
+## 你的职责（只读核查）
+
+1. **一致性**：brief 是否与事实/digest 矛盾、过时或过度自信？列出矛盾点并带上 id。
+2. **被忽略的线索**：从本轮 delta、最近结束的意图、以及需要时的 \`artex_trace\` 中，找出没有进入 brief 但值得注意的观察（报错、旁路、未写回的发现）。
+3. **覆盖/路径状态**：
+   - audit：覆盖地图有没有缺口或伪覆盖（把"没测"写成"已测"）；
+   - objective：路径树是否合理，失败路径是否该回溯、候选是否需要重排。
+4. **建议**：给出下一步优先级与理由，但**不要直接派意图或证明目标**。
+
+输出格式（Markdown，≤1200 字符）：
+
+\`\`\`markdown
+## 一致性检查
+- <矛盾/过时>（fact#id / intent#id）
+## 被忽略的线索
+- <观察>（来源：trace intent#id step#id / fact#id）
+## 覆盖缺口 / 路径重排
+## 建议（供 planner 决定）
+\`\`\`
+
+## 当前态势
+
+\`\`\`json
+${json(view)}
+\`\`\`
+
+只调用 \`artex_set_analysis\` 与只读工具（\`artex_graph_overview\` / \`artex_node_detail\` / \`artex_trace\`）。不要写 fact/finding、不要派意图、不要 prove_goal、不要更新 brief。`
+}
+
 /* --------------------------------------------------------------- settle */
 
 export function settlePrompt(role, kind) {
@@ -256,6 +317,7 @@ export function formatReport(task) {
     ? blueprints.map(i => `- [blueprint#${i.id}] ${i.summary}`).join('\n')
     : '- （无）'
   const brief = task.brief?.text?.trim()
+  const analysis = task.analysis?.text?.trim()
   return `# ARTEX 任务 ${task.id} 结束：${task.status}（${task.mode || 'objective'} 模式）
 
 - 目标：${task.goal}
@@ -265,6 +327,8 @@ export function formatReport(task) {
 
 ## 全局认知（planner brief）
 ${brief ? '```markdown\n' + brief + '\n```' : '（未建立）'}
+
+${analysis ? `## 独立分析（analyst）\n\`\`\`markdown\n${analysis}\n\`\`\`\n` : ''}
 
 ## 目标
 ${goalLines}

@@ -21,9 +21,10 @@ import {
   claimIntent, finishIntent, allGoalsMet, plannerView, workerView, recordFact as graphRecordFact,
   reportFinding as graphReportFinding, setTodos as graphSetTodos, proveGoal as graphProveGoal,
   digestOf, deltaOf, setBrief as graphSetBrief, promoteIntent as graphPromoteIntent,
+  setAnalysis as graphSetAnalysis,
   openIntents, runningIntents,
 } from './graph.js'
-import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
+import { plannerPrompt, workerPrompt, analystPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
 
 export const DEFAULTS = {
   /** ctx.subagents provider；默认 in-process spawn。 */
@@ -50,6 +51,18 @@ export const DEFAULTS = {
   breakthroughGraceMs: 30000,
   /** 任务级预算；0 = 不限。 */
   budgetMs: 0,
+  /** 全局视野策略：planner=只用 planner brief（默认）；hybrid=按触发跑 analyst；analyst=每轮都跑。 */
+  viewMode: 'planner',
+  /** hybrid/analyst：最多触发多少次独立分析。 */
+  analystMaxRuns: 4,
+  /** hybrid：至少间隔多少轮触发一次（audit）。 */
+  analystEveryRounds: 3,
+  /** hybrid：新增事实达到该数量时触发。 */
+  analystFactThreshold: 8,
+  /** 两次分析之间的最小间隔（毫秒）。 */
+  analystCooldownMs: 30000,
+  /** 单次分析的墙钟预算。 */
+  analystTimeoutMs: 180000,
   /** worker/planner 是否在任务目录下的独立 cwd 里工作（ARTEX 语义）；默认继承工作区。 */
   isolateWorkdir: false,
 }
@@ -57,13 +70,21 @@ export const DEFAULTS = {
 /** planner 不该拥有的执行型工具（ARTEX：planner 不写 fact/asset）。 */
 export const PLANNER_DENY = [
   'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
-  'artex_record_fact', 'artex_report_finding', 'artex_add_resource',
+  'artex_record_fact', 'artex_report_finding', 'artex_add_resource', 'artex_set_analysis',
 ]
 
 /** worker 不该拥有的规划/控制型工具（ARTEX：worker 不产意图、不判目标）。 */
 export const WORKER_DENY = [
   'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
   'artex_add_intent', 'artex_prove_goal', 'artex_set_todos', 'artex_set_brief', 'artex_promote_intent',
+  'artex_set_analysis',
+]
+
+/** analyst 只读：不允许任何写图/调度动作。 */
+export const ANALYST_DENY = [
+  'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
+  'artex_add_intent', 'artex_prove_goal', 'artex_set_todos', 'artex_set_brief', 'artex_promote_intent',
+  'artex_record_fact', 'artex_report_finding', 'artex_add_resource',
 ]
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(ms, 2 ** 31 - 1))))
@@ -159,7 +180,7 @@ export class ArtexEngine {
 
   /* --------------------------------------------------------------- lifecycle */
 
-  async startTask({ agent, goal, description, goals, constraints, mode, limits = {}, signal }) {
+  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, limits = {}, signal }) {
     if (this.disposed) throw new Error('ARTEX 插件已卸载')
     if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
     if (!String(goal || '').trim()) throw new Error('goal 不能为空')
@@ -178,6 +199,7 @@ export class ArtexEngine {
       goals,
       constraints,
       mode: mode === 'audit' ? 'audit' : 'objective',
+      viewMode: ['planner', 'hybrid', 'analyst'].includes(viewMode) ? viewMode : undefined,
       ownerSession: agent.id,
       cwd,
       outDir: stores.tasks.taskDir(id),
@@ -207,6 +229,11 @@ export class ArtexEngine {
       completing: false,
       finalProofDone: false,
       siblingStops: new Set(),
+      viewMode: ['planner', 'hybrid', 'analyst'].includes(viewMode) ? viewMode : this.config.viewMode,
+      analystRuns: 0,
+      lastAnalystAt: 0,
+      lastAnalystFactCount: 0,
+      lastAnalystRound: 0,
       finished: false,
       startedAt: Date.now(),
       done: undefined,
@@ -462,6 +489,7 @@ export class ArtexEngine {
     const since = t.lastPlannerRoundAt
     t.lastPlannerRoundAt = Date.now()
     const staleBrief = Boolean(t.brief) && (round - t.brief.round) > 1
+    await this.maybeRunAnalyst(rt, triggers)
     const prompt = plannerPrompt({
       task: t,
       view: plannerView(t, {
@@ -509,6 +537,109 @@ export class ArtexEngine {
       detail: outcome.text,
     })
     await this.persist(rt)
+  }
+
+  /* --------------------------------------------------------------- analyst */
+
+  /**
+   * 按 viewMode 与触发策略决定是否在规划轮之前跑一次独立分析。
+   * analyst 只读、只写 analysis，不参与决策；失败不影响规划（记一条 error 活动）。
+   */
+  async maybeRunAnalyst(rt, triggers = []) {
+    const t = rt.task
+    const mode = rt.viewMode === 'analyst' || rt.viewMode === 'hybrid'
+      ? rt.viewMode
+      : 'planner'
+    if (mode === 'planner' || rt.finished || rt.abort.signal.aborted) return null
+    // 第一轮还没有 brief，分析没有意义。
+    if (t.round <= 1) return null
+    if (triggers.some(x => x.kind === 'final')) return null
+    if ((rt.analystRuns || 0) >= (Number(this.config.analystMaxRuns) || 0)) return null
+    const now = Date.now()
+    if (now - (rt.lastAnalystAt || 0) < (Number(this.config.analystCooldownMs) || 0)) return null
+
+    const every = Math.max(1, Number(this.config.analystEveryRounds) || 3)
+    const factThreshold = Math.max(1, Number(this.config.analystFactThreshold) || 8)
+    const factsSince = t.facts.length - (rt.lastAnalystFactCount || 0)
+    const failedSince = t.intents.filter(i => i.state === 'failed' && (i.endedAt || 0) > (rt.lastAnalystAt || 0)).length
+    const stale = Boolean(t.brief) && (t.round - t.brief.round) > 1
+    let should = false
+    if (mode === 'analyst') {
+      should = true
+    } else if (t.mode === 'audit') {
+      should = (t.round - (rt.lastAnalystRound || 0) >= every) || factsSince >= factThreshold
+    } else {
+      should = failedSince > 0 || (factsSince > 0 && (t.round - (rt.lastAnalystRound || 0) >= every))
+    }
+    if (stale) should = true
+    if (!should) return null
+
+    const since = rt.lastAnalystAt || 0
+    rt.analystRuns = (rt.analystRuns || 0) + 1
+    rt.lastAnalystAt = now
+    rt.lastAnalystFactCount = t.facts.length
+    rt.lastAnalystRound = t.round
+
+    const view = plannerView(t, {
+      factsLimit: 8,
+      digest: digestOf(t),
+      delta: deltaOf(t, since),
+      staleBrief: stale,
+    })
+    this.addActivity(rt, {
+      intentId: null,
+      worker: 'analyst',
+      kind: 'round',
+      summary: `独立分析第 ${t.round} 轮（${mode}）`,
+      detail: `facts_since=${factsSince} failed_since=${failedSince} stale=${stale}`,
+    })
+    try {
+      const outcome = await this.runChild(rt, {
+        role: 'analyst',
+        key: `analyst-${t.round}`,
+        label: `ARTEX analyst · round ${t.round}`,
+        prompt: analystPrompt({ task: t, view }),
+        timeoutMs: Number(this.config.analystTimeoutMs) || 180000,
+        cwd: this.config.isolateWorkdir ? t.outDir : undefined,
+        deny: ANALYST_DENY,
+      })
+      this.addActivity(rt, {
+        intentId: null,
+        worker: 'analyst',
+        kind: 'result',
+        summary: `独立分析第 ${t.round} 轮结论`,
+        detail: outcome.text,
+      })
+      await this.persist(rt)
+      return outcome
+    } catch (error) {
+      this.addActivity(rt, {
+        intentId: null,
+        worker: 'analyst',
+        kind: 'error',
+        summary: `独立分析第 ${t.round} 轮失败`,
+        detail: String(error?.message || error),
+      })
+      this.logger.warn?.(`[artex] analyst failed: ${error?.message || error}`)
+      return null
+    }
+  }
+
+  /** analyst 写入独立分析；planner 读取后自行决定是否采纳。 */
+  setAnalysis(task, text, citations) {
+    const rt = this.runtimeForTask(task)
+    const analysis = graphSetAnalysis(rt.task, text, citations)
+    if (analysis) {
+      this.addActivity(rt, {
+        intentId: null,
+        worker: 'analyst',
+        kind: 'analysis',
+        summary: `提交独立分析（第 ${analysis.round} 轮）`,
+        detail: analysis.text,
+      })
+      void this.persist(rt)
+    }
+    return analysis
   }
 
   /* ---------------------------------------------------------------- worker */
@@ -1100,12 +1231,16 @@ export class ArtexEngine {
       status: task.status,
       live: Boolean(live && !live.finished),
       mode: task.mode || 'objective',
+      view_mode: task.viewMode || this.config.viewMode || 'planner',
       description: task.description,
       goal: task.goal,
       rounds: task.round,
       limits: task.limits,
       brief: task.brief?.text || undefined,
       brief_round: task.brief?.round ?? undefined,
+      analysis: task.analysis?.text || undefined,
+      analysis_round: task.analysis?.round ?? undefined,
+      analysis_runs: task.analysisRuns || 0,
       digest: digestOf(task),
       goals: task.goals.map(g => ({ id: g.id, text: g.text, status: g.status, evidence: g.evidence })),
       intents: {

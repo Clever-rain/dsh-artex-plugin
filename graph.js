@@ -35,7 +35,7 @@ export function createTask(input) {
     outDir: input.outDir,
     status: 'created',
     mode: input.mode === 'audit' ? 'audit' : 'objective',
-    brief: undefined,
+    viewMode: ['planner', 'hybrid', 'analyst'].includes(input.viewMode) ? input.viewMode : undefined,
     lastPlannerRoundAt: 0,
     createdAt: now(),
     updatedAt: now(),
@@ -43,6 +43,8 @@ export function createTask(input) {
     round: 0,
     nodeSeq: 0,
     activitySeq: 0,
+    brief: undefined,
+    analysis: undefined,
     goals: [],
     intents: [],
     facts: [],
@@ -265,6 +267,21 @@ export function setBrief(task, text, citations = []) {
   return task.brief
 }
 
+/** analyst 的独立分析：只读输入、单独存放，planner 决定是否采纳（不直接改 brief）。 */
+export function setAnalysis(task, text, citations = []) {
+  const clean = String(text || '').trim()
+  if (!clean) return undefined
+  task.analysis = {
+    text: truncate(clean, 2000),
+    round: task.round,
+    updatedAt: now(),
+    citations: normalizeIds(citations),
+  }
+  task.analysisRuns = (task.analysisRuns || 0) + 1
+  task.updatedAt = now()
+  return task.analysis
+}
+
 /** 把 blueprint 提升为 open，进入 frontier。 */
 export function promoteIntent(task, id) {
   const intent = intentById(task, id)
@@ -458,6 +475,10 @@ export function plannerView(task, options = {}) {
     stale_brief: options.staleBrief === true,
     digest: options.digest || digestOf(task),
     delta: options.delta,
+    analysis: task.analysis?.text
+      ? { text: truncate(task.analysis.text, 1200), round: task.analysis.round, citations: task.analysis.citations }
+      : undefined,
+    analysis_runs: task.analysisRuns || 0,
     goals: task.goals.map(g => ({
       id: g.id,
       text: g.text,

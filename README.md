@@ -1,6 +1,6 @@
 # @local/dsh-artex — 把 ARTEX 的 agent 编排搬进 DSH
 
-一个 Host 插件：用 DSH 原生的 subagent 机制，复刻 ARTEX（`Autumn-27/ARTEX`）的**双图 + 事件驱动 planner/worker 编排**。装上之后模型获得 14 个 `artex_*` 工具，可以：
+一个 Host 插件：用 DSH 原生的 subagent 机制，复刻 ARTEX（`Autumn-27/ARTEX`）的**双图 + 事件驱动 planner/worker 编排**。装上之后模型获得 17 个 `artex_*` 工具，可以：
 
 - 用一个总目标启动一次**自主多轮编排**：规划者（planner）每轮派意图，多个执行者（worker）并发领取意图干活，图一变就唤醒规划者，直到目标被**证据**证明；
 - 所有中间结论沉淀成可检索的**事实/发现/资源**，而不是散落在对话里；
@@ -64,7 +64,7 @@ DSH 没有 "Go goroutine + Postgres"，但有三样正好够用的原语：**子
 
 | 角色 | 行为 | 工具 |
 |---|---|---|
-| **所有者会话**（调用 `artex_run_task` 的那个 DSH 会话） | 下发目标/约束、在环路操舵、看报告 | 全部 14 个 |
+| **所有者会话**（调用 `artex_run_task` 的那个 DSH 会话） | 下发目标/约束、在环路操舵、看报告 | 全部 17 个 |
 | **planner**（每轮一个新子会话） | 读态势 → 判目标 → 派 0..4 条意图 / 更新串行链待办 | `artex_add_intent`、`artex_prove_goal`、`artex_set_todos` + 读工具 |
 | **worker**（每条意图一个新子会话） | 只做这一条 → 边发现边写回 → 一句话总结 | `artex_record_fact`、`artex_report_finding`、`artex_add_resource` + 读工具 |
 | 其它无关子会话 | 什么都不能做（控制/写操作被身份校验拒绝） | 读工具需显式 `task_id` |
@@ -100,6 +100,7 @@ DSH 没有 "Go goroutine + Postgres"，但有三样正好够用的原语：**子
 | `artex_record_fact` | 写回结论（evidence + confidence + outcome） | worker / 所有者 |
 | `artex_report_finding` | 登记已验证成果 | worker / 所有者 |
 | `artex_add_resource` | 登记跨任务复用的资源/实体 | worker / planner / 所有者 |
+| `artex_set_analysis` | 提交独立分析（只读输入，不改 brief） | analyst / 所有者 |
 
 ---
 
@@ -226,6 +227,22 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 - `audit` 的"覆盖闭合才允许完成"目前是**提示词级约束**（通过 goals 证据实现），不是引擎硬门禁；真正的覆盖清单工具（含未覆盖项报告）留给后续版本。
 - 专职 `analyst`（周期性只读重综合）只预留了接口与触发点，v0.3 未实现；当前由 planner 自维护 brief + 引擎 digest 承担。
 - 单进程内任务状态在插件重载后清空，历史快照仍在 `.artex/tasks/<id>/`。
+
+## 4.7 独立分析者（analyst，v0.3.3）
+
+全局视野分三层：**引擎 digest**（确定性计数）、**planner brief**（战略权威）、**analyst**（周期性只读重综合）。analyst 通过 `artex_set_analysis` 提交独立分析，planner 读取后自行决定采纳/驳回，并写进 brief——**只有 planner 能改 brief**，避免双写震荡。
+
+| `viewMode` | 行为 | 成本 |
+|---|---|---|
+| `planner`（默认） | 不启用 analyst，沿用 v0.3.2 | 最低 |
+| `hybrid` | 按触发运行：audit 每 3 轮或新增事实 ≥8；objective 出现 `failed` 路径；brief 过期 | 中 |
+| `analyst` | 每个规划轮都跑一次 | 最高 |
+
+触发与预算（config）：`analystMaxRuns=4`、`analystEveryRounds=3`、`analystFactThreshold=8`、`analystCooldownMs=30000`、`analystTimeoutMs=180000`。单任务可用 `artex_run_task({ view_mode })` 覆盖。
+
+analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**：不能写 fact/finding、不能派意图、不能证明目标、不能改 brief。它的输出建议包含：一致性检查（brief 与事实的矛盾）、被忽略的线索（带 trace id）、覆盖缺口或路径重排、下一步建议。
+
+> 默认仍是 `planner`。是否把 `hybrid` 设为默认，取决于长审计实测中 planner brief 是否出现明显失真（如把"没测"写成"已测"、忘记失败路径、覆盖地图与事实矛盾）。
 
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 

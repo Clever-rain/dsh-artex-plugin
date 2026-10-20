@@ -13,3 +13,10 @@
         settleGraceMs: 90000
         budgetMs: 0
         isolateWorkdir: false
+        # 全局视野策略：planner（默认，规划者自维护 brief）/ hybrid（按触发跑 analyst）/ analyst（每轮都跑）
+        viewMode: planner
+        analystMaxRuns: 4
+        analystEveryRounds: 3
+        analystFactThreshold: 8
+        analystCooldownMs: 30000
+        analystTimeoutMs: 180000

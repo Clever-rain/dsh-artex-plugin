@@ -6,7 +6,7 @@ import {
   TaskStore, ResourceStore, createTask, addIntents, claimIntent, finishIntent, recordFact,
   reportFinding, addHint, setTodos, proveGoal, allGoalsMet, overview, detail, addActivity,
   listTraces, searchTraces, getTrace, plannerView, workerView,
-  digestOf, deltaOf, setBrief, promoteIntent,
+  digestOf, deltaOf, setBrief, promoteIntent, setAnalysis,
 } from '../graph.js'
 import { plannerPrompt, workerPrompt, settlePrompt, formatReport } from '../prompts.js'
 import { createTools } from '../tools.js'
@@ -91,6 +91,8 @@ try {
   // 提示词渲染：角色投影 + 紧凑 JSON + brief/delta/digest
   setBrief(loaded, '## 已确认结论\n- A 可读（fact#1）\n## 下一步\n- 读 B', [fact.id])
   assert.equal(loaded.brief.round, loaded.round)
+  setAnalysis(loaded, '## 一致性检查\n- 无矛盾（fact#1）\n## 建议\n- 先读 B', [fact.id])
+  assert.equal(loaded.analysisRuns, 1)
   const digest = digestOf(loaded)
   assert.equal(digest.facts.by_outcome.found, 1)
   const delta = deltaOf(loaded, 0)
@@ -102,6 +104,7 @@ try {
   assert.match(planner, /t-test-1/)
   assert.match(planner, /全局认知/)
   assert.match(planner, /A 可读/)
+  assert.match(planner, /独立分析/)
   assert.match(planner, /brief 已过期/)
   assert.equal(planner.includes('"tasks"'), false)
   const worker = workerPrompt({ task: loaded, intent: loaded.intents[0], view: wView })

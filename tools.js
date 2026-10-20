@@ -142,6 +142,7 @@ const RUN_PARAMETERS = {
   goals: strings('可选：把总目标拆成 1..N 条"可独立判定是否达成"的验收目标；缺省时总目标本身作为唯一目标。规划者用 artex_prove_goal 逐条证明，全部证明后任务自动完成。'),
   constraints: strings('可选：硬约束（安全边界、禁止项、范围限制）。会以最高优先级注入 planner 与每个 worker，凌驾于一切探索偏好。'),
   mode: { type: 'string', enum: ['objective', 'audit'], description: 'objective=达成目的（首个充分突破即收官，可并行铺多条 pursue）；audit=发现风险（覆盖最大化，枚举验证、正负结果都要有证据）。默认 objective。' },
+  view_mode: { type: 'string', enum: ['planner', 'hybrid', 'analyst'], description: '全局视野策略：planner=规划者自维护 brief（默认）；hybrid=按触发跑 analyst；analyst=每轮都跑独立分析。' },
   max_workers: integer('并发 worker 数（默认 3）。0 = 只做规划不执行（用于先看方案）。'),
   max_rounds: integer('规划轮次上限（默认 24），达到后结束任务。'),
   max_stalls: integer('连续多少轮规划没有产出可执行方向就停止（默认 2）。'),
@@ -180,6 +181,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           goals: args.goals,
           constraints: args.constraints,
           mode: args.mode,
+          viewMode: args.view_mode,
           limits: pickLimits(args),
           signal: exec.signal,
         })
@@ -207,10 +209,11 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           goals: args.goals,
           constraints: args.constraints,
           mode: args.mode,
+          viewMode: args.view_mode,
           limits: pickLimits(args),
           signal: exec.signal,
         })
-        return `ARTEX 任务已在后台启动：${rt.task.id}（${rt.task.mode} 模式）
+        return `ARTEX 任务已在后台启动：${rt.task.id}（${rt.task.mode} 模式 / 视野 ${rt.task.viewMode || 'planner'}）
 目标：${rt.task.goal}
 验收目标：${rt.task.goals.map(g => `\n  - [goal#${g.id}] ${g.text}`).join('')}
 并发 worker：${rt.task.limits.maxWorkers} · 轮次上限：${rt.task.limits.maxRounds}${rt.task.limits.budgetMs ? ` · 预算：${Math.round(rt.task.limits.budgetMs / 1000)}s` : ''}
@@ -528,6 +531,32 @@ status: pending | in_progress | completed。`,
         return brief
           ? `全局认知已更新（第 ${brief.round} 轮，${brief.text.length} 字符，引用 ${brief.citations.length} 个节点）`
           : '更新失败：text 为空'
+      },
+    }),
+
+    artifact({
+      name: 'artex_set_analysis',
+      description: `analyst 专用（所有者也可手工注入）：提交一份**独立分析**供规划者参考。分析不具决策权：不改 brief、不派意图、不写事实；规划者读取后自行决定采纳或驳回并写清理由。
+建议内容：brief 与事实的一致性检查、被忽略的线索（带 trace/fact id）、覆盖缺口或路径重排建议。` + `\n整体替换，建议 ≤1200 字符。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          text: { type: 'string', required: true, description: '分析全文（Markdown）' },
+          citations: { type: 'array', items: { type: 'integer' }, description: '可选：引用的 fact/finding/intent 节点 id' },
+        },
+        required: ['text'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRole(agent, role, task, ['analyst'])
+        liveRuntime(engine, task)
+        if (!String(args.text || '').trim()) throw new Error('text 不能为空')
+        const analysis = engine.setAnalysis(task, args.text, args.citations)
+        return analysis
+          ? `独立分析已提交（第 ${analysis.round} 轮，${analysis.text.length} 字符，引用 ${analysis.citations.length} 个节点）`
+          : '提交失败：text 为空'
       },
     }),
 
