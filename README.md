@@ -211,6 +211,14 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 | `artex_add_intent` | `kind`：`pursue` / `enumerate`；`state`：`open` / `blueprint`；`path_parent` |
 | `artex_record_fact` | `outcome`：`found` / `none` / `inconclusive` / `blueprint` |
 
+### 实测记录（本机只读 audit）
+
+| 版本 | 结果 | 暴露的问题 → 修复 |
+|---|---|---|
+| v0.3.0 | `max_rounds`，goal 未证明 | 最后一条 worker 刚写完证据、planner 已无机会 `prove_goal` → v0.3.1 收官证明轮 |
+| v0.3.1 | `timeout`，4 条意图全 done 但 goal 未证明 | audit 的 brief 覆盖子项被当成验收标准、持续扩张；预算耗尽路径没有证明轮 → v0.3.2 |
+| v0.3.2 | `completed`，66s / 2 轮 / 12 次调用 / 20.8k tokens | brief 明确"覆盖只用于组织证据，唯一验收维度 goal#1 已满足即停"；未派发的第 2 条意图被标 `stopped/goal_met` |
+
 ### 已知边界
 
 - **v0.3.1 收官证明轮**：轮次用尽但目标仍未全部证明时，引擎会强制补一轮规划，只做目标判定与覆盖核对（不再派新意图），避免"最后一条 worker 刚写完证据、planner 已没有机会 prove_goal"。
