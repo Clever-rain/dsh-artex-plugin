@@ -241,7 +241,69 @@ async function runFinalProof() {
   }
 }
 
+async function runSettlingProof() {
+  const root = await mkdtemp(join(tmpdir(), 'artex-settle-'))
+  const warnings = []
+  let engine
+  let seq = 0
+  const subagents = {
+    list: () => ['spawn'],
+    getProvider: () => ({ capabilities: { agentOptions: true } }),
+    async startActivation(spec) {
+      const childId = `child-${++seq}`
+      const isPlanner = spec.label.includes('planner')
+      const result = new Promise((resolve) => {
+        setTimeout(() => {
+          const r = engine.roles.get(childId)
+          const task = engine.liveTask(r.taskId).task
+          if (isPlanner) {
+            if (task.facts.length > 0 && task.round >= 3 && task.goals[0].status !== 'met') {
+              engine.proveGoal(task, task.goals[0].id, task.facts[0].id, '已有证据')
+            } else if (task.intents.length === 0) {
+              engine.addIntents(task, [{ summary: '采证', kind: 'pursue' }])
+            }
+          } else {
+            engine.recordFacts(task, [{ summary: '证据', evidence: 'x', outcome: 'found' }], r.intentId)
+          }
+          resolve({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' })
+        }, 10)
+      })
+      return { childId, result, dispose: async () => undefined }
+    },
+    async sendMessage() {},
+    interrupt() {},
+  }
+  const ctx = { subagents, get: () => undefined, logger: { warn: (...a) => warnings.push(a.join(' ')) } }
+  engine = new ArtexEngine({
+    ctx,
+    config: { ...DEFAULTS, debounceMs: 400, heartbeatMs: 500, maxRounds: 5, maxWorkers: 1, workerTimeoutMs: 5000, plannerTimeoutMs: 2000, settleGraceMs: 500 },
+    logger: { warn: (...a) => warnings.push(a.join(' ')) },
+  })
+  const agent = { id: 'owner-settle', session: { header: { cwd: root } } }
+  try {
+    const rt = await engine.startTask({
+      agent,
+      goal: '验证收尾证明轮',
+      description: 'settling proof',
+      goals: ['拿到证据'],
+      constraints: [],
+      mode: 'objective',
+      limits: { maxWorkers: 1, maxRounds: 5, debounceMs: 400, heartbeatMs: 500, settleGraceMs: 500, budgetMs: 150 },
+    })
+    const task = await Promise.race([rt.done, sleep(8000).then(() => null)])
+    assert.ok(task, 'settling-proof 任务超时')
+    assert.equal(task.status, 'completed', `status=${task.status} detail=${task.finishDetail}`)
+    assert.equal(task.finishDetail.includes('收尾证明轮'), true)
+    assert.equal(warnings.length, 0, `unexpected warnings: ${warnings.join(' | ')}`)
+    console.log('OK settling-proof', { rounds: task.round, status: task.status })
+  } finally {
+    await engine.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
 await runObjective()
 await runAudit()
 await runFinalProof()
+await runSettlingProof()
 console.log('OK modes')

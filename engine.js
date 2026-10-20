@@ -283,6 +283,19 @@ export class ArtexEngine {
       while (!rt.abort.signal.aborted && !rt.finished) {
         if (rt.settling) {
           await this.drain(rt, t.limits.settleGraceMs)
+          if (!rt.finished && !rt.finalProofDone && t.facts.length > 0 && t.goals.some(g => g.status !== 'met')) {
+            // 收尾证明轮：预算已耗尽，但已有事实时用宽限时间做最后一次目标判定。
+            rt.finalProofDone = true
+            const timeoutMs = Math.max(1000, Math.min(
+              Number(t.limits.plannerTimeoutMs) || 60000,
+              Number(t.limits.settleGraceMs) || 30000,
+            ))
+            await this.plannerRound(rt, [{ kind: 'final', summary: '预算耗尽，做最后一次目标判定' }], { force: true, timeoutMs })
+            if (allGoalsMet(t)) {
+              await this.completeGracefully(rt, '全部目标已证明（收尾证明轮）')
+              break
+            }
+          }
           this.finish(rt, 'timeout', '任务级预算耗尽')
           break
         }
@@ -474,7 +487,7 @@ export class ArtexEngine {
         key: `plan-${round}`,
         label: `ARTEX planner · round ${round}`,
         prompt,
-        timeoutMs: t.limits.plannerTimeoutMs,
+        timeoutMs: options.timeoutMs ?? t.limits.plannerTimeoutMs,
         cwd: this.config.isolateWorkdir ? t.outDir : undefined,
         deny: PLANNER_DENY,
       })
