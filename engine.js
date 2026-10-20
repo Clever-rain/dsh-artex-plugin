@@ -205,6 +205,7 @@ export class ArtexEngine {
       stalls: 0,
       settling: false,
       completing: false,
+      finalProofDone: false,
       siblingStops: new Set(),
       finished: false,
       startedAt: Date.now(),
@@ -293,6 +294,17 @@ export class ArtexEngine {
         const active = rt.running.size > 0 || t.intents.some(i => i.state === 'open')
         if (!active) {
           if (t.round >= t.limits.maxRounds) {
+            const unmet = t.goals.some(g => g.status !== 'met')
+            if (!rt.finalProofDone && unmet) {
+              // 收官证明轮：轮次用尽但已有新证据时，给规划者最后一次判目标的机会。
+              rt.finalProofDone = true
+              await this.plannerRound(rt, [{ kind: 'final', summary: '轮次用尽，做最后一次目标判定' }], { force: true })
+              if (rt.abort.signal.aborted || rt.finished) break
+              if (allGoalsMet(t)) {
+                await this.completeGracefully(rt, '全部目标已证明（收官证明轮）')
+                break
+              }
+            }
             this.finish(rt, 'max_rounds', `达到规划轮次上限 ${t.limits.maxRounds}`)
             break
           }
@@ -429,9 +441,9 @@ export class ArtexEngine {
 
   /* --------------------------------------------------------------- planner */
 
-  async plannerRound(rt, triggers) {
+  async plannerRound(rt, triggers, options = {}) {
     const t = rt.task
-    if (t.round >= t.limits.maxRounds) return
+    if (!options.force && t.round >= t.limits.maxRounds) return
     t.round += 1
     const round = t.round
     const since = t.lastPlannerRoundAt

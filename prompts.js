@@ -36,6 +36,8 @@ function renderTriggers(triggers) {
         return `- 新增目标：${ev.summary || ''}`
       case 'budget':
         return '- 任务预算即将耗尽，进入收尾。'
+      case 'final':
+        return '- **规划轮次已用尽，本轮是收官证明轮**：只做目标判定与覆盖核对（已有证据够就 prove_goal），不再派新意图。'
       default:
         return `- 意图 #${ev.intentId} 结束（${ev.state || 'done'}）：${ev.summary || ''}`
     }
