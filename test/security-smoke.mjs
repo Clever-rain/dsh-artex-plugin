@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import { createTask } from '../graph.js'
 import { createTools } from '../tools.js'
 import { DEFAULTS, resolveTaskMode } from '../engine.js'
+import { TOOL_NAMES, denyForRole, assertPolicyCoverage } from '../policy.js'
+import { normalizeConfig } from '../config.js'
 
 const task = createTask({
   id: 't-sec-1',
@@ -48,4 +50,22 @@ assert.equal(resolveTaskMode(undefined, 'audit'), 'audit')
 assert.equal(resolveTaskMode('objective', 'audit'), 'objective', '任务参数优先')
 assert.equal(resolveTaskMode(undefined, undefined), 'objective')
 
-console.log('OK security', { crossTaskRead: 'guarded' })
+// 角色策略与真实注册工具一致（新增工具漏配会在这里失败）
+const allTools = createTools({ engine, config: { ...DEFAULTS } })
+assertPolicyCoverage(allTools.map(t => t.name))
+assert.equal(TOOL_NAMES.length, allTools.length)
+const workerDeny = denyForRole('worker')
+assert.ok(workerDeny.includes('artex_add_intent'), 'worker 不应能派意图')
+assert.equal(workerDeny.includes('artex_record_fact'), false, 'worker 应保留写回工具')
+const analystDeny = denyForRole('analyst')
+assert.ok(analystDeny.includes('artex_record_fact'), 'analyst 不应写事实')
+assert.equal(analystDeny.includes('artex_set_analysis'), false, 'analyst 应保留 set_analysis')
+
+// 配置归一化：未知键/非法枚举告警，数字与布尔字符串可转换
+const normalized = normalizeConfig({ unknownKey: 1, viewMode: 'bogus', maxWorkers: '4', enableHybrid: 'false' })
+assert.equal(normalized.warnings.length >= 2, true, `应产生告警: ${normalized.warnings.join('; ')}`)
+assert.equal(normalized.config.maxWorkers, 4)
+assert.equal(normalized.config.enableHybrid, false)
+assert.equal(normalized.config.viewMode, 'hybrid', '非法枚举回退默认值')
+
+console.log('OK security', { crossTaskRead: 'guarded', policy: 'consistent' })

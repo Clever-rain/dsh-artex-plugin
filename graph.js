@@ -383,12 +383,13 @@ export function overview(task, options = {}) {
         intent_id: f.intentId,
       })),
     },
-    findings: task.findings.map(f => ({
+    findings: task.findings.slice(-50).map(f => ({
       id: f.id,
       title: f.title,
       severity: f.severity,
       intent_id: f.intentId,
     })),
+    findings_total: task.findings.length,
     hints: task.hints.map(h => ({ id: h.id, text: h.text })),
     todos: task.todos,
     stats: {
@@ -472,14 +473,14 @@ export function plannerView(task, options = {}) {
     }
     return row
   }
+  const deltaFactIds = new Set((options.delta?.facts || []).map(f => f.id))
   return {
     mode: task.mode,
     stale_brief: options.staleBrief === true,
     digest: options.digest || digestOf(task),
     delta: options.delta,
-    analysis: task.analysis?.text
-      ? { text: truncate(task.analysis.text, 1200), round: task.analysis.round, citations: task.analysis.citations }
-      : undefined,
+    // analysis 由提示词正文单独渲染，避免在 JSON 里重复一遍。
+    analysis_round: task.analysis?.round ?? undefined,
     analysis_runs: task.analysisRuns || 0,
     goals: task.goals.map(g => ({
       id: g.id,
@@ -499,7 +500,7 @@ export function plannerView(task, options = {}) {
     },
     facts: {
       total: task.facts.length,
-      recent: facts.slice(-factsLimit).reverse().map(f => ({
+      recent: facts.filter(f => !deltaFactIds.has(f.id)).slice(-factsLimit).reverse().map(f => ({
         id: f.id,
         summary: truncate(f.summary, 160),
         confidence: f.confidence,

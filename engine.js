@@ -25,75 +25,10 @@ import {
   openIntents, runningIntents,
 } from './graph.js'
 import { plannerPrompt, workerPrompt, analystPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
+import { normalizeConfig } from './config.js'
+import { TOOL_NAMES, denyForRole } from './policy.js'
 
-export const DEFAULTS = {
-  /** ctx.subagents provider；默认 in-process spawn。 */
-  provider: 'spawn',
-  /** 任务内 worker 并发（ARTEX 默认 3）。 */
-  maxWorkers: 3,
-  /** 规划轮次上限（安全阀，ARTEX 本身不限轮）。 */
-  maxRounds: 24,
-  /** 连续「规划后仍然无任何可执行方向」的次数上限。 */
-  maxStalls: 2,
-  /** 图变动合并窗口（ARTEX 800ms）。 */
-  debounceMs: 800,
-  /** 无变动时的巡检间隔（ARTEX ≥600s）。 */
-  heartbeatMs: 600000,
-  /** 单个 worker 的墙钟预算（ARTEX agents.run_seconds 默认 1200s）。 */
-  workerTimeoutMs: 1200000,
-  /** 单轮 planner 的墙钟预算（ARTEX planner 自身不限，这里给安全阀）。 */
-  plannerTimeoutMs: 900000,
-  /** 默认任务模式：objective=达成目的；audit=覆盖评估。 */
-  mode: 'objective',
-  /** 预算耗尽后的收尾宽限（ARTEX settleDrainGrace 90s）。 */
-  settleGraceMs: 90000,
-  /** 突破后等待兄弟路径写回现场的宽限。 */
-  breakthroughGraceMs: 30000,
-  /** 任务级预算；0 = 不限。 */
-  budgetMs: 0,
-  /** hybrid 总开关：true=按 viewMode 启用 analyst（默认）；false=强制 planner（传统模式）。 */
-  enableHybrid: true,
-  /** 全局视野策略：hybrid=按触发跑 analyst（默认）；planner=只用 planner brief；analyst=每轮都跑。 */
-  viewMode: 'hybrid',
-  /** hybrid/analyst：最多触发多少次独立分析。 */
-  analystMaxRuns: 4,
-  /** hybrid：至少间隔多少轮触发一次（audit）。 */
-  analystEveryRounds: 3,
-  /** hybrid：新增事实达到该数量时触发。 */
-  analystFactThreshold: 8,
-  /** 两次分析之间的最小间隔（毫秒）。 */
-  analystCooldownMs: 30000,
-  /** 单次分析的墙钟预算。 */
-  analystTimeoutMs: 180000,
-  /** worker/planner 是否在任务目录下的独立 cwd 里工作（ARTEX 语义）；默认继承工作区。 */
-  isolateWorkdir: false,
-  /** 快照合并写延迟（毫秒）。 */
-  saveDebounceMs: 200,
-  /** 是否允许非 owner/角色的会话按 task_id 读取任务（默认 false）。 */
-  allowCrossTaskRead: false,
-  /** 全局任务索引路径；默认 ~/.dsh/artex-index.json。 */
-  indexPath: undefined,
-}
-
-/** planner 不该拥有的执行型工具（ARTEX：planner 不写 fact/asset）。 */
-export const PLANNER_DENY = [
-  'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
-  'artex_record_fact', 'artex_report_finding', 'artex_add_resource', 'artex_set_analysis',
-]
-
-/** worker 不该拥有的规划/控制型工具（ARTEX：worker 不产意图、不判目标）。 */
-export const WORKER_DENY = [
-  'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
-  'artex_add_intent', 'artex_prove_goal', 'artex_set_todos', 'artex_set_brief', 'artex_promote_intent',
-  'artex_set_analysis',
-]
-
-/** analyst 只读：不允许任何写图/调度动作。 */
-export const ANALYST_DENY = [
-  'artex_run_task', 'artex_start_task', 'artex_stop_task', 'artex_add_hint',
-  'artex_add_intent', 'artex_prove_goal', 'artex_set_todos', 'artex_set_brief', 'artex_promote_intent',
-  'artex_record_fact', 'artex_report_finding', 'artex_add_resource',
-]
+export { DEFAULTS } from './config.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(ms, 2 ** 31 - 1))))
 
@@ -121,7 +56,8 @@ function oneLine(value, max = 160) {
 export class ArtexEngine {
   constructor({ ctx, config, logger }) {
     this.ctx = ctx
-    this.config = { ...DEFAULTS, ...(config || {}) }
+    const normalized = normalizeConfig(config || {}, logger)
+    this.config = normalized.config
     this.logger = logger || console
     this.tasks = new Map() // taskId -> runtime
     this.roles = new Map() // child sessionId -> { taskId, role, intentId, writes, pending }
@@ -131,6 +67,16 @@ export class ArtexEngine {
     })
     this.providerName = this.config.provider
     this.disposed = false
+    this.toolNames = [...TOOL_NAMES]
+  }
+
+  /** 真实注册的工具名（index.js 注册后注入；缺省用 policy 的静态清单）。 */
+  setToolNames(names) {
+    if (Array.isArray(names) && names.length > 0) this.toolNames = [...names]
+  }
+
+  denyFor(role) {
+    return denyForRole(role, this.toolNames)
   }
 
   get subagents() {
@@ -562,7 +508,6 @@ export class ArtexEngine {
         prompt,
         timeoutMs: options.timeoutMs ?? t.limits.plannerTimeoutMs,
         cwd: this.config.isolateWorkdir ? t.outDir : undefined,
-        deny: PLANNER_DENY,
       })
     } catch (error) {
       this.addActivity(rt, {
@@ -646,7 +591,6 @@ export class ArtexEngine {
         prompt: analystPrompt({ task: t, view }),
         timeoutMs: Number(this.config.analystTimeoutMs) || 180000,
         cwd: this.config.isolateWorkdir ? t.outDir : undefined,
-        deny: ANALYST_DENY,
       })
       this.addActivity(rt, {
         intentId: null,
@@ -726,7 +670,6 @@ export class ArtexEngine {
         prompt,
         timeoutMs: t.limits.workerTimeoutMs,
         cwd: this.config.isolateWorkdir ? `${t.outDir}/i${intent.id}` : undefined,
-        deny: WORKER_DENY,
       })
     } catch (error) {
       this.finishWorker(rt, intent, {
@@ -807,11 +750,12 @@ export class ArtexEngine {
     let activation
     try {
       if (spec.cwd) await mkdir(spec.cwd, { recursive: true }).catch(() => undefined)
+      const deny = spec.deny ?? this.denyFor(spec.role)
       const request = {
         prompt: [{ type: 'text', text: spec.prompt }],
         parent,
         ...spec.cwd ? { cwd: spec.cwd } : {},
-        ...spec.deny && spec.deny.length > 0 ? { toolFilter: { deny: spec.deny } } : {},
+        ...deny.length > 0 ? { toolFilter: { deny } } : {},
       }
       activation = await this.subagents.startActivation({
         provider: this.providerName,
@@ -1301,7 +1245,8 @@ export class ArtexEngine {
         by_state: stateCount,
       },
       facts: task.facts.length,
-      findings: task.findings.map(f => ({ id: f.id, title: f.title, severity: f.severity, intent_id: f.intentId })),
+      findings: task.findings.slice(-50).map(f => ({ id: f.id, title: f.title, severity: f.severity, intent_id: f.intentId })),
+      findings_total: task.findings.length,
       resources: task.stats.resources,
       usage: task.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
       hints: task.hints.map(h => h.text),

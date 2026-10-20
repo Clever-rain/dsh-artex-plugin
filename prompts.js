@@ -303,18 +303,23 @@ export function formatReport(task) {
   const goalLines = task.goals
     .map(g => `- ${g.status === 'met' ? '✔' : '☐'} [goal#${g.id}] ${g.text}${g.evidence ? `（证据 #${g.evidence}）` : ''}`)
     .join('\n')
+  const capped = (lines, limit) => lines.length > limit
+    ? [...lines.slice(0, limit), `- …另 ${lines.length - limit} 条（见任务快照）`]
+    : lines
   const findingLines = task.findings.length > 0
-    ? task.findings.map(f => `- [finding#${f.id}] ${f.title}（severity=${f.severity}, intent#${f.intentId ?? '-'}）`).join('\n')
+    ? capped(task.findings.map(f => `- [finding#${f.id}] ${f.title}（severity=${f.severity}, intent#${f.intentId ?? '-'}）`), 30).join('\n')
     : '- （无）'
   const intentLine = (i) => `- [intent#${i.id}] ${i.state}${i.kind ? `/${i.kind}` : ''}${i.reason ? `（${i.reason}）` : ''} · writes(facts=${i.writes.facts},findings=${i.writes.findings}) · ${i.summary}`
-  const intentLines = task.intents.length > 0 ? task.intents.map(intentLine).join('\n') : '- （无）'
+  const intentLines = task.intents.length > 0
+    ? capped(task.intents.map(intentLine), 25).join('\n')
+    : '- （无）'
   const stopped = task.intents.filter(i => i.state === 'stopped' || i.state === 'failed')
   const stoppedLines = stopped.length > 0
-    ? stopped.map(i => `- [intent#${i.id}] ${i.state}（${i.reason || '-'}）${i.output ? `：${String(i.output).slice(0, 300)}` : ''}`).join('\n')
+    ? capped(stopped.map(i => `- [intent#${i.id}] ${i.state}（${i.reason || '-'}）${i.output ? `：${String(i.output).slice(0, 300)}` : ''}`), 8).join('\n')
     : '- （无）'
   const blueprints = task.intents.filter(i => i.state === 'blueprint')
   const blueprintLines = blueprints.length > 0
-    ? blueprints.map(i => `- [blueprint#${i.id}] ${i.summary}`).join('\n')
+    ? capped(blueprints.map(i => `- [blueprint#${i.id}] ${i.summary}`), 8).join('\n')
     : '- （无）'
   const brief = task.brief?.text?.trim()
   const analysis = task.analysis?.text?.trim()

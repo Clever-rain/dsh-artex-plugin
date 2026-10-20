@@ -272,6 +272,28 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 - **读权限收紧**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
 - **配置默认值生效**：`config.mode` 现在作为任务默认模式（任务参数优先）。
 
+## 4.9 架构分层（v0.4.0）
+
+| 模块 | 职责 |
+|---|---|
+| `index.js` | 插件入口：建引擎、注册工具、订阅会话事件、生命周期 |
+| `config.js` | 默认值 + `normalizeConfig`（未知键/非法枚举/类型错误显式告警） |
+| `policy.js` | **角色工具策略单一事实来源**：`TOOL_NAMES` + `ROLE_ALLOW` → 自动推导每个角色的 toolFilter deny |
+| `engine.js` | 调度循环、子会话生命周期、analyst、usage、持久化门面 |
+| `graph.js` | 双图模型、角色视图、资源图、文件存储与全局索引 |
+| `prompts.js` | planner / worker / analyst 提示词与报告渲染 |
+| `tools.js` | 17 个模型工具、参数 schema 规范化、角色校验 |
+
+v0.4.0 的具体改动：
+
+- 删掉 engine 里三份 `*_DENY` 常量（31 处硬编码工具名），改为 `policy.js` 的角色白名单推导；新增工具只需改 `TOOL_NAMES`，`security-smoke` 会校验策略与真实注册工具一致。
+- 插件配置统一走 `normalizeConfig`：`viewMode` 非法值回退 `hybrid`、`maxWorkers: "4"` 自动转数字、未知键告警而不是静默忽略。
+- 提示词去重：analyst 的 `analysis` 只在正文渲染一次（原来 JSON 视图里还有一份）；`delta` 里已出现的事实不再重复进 `recent`。
+- 报告与状态加上界：意图 25 条、发现 30 条、被中止路径 8 条、蓝图 8 条，超出显示"另 N 条"；`snapshot` 的发现列表上限 50 并附 `findings_total`。
+- `index.js` 在注册工具后把真实工具名注入引擎，role filter 始终与实际注册集一致。
+
+**仍待拆分（v0.4.1）**：engine.js（~1,200 行）里的子会话执行器 / 调度器 / analyst / usage 可独立成文件；graph.js 的 model / views / store 可拆三层；tools.js 可按控制/读/planner/worker 分组。这些是纯结构重构，行为不变，现有 10 个场景测试可兜底。
+
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
 **有意的简化**

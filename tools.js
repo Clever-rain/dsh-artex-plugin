@@ -250,7 +250,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           requireRead(agent, role, task, config)
           const snapshot = await engine.status(String(task.id))
           return `${snapshot.task_id} [${snapshot.status}] (${snapshot.mode}/${snapshot.view_mode}) ${snapshot.goal}
-轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings.length} · 资源 ${snapshot.resources}${snapshot.brief_round ? ` · brief@r${snapshot.brief_round}` : ''}
+轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings_total ?? snapshot.findings.length} · 资源 ${snapshot.resources}${snapshot.brief_round ? ` · brief@r${snapshot.brief_round}` : ''}
 用时 ${Math.round(snapshot.elapsed_ms / 1000)}s${snapshot.finish_detail ? ` · ${snapshot.finish_detail}` : ''}
 
 ${JSON.stringify(snapshot)}`

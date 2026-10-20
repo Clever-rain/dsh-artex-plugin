@@ -5,7 +5,7 @@
  * 真正的编排逻辑在 engine.js，图模型在 graph.js，角色纪律在 prompts.js。
  */
 
-import { ArtexEngine, DEFAULTS } from './engine.js'
+import { ArtexEngine } from './engine.js'
 import { createTools } from './tools.js'
 
 export const name = 'artex-orchestration'
@@ -33,13 +33,15 @@ export function apply(ctx, config = {}) {
 
   const engine = new ArtexEngine({
     ctx,
-    config: { ...DEFAULTS, ...(config || {}) },
+    config: config || {},
     logger,
   })
 
   // 工具是全局注册的；角色边界由 execute 内的会话身份校验 + 子会话 toolFilter 双重保证。
   ctx.effect(() => {
-    const disposers = createTools({ engine, config: engine.config }).map(definition => ctx.tools.register(definition))
+    const definitions = createTools({ engine, config: engine.config })
+    engine.setToolNames(definitions.map(definition => definition.name))
+    const disposers = definitions.map(definition => ctx.tools.register(definition))
     return () => {
       for (const dispose of disposers) {
         try {

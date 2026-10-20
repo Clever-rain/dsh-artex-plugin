@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-artex",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "ARTEX-style dual-graph planner/worker orchestration for DeepSeek Harness",
@@ -15,6 +15,8 @@
     "graph.js",
     "prompts.js",
     "tools.js",
+    "config.js",
+    "policy.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
