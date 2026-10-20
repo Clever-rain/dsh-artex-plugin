@@ -48,6 +48,7 @@ export function createTask(input) {
     todos: [],
     activities: [],
     stats: emptyStats(),
+    usage: { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
     report: undefined,
   }
   const goalTexts = Array.isArray(input.goals) && input.goals.length > 0 ? input.goals : [input.goal]
@@ -338,9 +339,81 @@ export function overview(task, options = {}) {
   }
 }
 
+/**
+ * 规划者视图：只保留"派意图 / 判目标"需要的字段。
+ * 去掉与提示词正文重复的 task/constraints/todos，省略空血缘与零写回计数。
+ */
+export function plannerView(task, options = {}) {
+  const factsLimit = Math.max(1, Math.min(50, options.factsLimit ?? 12))
+  const q = options.factsQ ? String(options.factsQ).toLowerCase() : ''
+  const facts = q ? task.facts.filter(f => `${f.summary}\n${f.detail}`.toLowerCase().includes(q)) : task.facts
+  const brief = (intent, withState = false) => {
+    const row = { id: intent.id, summary: truncate(intent.summary, 160) }
+    if (intent.parents.length > 0) row.parents = intent.parents
+    const yields = intentYields(task, intent.id)
+    if (yields.length > 0) row.yields = yields
+    if (intent.writes.facts || intent.writes.findings || intent.writes.resources) row.writes = intent.writes
+    if (withState) row.state = intent.state
+    return row
+  }
+  return {
+    goals: task.goals.map(g => ({
+      id: g.id,
+      text: g.text,
+      status: g.status,
+      ...(g.evidence ? { evidence: g.evidence } : {}),
+    })),
+    intents: {
+      open: openIntents(task).map(i => brief(i)),
+      running: runningIntents(task).map(i => brief(i)),
+      recent_done: task.intents
+        .filter(i => ['done', 'exhausted', 'blocked', 'stopped'].includes(i.state))
+        .slice(-6)
+        .reverse()
+        .map(i => brief(i, true)),
+    },
+    facts: {
+      total: task.facts.length,
+      recent: facts.slice(-factsLimit).reverse().map(f => ({
+        id: f.id,
+        summary: truncate(f.summary, 160),
+        confidence: f.confidence,
+        intent_id: f.intentId,
+      })),
+    },
+    findings: task.findings.slice(-20).map(f => ({
+      id: f.id,
+      title: truncate(f.title, 100),
+      severity: f.severity,
+      intent_id: f.intentId,
+    })),
+    hints: task.hints.map(h => ({ id: h.id, text: truncate(h.text, 200) })),
+  }
+}
+
+/**
+ * 执行者视图：只保留"别重复、别越界"所需的最小态势。
+ * 目标是给方向感而不是给全图；别人的完整意图只留一句摘要。
+ */
+export function workerView(task, intent, options = {}) {
+  const factsLimit = Math.max(1, Math.min(20, options.factsLimit ?? 5))
+  const others = task.intents.filter(i => i.state === 'running' && i.id !== intent.id)
+  const done = task.intents.filter(i => ['done', 'exhausted', 'blocked', 'stopped'].includes(i.state)).slice(-3)
+  const view = {
+    goals: task.goals.map(g => `${g.id}.[${g.status}] ${truncate(g.text, 80)}`),
+    facts_total: task.facts.length,
+    findings_total: task.findings.length,
+    facts_recent: task.facts.slice(-factsLimit).reverse().map(f => `#${f.id} [${f.confidence}] ${truncate(f.summary, 80)}`),
+    findings: task.findings.slice(-8).map(f => `#${f.id} ${truncate(f.title, 60)}`),
+  }
+  if (others.length > 0) view.running_others = others.map(i => `#${i.id} ${truncate(i.summary, 90)}`)
+  if (done.length > 0) view.recent_done = done.map(i => `#${i.id} ${i.state} ${truncate(i.summary, 60)}`)
+  if (task.hints.length > 0) view.hints = task.hints.map(h => truncate(h.text, 100))
+  return view
+}
+
 /** Full node content for node_detail. */
-export function detail(task, id) {
-  const n = nodeById(task, id)
+export function detail(task, id) {  const n = nodeById(task, id)
   if (!n) return undefined
   const kind = nodeKind(task, id)
   const base = { ...n, kind }

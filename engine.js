@@ -18,7 +18,7 @@ import { mkdir } from 'node:fs/promises'
 import {
   TaskStore, ResourceStore,
   createTask, addIntents as graphAddIntents, addActivity as graphAddActivity, addHint as graphAddHint,
-  claimIntent, finishIntent, allGoalsMet, overview, recordFact as graphRecordFact,
+  claimIntent, finishIntent, allGoalsMet, plannerView, workerView, recordFact as graphRecordFact,
   reportFinding as graphReportFinding, setTodos as graphSetTodos, proveGoal as graphProveGoal,
   openIntents, runningIntents,
 } from './graph.js'
@@ -384,7 +384,7 @@ export class ArtexEngine {
     if (t.round >= t.limits.maxRounds) return
     t.round += 1
     const round = t.round
-    const prompt = plannerPrompt({ task: t, overview: overview(t, { factsLimit: 20 }), triggers, round })
+    const prompt = plannerPrompt({ task: t, view: plannerView(t, { factsLimit: 12 }), triggers, round })
     this.addActivity(rt, {
       intentId: null,
       worker: 'planner',
@@ -450,7 +450,7 @@ export class ArtexEngine {
 
   async runWorker(rt, intent, workerName) {
     const t = rt.task
-    const prompt = workerPrompt({ task: t, intent, overview: overview(t, { factsLimit: 20 }) })
+    const prompt = workerPrompt({ task: t, intent, view: workerView(t, intent, { factsLimit: 5 }) })
     let outcome
     try {
       outcome = await this.runChild(rt, {
@@ -845,11 +845,29 @@ export class ArtexEngine {
       const sessionId = session?.header?.id ?? session?.id
       if (!sessionId) return
       const role = this.roles.get(sessionId)
-      if (!role || role.role !== 'worker') return
+      if (!role) return
       const rt = this.tasks.get(role.taskId)
       if (!rt || rt.finished) return
       const data = event?.data
       if (!data) return
+
+      // 用量统计对所有角色生效（planner 与 worker 都计入任务成本）。
+      if (event.type === 'assistant/message') {
+        this.recordUsage(rt, role, data.usage)
+        if (role.role !== 'worker') return
+        const text = textOf(data.message?.content)
+        if (!text) return
+        this.addActivity(rt, {
+          intentId: role.intentId,
+          worker: 'worker',
+          kind: 'text',
+          summary: oneLine(text, 160),
+          detail: text,
+        })
+        return
+      }
+
+      if (role.role !== 'worker') return
 
       if (event.type === 'tool/call') {
         const name = String(data.name || '')
@@ -873,23 +891,28 @@ export class ArtexEngine {
           detail,
           isError: data.message?.isError === true || data.error !== undefined,
         })
-        return
-      }
-
-      if (event.type === 'assistant/message') {
-        const text = textOf(data.message?.content)
-        if (!text) return
-        this.addActivity(rt, {
-          intentId: role.intentId,
-          worker: 'worker',
-          kind: 'text',
-          summary: oneLine(text, 160),
-          detail: text,
-        })
       }
     } catch (error) {
       this.logger.warn?.(`[artex] session event index failed: ${error?.message || error}`)
     }
+  }
+
+  /** 累计子会话的 provider usage，作为任务成本口径（输出/输入 token 与调用次数）。 */
+  recordUsage(rt, role, usage) {
+    if (!usage) return
+    const input = Number(usage.inputTokens) || 0
+    const output = Number(usage.outputTokens) || 0
+    if (input === 0 && output === 0) return
+    const t = rt.task
+    t.usage = t.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} }
+    t.usage.by_role = t.usage.by_role || {}
+    t.usage.input_tokens += input
+    t.usage.output_tokens += output
+    t.usage.calls += 1
+    const slot = t.usage.by_role[role.role] || (t.usage.by_role[role.role] = { input_tokens: 0, output_tokens: 0, calls: 0 })
+    slot.input_tokens += input
+    slot.output_tokens += output
+    slot.calls += 1
   }
 
   cleanupRoles(rt) {
@@ -931,6 +954,7 @@ export class ArtexEngine {
       facts: task.facts.length,
       findings: task.findings.map(f => ({ id: f.id, title: f.title, severity: f.severity, intent_id: f.intentId })),
       resources: task.stats.resources,
+      usage: task.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
       hints: task.hints.map(h => h.text),
       todos: task.todos,
       elapsed_ms: endsAt - task.createdAt,

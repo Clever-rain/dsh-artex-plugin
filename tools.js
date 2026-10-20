@@ -230,7 +230,7 @@ export function createTools({ engine, config }) {
 轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings.length} · 资源 ${snapshot.resources}
 用时 ${Math.round(snapshot.elapsed_ms / 1000)}s${snapshot.finish_detail ? ` · ${snapshot.finish_detail}` : ''}
 
-${JSON.stringify(snapshot, null, 2)}`
+${JSON.stringify(snapshot)}`
         }
         const live = await engine.status()
         const { agent } = callerOf(engine, exec)
@@ -302,7 +302,7 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
 
     artifact({
       name: 'artex_graph_overview',
-      description: '读 ARTEX 任务的探索图态势（等同规划者每轮看到的快照）：目标与状态、open/running/recent_done 意图（含血缘 parents/yields 与写回计数）、最近事实、全部发现、提示、跨轮待办、计数。可用 facts_q 在事实全文里检索，facts_limit 调整返回条数。只读。',
+      description: '读 ARTEX 任务的完整探索图态势（比规划者每轮看到的投影更全）：目标与状态、open/running/recent_done 意图（含血缘 parents/yields 与写回计数）、最近事实、最近发现、提示、跨轮待办。可用 facts_q 在事实全文里检索，facts_limit 调整返回条数。只读。',
       parameters: {
         type: 'object',
         properties: {
@@ -318,7 +318,7 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
         return JSON.stringify(overview(task, {
           factsLimit: args.facts_limit ?? 20,
           factsQ: args.facts_q,
-        }), null, 2)
+        }))
       },
     }),
 
@@ -339,7 +339,7 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
         const { task } = await resolve(engine, exec, args.task_id)
         const node = detail(task, args.id)
         if (!node) throw new Error(`节点 #${args.id} 不存在于任务 ${task.id}`)
-        return JSON.stringify(node, null, 2)
+        return JSON.stringify(node)
       },
     }),
 
@@ -369,12 +369,12 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
             limit: args.limit ?? 20,
             excludeIntentId: role?.intentId ?? undefined,
           })
-          return JSON.stringify({ q: args.q, hits, total: hits.length }, null, 2)
+          return JSON.stringify({ q: args.q, hits, total: hits.length })
         }
         if (args.intent_id) {
-          return JSON.stringify(getTrace(task, args.intent_id, args.step_ids), null, 2)
+          return JSON.stringify(getTrace(task, args.intent_id, args.step_ids))
         }
-        return JSON.stringify(listTraces(task), null, 2)
+        return JSON.stringify(listTraces(task))
       },
     }),
 

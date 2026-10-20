@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import {
   TaskStore, ResourceStore, createTask, addIntents, claimIntent, finishIntent, recordFact,
   reportFinding, addHint, setTodos, proveGoal, allGoalsMet, overview, detail, addActivity,
-  listTraces, searchTraces, getTrace,
+  listTraces, searchTraces, getTrace, plannerView, workerView,
 } from '../graph.js'
 import { plannerPrompt, workerPrompt, settlePrompt, formatReport } from '../prompts.js'
 import { createTools } from '../tools.js'
@@ -78,12 +78,22 @@ try {
   assert.equal(loaded.facts.length, 1)
   assert.equal(loaded.status, 'created')
 
-  // 提示词渲染
-  const planner = plannerPrompt({ task: loaded, overview: overview(loaded), triggers: [{ kind: 'done', intentId: id, state: 'done', summary: '完成 A' }], round: 1 })
+  // 提示词渲染：v0.2 用角色投影 + 紧凑 JSON
+  const pView = plannerView(loaded)
+  const wView = workerView(loaded, loaded.intents[0])
+  const planner = plannerPrompt({ task: loaded, view: pView, triggers: [{ kind: 'done', intentId: id, state: 'done', summary: '完成 A' }], round: 1 })
   assert.match(planner, /ARTEX 规划者/)
   assert.match(planner, /t-test-1/)
-  const worker = workerPrompt({ task: loaded, intent: loaded.intents[0], overview: overview(loaded) })
+  assert.equal(planner.includes('"tasks"'), false)
+  const worker = workerPrompt({ task: loaded, intent: loaded.intents[0], view: wView })
   assert.match(worker, /ARTEX 执行者/)
+  assert.equal(worker.includes('"todos"'), false, 'worker 视图不应含 planner 待办')
+  assert.equal(worker.includes('"constraints"'), false, 'worker 视图不应重复 constraints')
+  assert.equal(worker.includes('\n "'), false, 'JSON 应为紧凑格式')
+  assert.ok(worker.length < 3500, `worker prompt 过长: ${worker.length}`)
+  assert.match(worker, new RegExp(`意图 #${loaded.intents[0].id}`))
+  assert.equal(pView.constraints, undefined)
+  assert.equal(pView.todos, undefined)
   assert.match(settlePrompt('worker'), /写回/)
   assert.match(formatReport(loaded), /冒烟任务/)
 

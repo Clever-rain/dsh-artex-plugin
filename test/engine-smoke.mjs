@@ -24,6 +24,17 @@ const subagents = {
         const role = engine.roles.get(childId)
         assert.ok(role, `role missing for ${childId}`)
         const task = engine.liveTask(role.taskId).task
+        // 模拟 provider usage 事件，验证任务成本统计
+        engine.handleSessionEvent(
+          { header: { id: childId } },
+          {
+            type: 'assistant/message',
+            data: {
+              message: { content: [{ type: 'text', text: 'step' }] },
+              usage: { inputTokens: isPlanner ? 300 : 500, outputTokens: isPlanner ? 80 : 120 },
+            },
+          },
+        )
         if (isPlanner) {
           const unusedFact = task.facts.find(f => !task.goals.some(g => g.evidence === f.id))
           const unusedFinding = task.findings.find(f => !task.goals.some(g => g.evidence === f.id))
@@ -96,6 +107,14 @@ try {
   assert.equal(task.intents.every(i => ['done', 'exhausted', 'stopped'].includes(i.state)), true)
   assert.equal(task.intents[0].writes.facts, 1)
   assert.equal(task.intents[1].writes.findings, 1)
+
+  // 成本统计：planner 与 worker 的 usage 都计入任务
+  assert.ok(task.usage, 'usage missing')
+  assert.ok(task.usage.calls >= 3, `usage.calls=${task.usage.calls}`)
+  assert.ok(task.usage.input_tokens > 0)
+  assert.ok(task.usage.by_role.planner.calls >= 1)
+  assert.ok(task.usage.by_role.worker.calls >= 1)
+  assert.match(engine.report(task), /用量：输入 \d+ \/ 输出 \d+ tokens/)
 
   const steps = task.activities.filter(a => a.kind === 'step')
   assert.ok(steps.some(s => s.tool === 'bash'), 'worker tool step not indexed')

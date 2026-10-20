@@ -141,6 +141,24 @@ max_workers: 3
 
 ---
 
+## 4.5 提示词体积（v0.2）
+
+v0.1 把整份 `overview` 以美化 JSON 同时塞给 planner 和每个 worker，重复且昂贵。v0.2 改为**角色投影**：
+
+- `plannerView()`：只留派意图/判目标所需（goals、open/running/recent_done、近 12 条事实、最近发现、hints），去掉与正文重复的 `constraints`/`todos`、空血缘、零写回计数、`stats`。
+- `workerView()`：只留"别重复、别越界"所需（goals 一行、近 5 条事实、发现标题、其他在跑意图的一句话、hints），不再给 worker 看 planner 的待办与全量发现。
+- 两处 JSON 全部改为 `JSON.stringify` 紧凑序列化；`.artex` 落盘快照仍保持可读美化。
+- 任务报告与 `artex_task_status` 新增 `usage`（输入/输出 token、调用次数，按 planner/worker 分角色累计）。
+
+同一份合成任务（4 意图 / 20 事实 / 6 发现）的实测：
+
+| 提示词 | v0.1 | v0.2 | 变化 |
+|---|---|---|---|
+| planner | 8,521 字符 / ≈4,120 token | 4,056 字符 / ≈2,102 token | **-52% 字符 / -49% token** |
+| worker | 6,826 字符 / ≈3,165 token | 1,856 字符 / ≈1,177 token | **-73% 字符 / -63% token** |
+
+`node test/prompt-size.mjs` 可复现该基准。
+
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
 **有意的简化**
