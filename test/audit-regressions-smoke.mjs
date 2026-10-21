@@ -9,7 +9,7 @@ import {
   createTask, addIntents, claimIntent, recordFact, reportFinding, proveGoal, addHint,
   MAX_FACTS, MAX_FINDINGS, MAX_HINTS,
 } from '../model.js'
-import { addIntents as addIntentsOp, recordFacts, proveGoal as proveGoalOp } from '../graph-ops.js'
+import { addIntents as addIntentsOp, recordFacts, proveGoal as proveGoalOp, promoteIntent as promoteIntentOp } from '../graph-ops.js'
 import { ResourceStore, TaskStore, TaskIndex, isValidTaskId } from '../store.js'
 import { ArtexEngine, DEFAULTS } from '../engine.js'
 import { normalizeConfig } from '../config.js'
@@ -254,6 +254,69 @@ try {
   const historyResult = await statusTool.execute({}, { agent: { id: 'owner' } })
   const historyLines = historyResult.text.split('\n').filter(line => /^- t-audit-h\d+$/.test(line))
   assert.equal(historyLines.length, 10, `history=${historyLines.length}`)
+
+  // N11：回读时超过上限也要保留 goals[].evidence（与内存层 trimCollection 对齐）
+  const evidenceStore = new TaskStore(join(root, 'evidence'))
+  const evidenceTask = makeTask('t-audit-16')
+  const evidenceFact = recordFact(evidenceTask, { summary: 'EVIDENCE-FACT', outcome: 'found' })
+  evidenceTask.goals[0].status = 'met'
+  evidenceTask.goals[0].evidence = evidenceFact.id
+  for (let i = 0; i < MAX_FACTS + 20; i += 1) recordFact(evidenceTask, { summary: `noise ${i}` })
+  await evidenceStore.save(evidenceTask)
+  const evidenceLoaded = await evidenceStore.load(evidenceTask.id)
+  assert.equal(evidenceLoaded.facts.length, MAX_FACTS + 1, `facts=${evidenceLoaded.facts.length}（尾部上限 + 证据）`)
+  assert.equal(evidenceLoaded.facts.some(f => f.id === evidenceFact.id), true, '回读后 fact 证据必须保留')
+
+  const evidenceTask2 = makeTask('t-audit-17')
+  const evidenceFinding = reportFinding(evidenceTask2, { title: 'EVIDENCE-FINDING', severity: 'high' })
+  evidenceTask2.goals[0].status = 'met'
+  evidenceTask2.goals[0].evidence = evidenceFinding.id
+  for (let i = 0; i < MAX_FINDINGS + 20; i += 1) reportFinding(evidenceTask2, { title: `noise ${i}` })
+  await evidenceStore.save(evidenceTask2)
+  const findingsLoaded = await evidenceStore.load(evidenceTask2.id)
+  assert.equal(findingsLoaded.findings.length, MAX_FINDINGS + 1, `findings=${findingsLoaded.findings.length}`)
+  assert.equal(findingsLoaded.findings.some(f => f.id === evidenceFinding.id), true, '回读后 finding 证据必须保留')
+
+  // N10′：prove_goal / promote_intent 也走 notify；默认必须唤醒（守住首轮 P0-3）
+  const goalTask = makeTask('t-audit-18')
+  const proofFact = recordFact(goalTask, { summary: 'proof', outcome: 'found' })
+  const goalEvents = []
+  const goalEngine = {
+    ...n1Engine,
+    runtimeForTask: () => ({ task: goalTask }),
+    pushEvent: (_rt, e) => goalEvents.push(e),
+  }
+  proveGoalOp(goalEngine, goalTask, goalTask.goals[0].id, proofFact.id, 'r', false, { notify: false })
+  assert.equal(goalEvents.some(e => e.kind === 'goal'), false, 'planner 自证不应 pushEvent')
+  goalTask.goals[0].status = 'open'          // proveGoal 拒绝重复证明，重置后验证"所有者默认唤醒"
+  goalTask.goals[0].evidence = undefined
+  proveGoalOp(goalEngine, goalTask, goalTask.goals[0].id, proofFact.id, 'r')
+  assert.equal(goalEvents.some(e => e.kind === 'goal'), true, '所有者证明目标必须 pushEvent')
+
+  const promoteTask = makeTask('t-audit-19')
+  const [blueprint] = addIntents(promoteTask, [{ summary: 'blueprint', state: 'blueprint' }])
+  const promoteEvents = []
+  const promoteEngine = {
+    ...n1Engine,
+    runtimeForTask: () => ({ task: promoteTask }),
+    pushEvent: (_rt, e) => promoteEvents.push(e),
+  }
+  promoteIntentOp(promoteEngine, promoteTask, blueprint.id, { notify: false })
+  assert.equal(promoteEvents.some(e => e.kind === 'intent'), false, 'planner 自提升蓝图不应 pushEvent')
+
+  // 工具层：planner 与 owner 传给 proveGoal 的 notify 相反
+  const notifyArgs = []
+  const notifyEngine = {
+    roleOf: (id) => (id === 'planner-sess' ? { role: 'planner', taskId: goalTask.id } : undefined),
+    resolveTask: async () => goalTask,
+    liveTask: () => ({ task: goalTask, finished: false }),
+    proveGoal: (...args) => { notifyArgs.push(args[5]); return { ok: true, kind: 'fact' } },
+  }
+  const proveTool = createTools({ engine: notifyEngine, config: DEFAULTS }).find(t => t.name === 'artex_prove_goal')
+  await proveTool.execute({ goal_id: goalTask.goals[0].id, evidence_id: proofFact.id }, { agent: { id: 'planner-sess' } })
+  await proveTool.execute({ task_id: goalTask.id, goal_id: goalTask.goals[0].id, evidence_id: proofFact.id }, { agent: { id: 'owner' } })
+  assert.equal(notifyArgs[0]?.notify, false, 'planner 调用 prove_goal 应传 notify:false')
+  assert.equal(notifyArgs[1]?.notify, true, 'owner 调用 prove_goal 应传 notify:true')
 
   console.log('OK audit-regressions')
 } finally {

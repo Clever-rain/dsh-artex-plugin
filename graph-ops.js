@@ -50,7 +50,7 @@ export function addHint(engine, task, texts) {
     return added
   }
 
-export function proveGoal(engine, task, goalId, evidenceId, reason, allowNegative = false) {
+export function proveGoal(engine, task, goalId, evidenceId, reason, allowNegative = false, options = {}) {
     const rt = engine.runtimeForTask(task)
     const result = graphProveGoal(rt.task, goalId, evidenceId, reason, { allowNegative })
     if (result.ok) {
@@ -61,7 +61,11 @@ export function proveGoal(engine, task, goalId, evidenceId, reason, allowNegativ
         summary: `目标 #${goalId} 标记达成（证据 #${evidenceId}）`,
         detail: reason || '',
       })
-      engine.pushEvent(rt, { kind: 'goal', summary: `目标 #${goalId} 已证明` })
+      // 默认唤醒：所有者证明目标后必须让主循环立刻收敛（首轮 P0-3）。
+      // 规划者自己证的由本轮返回后的 allGoalsMet 检查兜底，不必再烧一轮。
+      if (options.notify !== false) {
+        engine.pushEvent(rt, { kind: 'goal', summary: `目标 #${goalId} 已证明` })
+      }
       void engine.persist(rt)
     }
     return result
@@ -112,7 +116,7 @@ export function setAnalysis(engine, task, text, citations) {
 
   /* ---------------------------------------------------------------- worker */
 
-export function promoteIntent(engine, task, intentId) {
+export function promoteIntent(engine, task, intentId, options = {}) {
     const rt = engine.runtimeForTask(task)
     const result = graphPromoteIntent(rt.task, intentId)
     if (result.ok) {
@@ -122,7 +126,9 @@ export function promoteIntent(engine, task, intentId) {
         kind: 'promote',
         summary: `蓝图提升为 open：#${result.intent.id}`,
       })
-      engine.pushEvent(rt, { kind: 'intent', summary: `蓝图 #${result.intent.id} 提升为 open` })
+      if (options.notify !== false) {
+        engine.pushEvent(rt, { kind: 'intent', summary: `蓝图 #${result.intent.id} 提升为 open` })
+      }
       void engine.persist(rt)
     }
     return result

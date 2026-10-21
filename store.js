@@ -137,6 +137,20 @@ async function writeAtomic(path, content) {
   await rename(tmp, path)
 }
 
+/**
+ * 回读时的截断策略：保留尾部 max 条，外加 goals[].evidence 指向的节点。
+ * 与 model.js trimCollection 的保护策略一致 —— 否则长任务重启后
+ * 「证据 #N」会指向已被截掉的节点。
+ */
+function keepWithEvidence(items, max, evidenceIds) {
+  if (!Array.isArray(items) || items.length <= max) return items
+  const kept = new Map(items.slice(-max).map(item => [item.id, item]))
+  for (const item of items) {
+    if (evidenceIds.has(item.id)) kept.set(item.id, item)
+  }
+  return [...kept.values()].sort((a, b) => a.id - b.id)
+}
+
 export class TaskStore {
   constructor(cwd, options = {}) {
     this.cwd = cwd
@@ -339,15 +353,21 @@ export class TaskStore {
     if (!raw || typeof raw !== 'object') throw new Error('task snapshot 损坏')
     const factsFile = await this.readJsonl(taskId, 'facts')
     const findingsFile = await this.readJsonl(taskId, 'findings')
+    // 与内存层 trimCollection 对齐：超上限时保留目标证据，否则回读后 evidence 会指向已删节点。
+    const evidenceIds = new Set(
+      (Array.isArray(raw.goals) ? raw.goals : [])
+        .map(goal => Number(goal?.evidence))
+        .filter(id => Number.isFinite(id) && id > 0),
+    )
     if (factsFile.exists) {
       const merged = new Map()
       for (const f of [...(Array.isArray(raw.facts) ? raw.facts : []), ...factsFile.items]) merged.set(f.id, f)
-      raw.facts = [...merged.values()].sort((a, b) => a.id - b.id).slice(-MAX_FACTS)
+      raw.facts = keepWithEvidence([...merged.values()].sort((a, b) => a.id - b.id), MAX_FACTS, evidenceIds)
     }
     if (findingsFile.exists) {
       const merged = new Map()
       for (const f of [...(Array.isArray(raw.findings) ? raw.findings : []), ...findingsFile.items]) merged.set(f.id, f)
-      raw.findings = [...merged.values()].sort((a, b) => a.id - b.id).slice(-MAX_FINDINGS)
+      raw.findings = keepWithEvidence([...merged.values()].sort((a, b) => a.id - b.id), MAX_FINDINGS, evidenceIds)
     }
     // 新格式快照不存 facts/findings；对应 JSONL 不存在时也要补空数组。
     if (!Array.isArray(raw.facts)) raw.facts = []

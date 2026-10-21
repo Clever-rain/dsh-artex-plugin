@@ -386,8 +386,8 @@ export class ArtexEngine {
     return addHintImpl(this, task, texts)
   }
 
-  proveGoal(task, goalId, evidenceId, reason, allowNegative = false) {
-    return proveGoalImpl(this, task, goalId, evidenceId, reason, allowNegative)
+  proveGoal(task, goalId, evidenceId, reason, allowNegative = false, options = {}) {
+    return proveGoalImpl(this, task, goalId, evidenceId, reason, allowNegative, options)
   }
 
   setTodos(task, items) {
@@ -396,8 +396,8 @@ export class ArtexEngine {
   setBrief(task, text, citations) {
     return setBriefImpl(this, task, text, citations)
   }
-  promoteIntent(task, intentId) {
-    return promoteIntentImpl(this, task, intentId)
+  promoteIntent(task, intentId, options = {}) {
+    return promoteIntentImpl(this, task, intentId, options)
   }
 
   roleForIntent(taskId, intentId) {

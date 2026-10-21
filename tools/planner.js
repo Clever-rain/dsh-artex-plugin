@@ -82,7 +82,7 @@ export function plannerTools({ engine, config }) {
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
         requireRole(agent, role, task, ['planner'])
         liveRuntime(engine, task)
-        const result = engine.proveGoal(task, args.goal_id, args.evidence_id, args.reason, args.allow_negative === true)
+        const result = engine.proveGoal(task, args.goal_id, args.evidence_id, args.reason, args.allow_negative === true, { notify: role?.role !== 'planner' })
         if (!result.ok) throw new Error(result.error)
         const remaining = task.goals.filter(g => g.status !== 'met')
         return `目标 #${args.goal_id} 已标记达成（证据 ${result.kind} #${args.evidence_id}）。`
@@ -168,7 +168,7 @@ status: pending | in_progress | completed。`,
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
         requireRole(agent, role, task, ['planner'])
         liveRuntime(engine, task)
-        const result = engine.promoteIntent(task, args.intent_id)
+        const result = engine.promoteIntent(task, args.intent_id, { notify: role?.role !== 'planner' })
         if (!result.ok) throw new Error(result.error)
         return `蓝图 #${result.intent.id} 已提升为 open：${result.intent.summary}`
       },
