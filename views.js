@@ -1,0 +1,280 @@
+/**
+ * 角色视图与查询：overview / plannerView / workerView / digest / delta / trace。
+ * 只读投影，不修改图。
+ */
+
+import { intentById, nodeById, nodeKind, openIntents, runningIntents, truncate } from './model.js'
+
+/* ---------------------------------------------------------------- queries */
+
+export function intentYields(task, intentId) {
+  return [
+    ...task.facts.filter(f => f.intentId === intentId).map(f => f.id),
+    ...task.findings.filter(f => f.intentId === intentId).map(f => f.id),
+  ]
+}
+
+function briefIntent(task, i) {
+  return {
+    id: i.id,
+    summary: i.summary,
+    state: i.state,
+    parents: i.parents,
+    yields: intentYields(task, i.id),
+    writes: i.writes,
+  }
+}
+
+/**
+ * The situational snapshot attached to every planner wake-up (mirrors
+ * graph_overview): goals + open/running/recent_done intents + facts + findings.
+ */
+export function overview(task, options = {}) {
+  const factsLimit = Math.max(1, Math.min(50, options.factsLimit ?? 20))
+  const q = options.factsQ ? String(options.factsQ).toLowerCase() : ''
+  const facts = q ? task.facts.filter(f => `${f.summary}\n${f.detail}`.toLowerCase().includes(q)) : task.facts
+  const recent = facts.slice(-factsLimit).reverse()
+  const done = task.intents.filter(i => ['done', 'exhausted', 'blocked', 'stopped'].includes(i.state)).slice(-8).reverse()
+  return {
+    task: { id: task.id, description: task.description, goal: task.goal, status: task.status },
+    goals: task.goals.map(g => ({ id: g.id, text: g.text, status: g.status, evidence: g.evidence })),
+    constraints: task.constraints,
+    intents: {
+      open: openIntents(task).map(i => briefIntent(task, i)),
+      running: runningIntents(task).map(i => briefIntent(task, i)),
+      recent_done: done.map(i => briefIntent(task, i)),
+    },
+    facts: {
+      total: task.facts.length,
+      recent: recent.map(f => ({
+        id: f.id,
+        summary: f.summary,
+        confidence: f.confidence,
+        intent_id: f.intentId,
+      })),
+    },
+    findings: task.findings.slice(-50).map(f => ({
+      id: f.id,
+      title: f.title,
+      severity: f.severity,
+      intent_id: f.intentId,
+    })),
+    findings_total: task.findings.length,
+    hints: task.hints.map(h => ({ id: h.id, text: h.text })),
+    todos: task.todos,
+    stats: {
+      round: task.round,
+      intents_total: task.intents.length,
+      facts_total: task.facts.length,
+      findings_total: task.findings.length,
+      resources_total: task.stats.resources,
+    },
+  }
+}
+
+/** 确定性事实底数：不产生判断，只统计，供规划者校准 brief。 */
+export function digestOf(task) {
+  const byOutcome = { found: 0, none: 0, inconclusive: 0, blueprint: 0, unset: 0 }
+  for (const f of task.facts) {
+    const key = f.outcome || 'unset'
+    byOutcome[key] = (byOutcome[key] || 0) + 1
+  }
+  const states = {}
+  for (const i of task.intents) states[i.state] = (states[i.state] || 0) + 1
+  return {
+    mode: task.mode,
+    facts: { total: task.facts.length, by_outcome: byOutcome },
+    findings: task.findings.length,
+    intents: states,
+    failed_paths: task.intents
+      .filter(i => i.state === 'failed')
+      .slice(-6)
+      .map(i => ({ id: i.id, summary: truncate(i.summary, 100), reason: i.reason })),
+    resources: task.stats.resources,
+  }
+}
+
+/** 本轮增量：上一次规划之后新增的事实/发现/结束的意图。 */
+export function deltaOf(task, since) {
+  const at = Number(since) || 0
+  return {
+    since: at > 0 ? new Date(at).toISOString() : '(任务开始)',
+    facts: task.facts.filter(f => f.createdAt > at).slice(-10).map(f => ({
+      id: f.id,
+      summary: truncate(f.summary, 120),
+      confidence: f.confidence,
+      outcome: f.outcome,
+      intent_id: f.intentId,
+    })),
+    findings: task.findings.filter(f => f.createdAt > at).slice(-5).map(f => ({
+      id: f.id,
+      title: truncate(f.title, 100),
+      severity: f.severity,
+      intent_id: f.intentId,
+    })),
+    intents: task.intents.filter(i => i.endedAt && i.endedAt > at).slice(-8).map(i => ({
+      id: i.id,
+      state: i.state,
+      summary: truncate(i.summary, 100),
+      reason: i.reason,
+    })),
+  }
+}
+
+/**
+ * 规划者视图：只保留"派意图 / 判目标"需要的字段。
+ * brief 由提示词正文单独渲染，不在这里重复；digest/delta 由引擎注入。
+ */
+export function plannerView(task, options = {}) {
+  const factsLimit = Math.max(1, Math.min(50, options.factsLimit ?? 5))
+  const q = options.factsQ ? String(options.factsQ).toLowerCase() : ''
+  const facts = q ? task.facts.filter(f => `${f.summary}\n${f.detail}`.toLowerCase().includes(q)) : task.facts
+  const briefRow = (intent, withState = false) => {
+    const row = { id: intent.id, summary: truncate(intent.summary, 160) }
+    if (intent.kind === 'pursue') row.kind = 'pursue'
+    if (intent.pathParent) row.path_parent = intent.pathParent
+    if (intent.parents.length > 0) row.parents = intent.parents
+    const yields = intentYields(task, intent.id)
+    if (yields.length > 0) row.yields = yields
+    if (intent.writes.facts || intent.writes.findings || intent.writes.resources) row.writes = intent.writes
+    if (withState) {
+      row.state = intent.state
+      if (intent.reason) row.reason = intent.reason
+    }
+    return row
+  }
+  const deltaFactIds = new Set((options.delta?.facts || []).map(f => f.id))
+  return {
+    mode: task.mode,
+    stale_brief: options.staleBrief === true,
+    digest: options.digest || digestOf(task),
+    delta: options.delta,
+    // analysis 由提示词正文单独渲染，避免在 JSON 里重复一遍。
+    analysis_round: task.analysis?.round ?? undefined,
+    analysis_runs: task.analysisRuns || 0,
+    goals: task.goals.map(g => ({
+      id: g.id,
+      text: g.text,
+      status: g.status,
+      ...(g.evidence ? { evidence: g.evidence } : {}),
+    })),
+    intents: {
+      open: openIntents(task).map(i => briefRow(i)),
+      running: runningIntents(task).map(i => briefRow(i)),
+      blueprints: task.intents.filter(i => i.state === 'blueprint').slice(-10).map(i => briefRow(i)),
+      recent_done: task.intents
+        .filter(i => ['done', 'failed', 'exhausted', 'blocked', 'stopped'].includes(i.state))
+        .slice(-6)
+        .reverse()
+        .map(i => briefRow(i, true)),
+    },
+    facts: {
+      total: task.facts.length,
+      recent: facts.filter(f => !deltaFactIds.has(f.id)).slice(-factsLimit).reverse().map(f => ({
+        id: f.id,
+        summary: truncate(f.summary, 160),
+        confidence: f.confidence,
+        outcome: f.outcome,
+        intent_id: f.intentId,
+      })),
+    },
+    findings: task.findings.slice(-20).map(f => ({
+      id: f.id,
+      title: truncate(f.title, 100),
+      severity: f.severity,
+      intent_id: f.intentId,
+    })),
+    hints: task.hints.map(h => ({ id: h.id, text: truncate(h.text, 200) })),
+  }
+}
+
+/**
+ * 执行者视图：只保留"别重复、别越界"所需的最小态势，外加共享的全局认知摘要。
+ */
+export function workerView(task, intent, options = {}) {
+  const factsLimit = Math.max(1, Math.min(20, options.factsLimit ?? 5))
+  const others = task.intents.filter(i => i.state === 'running' && i.id !== intent.id)
+  const done = task.intents.filter(i => ['done', 'failed', 'exhausted', 'blocked', 'stopped'].includes(i.state)).slice(-3)
+  const view = {
+    mode: task.mode,
+    kind: intent.kind,
+    goals: task.goals.map(g => `${g.id}.[${g.status}] ${truncate(g.text, 80)}`),
+    facts_total: task.facts.length,
+    findings_total: task.findings.length,
+    facts_recent: task.facts.slice(-factsLimit).reverse().map(f => `#${f.id} [${f.confidence}${f.outcome ? `/${f.outcome}` : ''}] ${truncate(f.summary, 80)}`),
+    findings: task.findings.slice(-8).map(f => `#${f.id} ${truncate(f.title, 60)}`),
+  }
+  if (intent.pathParent) {
+    const parent = intentById(task, intent.pathParent)
+    if (parent) view.path = `#${parent.id} ${truncate(parent.summary, 100)}`
+  }
+  if (task.brief?.text) view.brief = truncate(task.brief.text, 600)
+  if (others.length > 0) view.running_others = others.map(i => `#${i.id} ${truncate(i.summary, 70)}`)
+  if (done.length > 0) view.recent_done = done.map(i => `#${i.id} ${i.state} ${truncate(i.summary, 60)}`)
+  if (task.hints.length > 0) view.hints = task.hints.map(h => truncate(h.text, 100))
+  return view
+}
+
+/** Full node content for node_detail. */
+export function detail(task, id) {
+  const n = nodeById(task, id)
+  if (!n) return undefined
+  const kind = nodeKind(task, id)
+  const base = { ...n, kind }
+  if (kind === 'intent') {
+    base.yields = intentYields(task, n.id)
+    base.parents = n.parents
+  }
+  if (kind === 'fact' || kind === 'finding') {
+    base.from_intent = n.intentId ? intentById(task, n.intentId)?.summary : undefined
+  }
+  return base
+}
+
+/** Which intents ran, and how many trace steps each has. */
+export function listTraces(task) {
+  return task.intents
+    .filter(i => i.state !== 'open')
+    .map(i => ({
+      intent_id: i.id,
+      summary: i.summary,
+      state: i.state,
+      steps: task.activities.filter(a => a.intentId === i.id).length,
+      output: truncate(String(i.output || ''), 240),
+    }))
+}
+
+/** Keyword search across every worker's process trace (excludes own intent optionally). */
+export function searchTraces(task, q, options = {}) {
+  const needle = String(q || '').toLowerCase()
+  const limit = Math.max(1, Math.min(100, options.limit ?? 20))
+  if (!needle) return []
+  const exclude = options.excludeIntentId ? Number(options.excludeIntentId) : 0
+  const hits = []
+  for (const a of task.activities) {
+    if (a.intentId && exclude && a.intentId === exclude) continue
+    if (a.kind === 'thinking' || a.kind === 'usage') continue
+    if (!`${a.summary}\n${a.detail}`.toLowerCase().includes(needle)) continue
+    hits.push({ intent_id: a.intentId, step_id: a.id, worker: a.worker, kind: a.kind, tool: a.tool, summary: a.summary })
+    if (hits.length >= limit) break
+  }
+  return hits
+}
+
+/** Trace detail: step list, or full content for up to 5 requested steps. */
+export function getTrace(task, intentId, stepIds) {
+  const steps = task.activities.filter(a => a.intentId === Number(intentId))
+  if (!stepIds || stepIds.length === 0) {
+    return {
+      intent_id: Number(intentId),
+      steps: steps.map(s => ({ step_id: s.id, kind: s.kind, tool: s.tool, summary: s.summary, is_error: s.isError })),
+    }
+  }
+  const wanted = stepIds.map(Number).slice(0, 5)
+  const found = steps.filter(s => wanted.includes(s.id))
+  return {
+    intent_id: Number(intentId),
+    steps: found.map(s => ({ step_id: s.id, kind: s.kind, tool: s.tool, summary: s.summary, is_error: s.isError, detail: s.detail })),
+    omitted_step_ids: stepIds.map(Number).slice(5),
+  }
+}

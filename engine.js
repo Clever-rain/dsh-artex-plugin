@@ -25,32 +25,21 @@ import {
   openIntents, runningIntents,
 } from './graph.js'
 import { plannerPrompt, workerPrompt, analystPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
+import { interruptChildren as interruptChildrenImpl, interruptChild as interruptChildImpl, runChild as runChildImpl, awaitChild as awaitChildImpl, outcome as outcomeImpl, abortOnly as abortOnlyImpl, abortOrTimeout as abortOrTimeoutImpl, nudge as nudgeImpl } from './runner.js'
+import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl } from './scheduler.js'
+import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
+import { recordUsage as recordUsageImpl } from './usage.js'
+import { oneLine, sleep, textOf } from './util.js'
 import { normalizeConfig } from './config.js'
 import { TOOL_NAMES, denyForRole } from './policy.js'
 
 export { DEFAULTS } from './config.js'
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(ms, 2 ** 31 - 1))))
 
 /** 任务模式优先级：任务参数 > 插件配置 > objective。 */
 export function resolveTaskMode(taskMode, configMode) {
   if (taskMode) return taskMode === 'audit' ? 'audit' : 'objective'
   return configMode === 'audit' ? 'audit' : 'objective'
-}
-
-function textOf(blocks) {
-  if (!Array.isArray(blocks)) return ''
-  return blocks
-    .filter(b => b && b.type === 'text' && typeof b.text === 'string')
-    .map(b => b.text)
-    .join('\n')
-    .trim()
-}
-
-function oneLine(value, max = 160) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '')
-  const flat = String(text).replace(/\s+/g, ' ').trim()
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat
 }
 
 export class ArtexEngine {
@@ -280,341 +269,38 @@ export class ArtexEngine {
   }
 
   interruptChildren(rt) {
-    for (const childId of rt.children.values()) this.interruptChild(rt, childId)
+    return interruptChildrenImpl(this, rt)
   }
 
   interruptChild(rt, childId) {
-    try {
-      this.subagents.interrupt(childId, { kind: 'ancestor', agent: rt.ownerAgent })
-    } catch (error) {
-      this.logger.warn?.(`[artex] interrupt ${childId} failed: ${error?.message || error}`)
-    }
+    return interruptChildImpl(this, rt, childId)
   }
 
-  /* ------------------------------------------------------------------ loop */
-
   async runLoop(rt) {
-    const t = rt.task
-    t.status = 'running'
-    this.persist(rt)
-    try {
-      while (!rt.abort.signal.aborted && !rt.finished) {
-        if (rt.settling) {
-          await this.drain(rt, t.limits.settleGraceMs)
-          if (!rt.finished && !rt.finalProofDone && (t.facts.length > 0 || t.findings.length > 0) && t.goals.some(g => g.status !== 'met')) {
-            // 收尾证明轮：预算已耗尽，但已有事实时用宽限时间做最后一次目标判定。
-            rt.finalProofDone = true
-            const timeoutMs = Math.max(1000, Math.min(
-              Number(t.limits.plannerTimeoutMs) || 60000,
-              Number(t.limits.settleGraceMs) || 30000,
-            ))
-            await this.plannerRound(rt, [{ kind: 'final', summary: '预算耗尽，做最后一次目标判定' }], { force: true, timeoutMs })
-            if (allGoalsMet(t)) {
-              await this.completeGracefully(rt, '全部目标已证明（收尾证明轮）')
-              break
-            }
-          }
-          this.finish(rt, 'timeout', '任务级预算耗尽')
-          break
-        }
-        if (allGoalsMet(t)) {
-          await this.completeGracefully(rt, '全部目标已证明')
-          break
-        }
-        this.dispatchWorkers(rt)
-        const active = rt.running.size > 0 || t.intents.some(i => i.state === 'open')
-        if (!active) {
-          if (t.round >= t.limits.maxRounds) {
-            const unmet = t.goals.some(g => g.status !== 'met')
-            if (!rt.finalProofDone && unmet) {
-              // 收官证明轮：轮次用尽但已有新证据时，给规划者最后一次判目标的机会。
-              rt.finalProofDone = true
-              await this.plannerRound(rt, [{ kind: 'final', summary: '轮次用尽，做最后一次目标判定' }], { force: true })
-              if (rt.abort.signal.aborted || rt.finished) break
-              if (allGoalsMet(t)) {
-                await this.completeGracefully(rt, '全部目标已证明（收官证明轮）')
-                break
-              }
-            }
-            this.finish(rt, 'max_rounds', `达到规划轮次上限 ${t.limits.maxRounds}`)
-            break
-          }
-          await this.plannerRound(rt, rt.events.splice(0))
-          if (rt.abort.signal.aborted || rt.finished) break
-          if (allGoalsMet(t)) {
-            await this.completeGracefully(rt, '全部目标已证明')
-            break
-          }
-          if (t.limits.maxWorkers === 0) {
-            this.finish(rt, 'planned', '仅规划模式（max_workers=0），不派 worker')
-            break
-          }
-          this.dispatchWorkers(rt)
-          if (rt.running.size === 0 && !t.intents.some(i => i.state === 'open')) {
-            rt.stalls += 1
-            if (rt.stalls >= t.limits.maxStalls) {
-              this.finish(rt, 'stalled', `连续 ${rt.stalls} 轮规划没有产出可执行的新方向`)
-              break
-            }
-            await this.sleepOrAbort(rt, Math.max(500, t.limits.debounceMs))
-          }
-          continue
-        }
-        const ev = await this.waitEvent(rt, t.limits.heartbeatMs)
-        if (rt.abort.signal.aborted || rt.finished) break
-        if (ev !== 'heartbeat') await this.sleepOrAbort(rt, t.limits.debounceMs)
-        if (rt.abort.signal.aborted || rt.finished) break
-        const triggers = rt.events.splice(0)
-        if (t.round >= t.limits.maxRounds) continue
-        await this.plannerRound(rt, triggers)
-        if (allGoalsMet(t)) {
-          await this.completeGracefully(rt, '全部目标已证明')
-          break
-        }
-      }
-    } catch (error) {
-      if (!rt.finished) this.finish(rt, 'failed', String(error?.message || error))
-    } finally {
-      await this.drain(rt, 15000)
-      this.finish(rt, rt.finishedStatus || 'stopped', rt.finishDetail || '引擎退出')
-      await this.flushPersist(rt)
-      rt.doneResolve(t)
-      this.cleanupRoles(rt)
-    }
+    return runLoopImpl(this, rt)
   }
 
   finish(rt, status, detail) {
-    if (rt.finished) return
-    rt.finished = true
-    const t = rt.task
-    t.status = status
-    t.endedAt = Date.now()
-    t.finishDetail = detail
-    t.report = {
-      status,
-      detail,
-      rounds: t.round,
-      goals: t.goals.map(g => ({ id: g.id, status: g.status, evidence: g.evidence, text: g.text })),
-      facts: t.facts.length,
-      findings: t.findings.length,
-      resources: t.stats.resources,
-    }
-    if (rt.deadlineTimer) {
-      clearTimeout(rt.deadlineTimer)
-      rt.deadlineTimer = undefined
-    }
-    this.interruptChildren(rt)
-    this.wake(rt, 'abort')
-    void this.persist(rt)
+    return finishImpl(this, rt, status, detail)
   }
-
-  /**
-   * 目标达成后的"突破收尾"：先停兄弟 pursue，给它们一个写回现场的宽限，
-   * 再硬停并收官。顺序不能反——finish() 之后写操作会被拒绝。
-   */
   async completeGracefully(rt, detail) {
-    if (rt.completing || rt.finished) return
-    rt.completing = true
-    const t = rt.task
-    const runningIds = [...rt.running.keys()]
-    if (runningIds.length > 0) {
-      rt.siblingStops = new Set(runningIds)
-      for (const intentId of runningIds) {
-        const childId = rt.children.get(`intent-${intentId}`)
-        if (!childId) continue
-        this.addActivity(rt, {
-          intentId,
-          worker: 'engine',
-          kind: 'system',
-          summary: '目标已由其它路径达成，发送"停止并回报现场"指令',
-        })
-        void this.nudge(rt, childId, siblingStopPrompt())
-      }
-      const grace = Number(t.limits.breakthroughGraceMs) || 0
-      await Promise.race([Promise.allSettled([...rt.running.values()]), sleep(grace)])
-      if (rt.running.size > 0) {
-        for (const intentId of [...rt.running.keys()]) {
-          const childId = rt.children.get(`intent-${intentId}`)
-          if (childId) this.interruptChild(rt, childId)
-        }
-        await Promise.race([Promise.allSettled([...rt.running.values()]), sleep(15000)])
-      }
-    }
-    // 队列里尚未领取的意图：目标已达成，不再执行（blueprint 保留为候选记录）。
-    for (const intent of t.intents) {
-      if (intent.state === 'open') {
-        finishIntent(t, intent.id, { state: 'stopped', output: intent.output, reason: 'goal_met', writes: intent.writes })
-      }
-    }
-    this.finish(rt, 'completed', detail)
+    return completeGracefullyImpl(this, rt, detail)
   }
 
   beginSettling(rt) {
-    if (rt.finished || rt.settling) return
-    rt.settling = true
-    for (const [childId, role] of this.roles) {
-      if (role.taskId !== rt.task.id) continue
-      this.addActivity(rt, { intentId: role.intentId, worker: 'engine', kind: 'system', summary: '任务预算耗尽，向子会话发送收尾指令' })
-      void this.nudge(rt, childId, settlePrompt(role.role, role.kind))
-    }
-    this.pushEvent(rt, { kind: 'budget', summary: '任务级预算耗尽' })
+    return beginSettlingImpl(this, rt)
   }
 
   async drain(rt, graceMs) {
-    const running = [...rt.running.values()]
-    if (running.length > 0) {
-      await Promise.race([Promise.allSettled(running), sleep(graceMs > 0 ? graceMs : 0)])
-    }
-    if (rt.running.size === 0) return
-    this.interruptChildren(rt)
-    await Promise.race([Promise.allSettled([...rt.running.values()]), sleep(15000)])
+    return drainImpl(this, rt, graceMs)
   }
-
-  /* --------------------------------------------------------------- planner */
 
   async plannerRound(rt, triggers, options = {}) {
-    const t = rt.task
-    if (!options.force && t.round >= t.limits.maxRounds) return
-    t.round += 1
-    const round = t.round
-    const since = t.lastPlannerRoundAt
-    t.lastPlannerRoundAt = Date.now()
-    const staleBrief = Boolean(t.brief) && (round - t.brief.round) > 1
-    await this.maybeRunAnalyst(rt, triggers)
-    const prompt = plannerPrompt({
-      task: t,
-      view: plannerView(t, {
-        factsLimit: 5,
-        digest: digestOf(t),
-        delta: deltaOf(t, since),
-        staleBrief,
-      }),
-      triggers,
-      round,
-    })
-    this.addActivity(rt, {
-      intentId: null,
-      worker: 'planner',
-      kind: 'round',
-      summary: `规划第 ${round} 轮`,
-      detail: triggers.map(x => `${x.kind}:${x.summary || ''}`).join('\n'),
-    })
-    let outcome
-    try {
-      outcome = await this.runChild(rt, {
-        role: 'planner',
-        key: `plan-${round}`,
-        label: `ARTEX planner · round ${round}`,
-        prompt,
-        timeoutMs: options.timeoutMs ?? t.limits.plannerTimeoutMs,
-        cwd: this.config.isolateWorkdir ? t.outDir : undefined,
-      })
-    } catch (error) {
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'planner',
-        kind: 'error',
-        summary: `规划第 ${round} 轮失败`,
-        detail: String(error?.message || error),
-      })
-      throw error
-    }
-    this.addActivity(rt, {
-      intentId: null,
-      worker: 'planner',
-      kind: 'result',
-      summary: `规划第 ${round} 轮结论`,
-      detail: outcome.text,
-    })
-    void this.persist(rt)
+    return plannerRoundImpl(this, rt, triggers, options)
   }
-
-  /* --------------------------------------------------------------- analyst */
-
-  /**
-   * 按 viewMode 与触发策略决定是否在规划轮之前跑一次独立分析。
-   * analyst 只读、只写 analysis，不参与决策；失败不影响规划（记一条 error 活动）。
-   */
   async maybeRunAnalyst(rt, triggers = []) {
-    const t = rt.task
-    const mode = rt.viewMode === 'analyst' || rt.viewMode === 'hybrid'
-      ? rt.viewMode
-      : 'planner'
-    if (mode === 'planner' || rt.finished || rt.abort.signal.aborted) return null
-    // 第一轮还没有 brief，分析没有意义。
-    if (t.round <= 1) return null
-    if (triggers.some(x => x.kind === 'final')) return null
-    if ((rt.analystRuns || 0) >= (Number(this.config.analystMaxRuns) || 0)) return null
-    const now = Date.now()
-    if (now - (rt.lastAnalystAt || 0) < (Number(this.config.analystCooldownMs) || 0)) return null
-
-    const every = Math.max(1, Number(this.config.analystEveryRounds) || 3)
-    const factThreshold = Math.max(1, Number(this.config.analystFactThreshold) || 8)
-    const factsSince = t.facts.length - (rt.lastAnalystFactCount || 0)
-    const failedSince = t.intents.filter(i => i.state === 'failed' && (i.endedAt || 0) > (rt.lastAnalystAt || 0)).length
-    const stale = Boolean(t.brief) && (t.round - t.brief.round) > 1
-    let should = false
-    if (mode === 'analyst') {
-      should = true
-    } else if (t.mode === 'audit') {
-      should = (t.round - (rt.lastAnalystRound || 0) >= every) || factsSince >= factThreshold
-    } else {
-      should = failedSince > 0 || (factsSince > 0 && (t.round - (rt.lastAnalystRound || 0) >= every))
-    }
-    if (stale) should = true
-    if (!should) return null
-
-    const since = rt.lastAnalystAt || 0
-    rt.analystRuns = (rt.analystRuns || 0) + 1
-    rt.lastAnalystAt = now
-    rt.lastAnalystFactCount = t.facts.length
-    rt.lastAnalystRound = t.round
-
-    const view = plannerView(t, {
-      factsLimit: 8,
-      digest: digestOf(t),
-      delta: deltaOf(t, since),
-      staleBrief: stale,
-    })
-    this.addActivity(rt, {
-      intentId: null,
-      worker: 'analyst',
-      kind: 'round',
-      summary: `独立分析第 ${t.round} 轮（${mode}）`,
-      detail: `facts_since=${factsSince} failed_since=${failedSince} stale=${stale}`,
-    })
-    try {
-      const outcome = await this.runChild(rt, {
-        role: 'analyst',
-        key: `analyst-${t.round}`,
-        label: `ARTEX analyst · round ${t.round}`,
-        prompt: analystPrompt({ task: t, view }),
-        timeoutMs: Number(this.config.analystTimeoutMs) || 180000,
-        cwd: this.config.isolateWorkdir ? t.outDir : undefined,
-      })
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'analyst',
-        kind: 'result',
-        summary: `独立分析第 ${t.round} 轮结论`,
-        detail: outcome.text,
-      })
-      void this.persist(rt)
-      return outcome
-    } catch (error) {
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'analyst',
-        kind: 'error',
-        summary: `独立分析第 ${t.round} 轮失败`,
-        detail: String(error?.message || error),
-      })
-      this.logger.warn?.(`[artex] analyst failed: ${error?.message || error}`)
-      return null
-    }
+    return maybeRunAnalystImpl(this, rt, triggers)
   }
-
-  /** analyst 写入独立分析；planner 读取后自行决定是否采纳。 */
   setAnalysis(task, text, citations) {
     const rt = this.runtimeForTask(task)
     const analysis = graphSetAnalysis(rt.task, text, citations)
@@ -634,297 +320,56 @@ export class ArtexEngine {
   /* ---------------------------------------------------------------- worker */
 
   dispatchWorkers(rt) {
-    if (rt.finished || rt.settling || rt.completing || rt.abort.signal.aborted) return
-    const t = rt.task
-    while (rt.running.size < t.limits.maxWorkers) {
-      const intent = t.intents.find(i => i.state === 'open')
-      if (!intent) break
-      const workerName = `work#${rt.running.size + 1}`
-      claimIntent(t, intent.id, workerName)
-      this.addActivity(rt, {
-        intentId: intent.id,
-        worker: workerName,
-        kind: 'start',
-        summary: `worker 领取意图 #${intent.id}：${oneLine(intent.summary, 120)}`,
-      })
-      const promise = this.runWorker(rt, intent, workerName).catch((error) => {
-        this.logger.warn?.(`[artex] worker #${intent.id} failed: ${error?.message || error}`)
-      }).finally(() => {
-        rt.running.delete(intent.id)
-      })
-      rt.running.set(intent.id, promise)
-    }
+    return dispatchWorkersImpl(this, rt)
   }
 
   async runWorker(rt, intent, workerName) {
-    const t = rt.task
-    const prompt = workerPrompt({ task: t, intent, view: workerView(t, intent, { factsLimit: 5 }) })
-    let outcome
-    try {
-      outcome = await this.runChild(rt, {
-        role: 'worker',
-        key: `intent-${intent.id}`,
-        intentId: intent.id,
-        kind: intent.kind,
-        label: `ARTEX worker · intent #${intent.id}`,
-        prompt,
-        timeoutMs: t.limits.workerTimeoutMs,
-        cwd: this.config.isolateWorkdir ? `${t.outDir}/i${intent.id}` : undefined,
-      })
-    } catch (error) {
-      this.finishWorker(rt, intent, {
-        text: '',
-        stopReason: 'error',
-        timedOut: false,
-        writes: { facts: 0, findings: 0, resources: 0, outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 } },
-        error: String(error?.message || error),
-      })
-      return
-    }
-    this.finishWorker(rt, intent, outcome)
+    return runWorkerImpl(this, rt, intent, workerName)
   }
 
   finishWorker(rt, intent, outcome) {
-    const t = rt.task
-    const writes = outcome.writes || { facts: 0, findings: 0, resources: 0 }
-    const outcomes = writes.outcomes || { found: 0, none: 0, inconclusive: 0, blueprint: 0 }
-    let state
-    let reason
-    if (outcome.error) {
-      state = 'blocked'
-      reason = outcome.error
-    } else if (rt.siblingStops?.has(intent.id)) {
-      state = 'stopped'
-      reason = t.mode === 'audit' ? 'goal_met' : 'sibling_breakthrough'
-    } else if (outcome.timedOut) {
-      state = 'exhausted'
-      reason = 'worker 预算耗尽'
-    } else if (outcome.stopReason === 'aborted') {
-      state = 'stopped'
-      reason = 'aborted'
-    } else if (outcome.stopReason === 'max-tokens') {
-      state = 'exhausted'
-      reason = 'max_tokens'
-    } else if (intent.kind === 'pursue') {
-      if (outcomes.found > 0 || writes.findings > 0) {
-        state = 'done'
-        reason = 'path_success'
-      } else if (outcomes.none > 0) {
-        state = 'failed'
-        reason = 'path_dead'
-      } else {
-        state = 'exhausted'
-        reason = 'no_evidence'
-      }
-    } else {
-      state = 'done'
-      reason = 'enumerated'
-    }
-    finishIntent(t, intent.id, { state, output: outcome.text, reason, writes })
-    this.addActivity(rt, {
-      intentId: intent.id,
-      worker: intent.worker,
-      kind: 'result',
-      summary: `意图 #${intent.id} 结束：${state}`,
-      detail: outcome.text || outcome.error || '',
-      isError: state === 'blocked',
-    })
-    this.pushEvent(rt, {
-      kind: 'done',
-      intentId: intent.id,
-      state,
-      summary: `${oneLine(intent.summary, 100)}${outcome.text ? ` → ${oneLine(outcome.text, 160)}` : ''}`,
-    })
-    void this.persist(rt)
+    return finishWorkerImpl(this, rt, intent, outcome)
   }
 
-  /* ------------------------------------------------------------------ child */
-
   async runChild(rt, spec) {
-    const parent = rt.ownerAgent
-    const controller = new AbortController()
-    const onAbort = () => {
-      try { controller.abort(rt.abort.signal.reason) } catch { /* ignore */ }
-    }
-    rt.abort.signal.addEventListener('abort', onAbort, { once: true })
-    let activation
-    try {
-      if (spec.cwd) await mkdir(spec.cwd, { recursive: true }).catch(() => undefined)
-      const deny = spec.deny ?? this.denyFor(spec.role)
-      const request = {
-        prompt: [{ type: 'text', text: spec.prompt }],
-        parent,
-        ...spec.cwd ? { cwd: spec.cwd } : {},
-        ...deny.length > 0 ? { toolFilter: { deny } } : {},
-      }
-      activation = await this.subagents.startActivation({
-        provider: this.providerName,
-        label: spec.label,
-        request,
-        signal: controller.signal,
-        delivery: 'caller',
-      })
-    } catch (error) {
-      rt.abort.signal.removeEventListener('abort', onAbort)
-      throw new Error(`启动 ${spec.role} 子会话失败：${error?.message || error}`)
-    }
-    const childId = activation.childId
-    const role = {
-      taskId: rt.task.id,
-      role: spec.role,
-      kind: spec.kind || null,
-      intentId: spec.intentId ?? null,
-      writes: { facts: 0, findings: 0, resources: 0, outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 } },
-      pending: new Map(),
-    }
-    this.roles.set(childId, role)
-    if (spec.key) rt.children.set(spec.key, childId)
-    try {
-      return await this.awaitChild(rt, activation, spec, role)
-    } finally {
-      if (spec.key) rt.children.delete(spec.key)
-      this.roles.delete(childId)
-      rt.abort.signal.removeEventListener('abort', onAbort)
-    }
+    return runChildImpl(this, rt, spec)
   }
 
   async awaitChild(rt, activation, spec, role) {
-    const settled = activation.result.then(
-      result => ({ kind: 'settled', result }),
-      error => ({ kind: 'settled', result: { output: [], stopReason: 'error', diagnostic: String(error?.message || error) } }),
-    )
-    const timeoutMs = Number(spec.timeoutMs) > 0 ? Number(spec.timeoutMs) : 0
-    const first = await Promise.race([
-      settled,
-      timeoutMs > 0 ? this.abortOrTimeout(rt, timeoutMs) : this.abortOnly(rt),
-    ])
-
-    if (first.kind === 'settled') return this.outcome(first.result, role, false)
-
-    if (first.kind === 'abort') {
-      this.interruptChild(rt, activation.childId)
-      const after = await Promise.race([settled, sleep(15000).then(() => ({ kind: 'hard' }))])
-      if (after.kind === 'settled') return this.outcome(after.result, role, true)
-      void activation.dispose().catch(() => undefined)
-      return this.outcome({ output: [], stopReason: 'aborted' }, role, true)
-    }
-
-    // 墙钟预算耗尽：先给收尾机会（ARTEX settlement），宽限期后再硬停。
-    await this.nudge(rt, activation.childId, settlePrompt(spec.role))
-    const grace = Number(rt.task.limits.settleGraceMs) || 0
-    const graced = await Promise.race([settled, sleep(grace > 0 ? grace : 0).then(() => ({ kind: 'grace' }))])
-    if (graced.kind === 'settled') return this.outcome(graced.result, role, true)
-    this.interruptChild(rt, activation.childId)
-    const hard = await Promise.race([settled, sleep(30000).then(() => ({ kind: 'hard' }))])
-    if (hard.kind === 'settled') return this.outcome(hard.result, role, true)
-    void activation.dispose().catch(() => undefined)
-    return this.outcome({ output: [], stopReason: 'timeout' }, role, true)
+    return awaitChildImpl(this, rt, activation, spec, role)
   }
 
   outcome(result, role, timedOut) {
-    return {
-      text: textOf(result?.output),
-      stopReason: result?.stopReason || 'completed',
-      timedOut,
-      writes: { ...role.writes, outcomes: { ...role.writes.outcomes } },
-    }
+    return outcomeImpl(this, result, role, timedOut)
   }
 
   abortOnly(rt) {
-    return new Promise((resolve) => {
-      if (rt.abort.signal.aborted) return resolve({ kind: 'abort' })
-      const onAbort = () => {
-        rt.abort.signal.removeEventListener('abort', onAbort)
-        resolve({ kind: 'abort' })
-      }
-      rt.abort.signal.addEventListener('abort', onAbort, { once: true })
-    })
+    return abortOnlyImpl(this, rt)
   }
 
   abortOrTimeout(rt, ms) {
-    return new Promise((resolve) => {
-      let done = false
-      const finish = (value) => {
-        if (done) return
-        done = true
-        clearTimeout(timer)
-        rt.abort.signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      }
-      const onAbort = () => finish({ kind: 'abort' })
-      const timer = setTimeout(() => finish({ kind: 'timeout' }), ms)
-      timer.unref?.()
-      if (rt.abort.signal.aborted) return finish({ kind: 'abort' })
-      rt.abort.signal.addEventListener('abort', onAbort, { once: true })
-    })
+    return abortOrTimeoutImpl(this, rt, ms)
   }
 
   async nudge(rt, childId, text) {
-    try {
-      await this.subagents.sendMessage(
-        rt.ownerAgent,
-        childId,
-        [{ type: 'text', text }],
-        { signal: new AbortController().signal },
-      )
-    } catch (error) {
-      this.logger.warn?.(`[artex] steer ${childId} failed: ${error?.message || error}`)
-    }
+    return nudgeImpl(this, rt, childId, text)
   }
 
-  /* ----------------------------------------------------------- event queue */
-
   pushEvent(rt, event) {
-    rt.events.push(event)
-    this.wake(rt, 'edge')
+    return pushEventImpl(this, rt, event)
   }
 
   wake(rt, kind) {
-    const waiters = rt.waiters.splice(0, rt.waiters.length)
-    for (const waiter of waiters) waiter(kind === 'abort' ? 'abort' : 'edge')
+    return wakeImpl(this, rt, kind)
   }
 
   waitEvent(rt, timeoutMs) {
-    if (rt.events.length > 0) return Promise.resolve('edge')
-    return new Promise((resolve) => {
-      let done = false
-      const finish = (value) => {
-        if (done) return
-        done = true
-        clearTimeout(timer)
-        rt.abort.signal.removeEventListener('abort', onAbort)
-        const index = rt.waiters.indexOf(finish)
-        if (index >= 0) rt.waiters.splice(index, 1)
-        resolve(value)
-      }
-      const onAbort = () => finish('abort')
-      const timer = setTimeout(() => finish('heartbeat'), Math.max(50, timeoutMs))
-      timer.unref?.()
-      if (rt.abort.signal.aborted) return finish('abort')
-      rt.waiters.push(finish)
-      rt.abort.signal.addEventListener('abort', onAbort, { once: true })
-    })
+    return waitEventImpl(this, rt, timeoutMs)
   }
 
   sleepOrAbort(rt, ms) {
-    return new Promise((resolve) => {
-      let done = false
-      const finish = (value) => {
-        if (done) return
-        done = true
-        clearTimeout(timer)
-        rt.abort.signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      }
-      const onAbort = () => finish('abort')
-      const timer = setTimeout(() => finish('timeout'), Math.max(0, ms))
-      timer.unref?.()
-      if (rt.abort.signal.aborted) return finish('abort')
-      rt.abort.signal.addEventListener('abort', onAbort, { once: true })
-    })
+    return sleepOrAbortImpl(this, rt, ms)
   }
-
-  /* --------------------------------------------------------------- mutations */
 
   addActivity(rt, input) {
     const activity = graphAddActivity(rt.task, input)
@@ -1183,20 +628,7 @@ export class ArtexEngine {
 
   /** 累计子会话的 provider usage，作为任务成本口径（输出/输入 token 与调用次数）。 */
   recordUsage(rt, role, usage) {
-    if (!usage) return
-    const input = Number(usage.inputTokens) || 0
-    const output = Number(usage.outputTokens) || 0
-    if (input === 0 && output === 0) return
-    const t = rt.task
-    t.usage = t.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} }
-    t.usage.by_role = t.usage.by_role || {}
-    t.usage.input_tokens += input
-    t.usage.output_tokens += output
-    t.usage.calls += 1
-    const slot = t.usage.by_role[role.role] || (t.usage.by_role[role.role] = { input_tokens: 0, output_tokens: 0, calls: 0 })
-    slot.input_tokens += input
-    slot.output_tokens += output
-    slot.calls += 1
+    return recordUsageImpl(this, rt, role, usage)
   }
 
   cleanupRoles(rt) {
