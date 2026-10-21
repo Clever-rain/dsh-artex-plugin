@@ -254,7 +254,7 @@ export class ArtexEngine {
 
   async stopTask(taskId, reason = '用户/主 agent 停止') {
     const rt = this.liveTask(taskId)
-    if (!rt) return false
+    if (!rt || rt.finished) return false
     rt.finishedStatus = 'stopped'
     rt.finishDetail = reason
     this.interruptChildren(rt)

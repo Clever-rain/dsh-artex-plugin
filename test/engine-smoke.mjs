@@ -112,6 +112,7 @@ try {
   assert.equal(task.intents.every(i => ['done', 'exhausted', 'stopped'].includes(i.state)), true)
   assert.equal(task.intents[0].writes.facts, 1)
   assert.equal(task.intents[1].writes.findings, 1)
+  assert.equal(await engine.stopTask(task.id, '测试'), false, '已完成任务不应再被停止')
 
   // 成本统计：planner 与 worker 的 usage 都计入任务
   assert.ok(task.usage, 'usage missing')
