@@ -14,7 +14,7 @@ function requireRunningIntent(task, intentId) {
   return intent
 }
 
-export function addIntents(engine, task, items) {
+export function addIntents(engine, task, items, options = {}) {
     const rt = engine.runtimeForTask(task)
     const results = graphAddIntents(rt.task, items)
     const created = results.filter(r => r.id > 0).map(r => r.id)
@@ -26,7 +26,10 @@ export function addIntents(engine, task, items) {
         summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}`,
       })
       rt.stalls = 0
-      engine.pushEvent(rt, { kind: 'intent', summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}` })
+      // planner 在自己这一轮里派意图不需要再唤醒自己；所有者手工派意图仍唤醒。
+      if (options.notify !== false) {
+        engine.pushEvent(rt, { kind: 'intent', summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}` })
+      }
       void engine.persist(rt)
     }
     return results

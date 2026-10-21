@@ -6,6 +6,7 @@
 import { mkdir, readFile, writeFile, appendFile, rename, readdir, rm, stat, open } from 'node:fs/promises'
 import { dirname, join, sep } from 'node:path'
 import { homedir } from 'node:os'
+import { MAX_FACTS, MAX_FINDINGS } from './model.js'
 
 export const GRAPH_DIR = '.artex'
 
@@ -142,6 +143,7 @@ export class TaskStore {
     this.root = join(cwd, GRAPH_DIR)
     this.paths = new Map()
     this.pending = new Map()
+    this.written = new Map()
     this.onError = options.onError
     this.lastError = undefined
   }
@@ -159,19 +161,68 @@ export class TaskStore {
     return join(this.taskDir(taskId), 'task.json')
   }
 
-  /** 快照不重复存过程日志：activities 已有 activity.jsonl 作为权威副本。 */
+  /** 快照只存元数据：activities / facts / findings 各自 JSONL 为权威副本。 */
   snapshotPayload(task) {
-    const { activities, ...rest } = task
+    const { activities, facts, findings, ...rest } = task
     return JSON.stringify(rest)
   }
 
-  /** Persist the graph snapshot (atomic rename, compact JSON, no activities). */
+  jsonlPath(taskId, name) {
+    return join(this.taskDir(taskId), `${name}.jsonl`)
+  }
+
+  entryFor(taskId) {
+    let entry = this.written.get(taskId)
+    if (!entry) {
+      entry = { facts: new Set(), findings: new Set(), factLines: 0, findingLines: 0 }
+      this.written.set(taskId, entry)
+    }
+    return entry
+  }
+
+  async appendNew(task, entry) {
+    const facts = Array.isArray(task.facts) ? task.facts : []
+    const findings = Array.isArray(task.findings) ? task.findings : []
+    const newFacts = facts.filter(f => !entry.facts.has(f.id))
+    const newFindings = findings.filter(f => !entry.findings.has(f.id))
+    if (newFacts.length > 0) {
+      const path = this.jsonlPath(task.id, 'facts')
+      await mkdir(dirname(path), { recursive: true })
+      await appendFile(path, newFacts.map(f => `${JSON.stringify(f)}\n`).join(''), 'utf8')
+      for (const f of newFacts) entry.facts.add(f.id)
+      entry.factLines += newFacts.length
+    }
+    if (newFindings.length > 0) {
+      const path = this.jsonlPath(task.id, 'findings')
+      await mkdir(dirname(path), { recursive: true })
+      await appendFile(path, newFindings.map(f => `${JSON.stringify(f)}\n`).join(''), 'utf8')
+      for (const f of newFindings) entry.findings.add(f.id)
+      entry.findingLines += newFindings.length
+    }
+    // 文件行数超过内存上限 2 倍时压实，避免 JSONL 无界增长。
+    if (entry.factLines > MAX_FACTS * 2) {
+      const path = this.jsonlPath(task.id, 'facts')
+      await writeAtomic(path, facts.map(f => `${JSON.stringify(f)}\n`).join(''))
+      entry.facts = new Set(facts.map(f => f.id))
+      entry.factLines = facts.length
+    }
+    if (entry.findingLines > MAX_FINDINGS * 2) {
+      const path = this.jsonlPath(task.id, 'findings')
+      await writeAtomic(path, findings.map(f => `${JSON.stringify(f)}\n`).join(''))
+      entry.findings = new Set(findings.map(f => f.id))
+      entry.findingLines = findings.length
+    }
+  }
+
+  /** Persist metadata + append only new facts/findings (atomic rename, compact JSON). */
   save(task) {
     const path = this.pathOf(task.id)
     const payload = this.snapshotPayload(task)
     const prev = this.paths.get(task.id) ?? Promise.resolve()
     const next = prev.then(async () => {
       await mkdir(dirname(path), { recursive: true })
+      const entry = this.entryFor(task.id)
+      await this.appendNew(task, entry)
       await writeAtomic(path, payload)
     }).catch((error) => {
       this.lastError = error
@@ -228,24 +279,36 @@ export class TaskStore {
     return next
   }
 
-  /** 从 JSONL 尾部回填过程日志（最多 4000 条），避免整份读取 19 MB 级日志。 */
+  /** 从 JSONL 尾部回填过程日志（最多 4000 条）；窗口按平均行长自适应。 */
   async readActivities(taskId) {
     let handle
     try {
       handle = await open(join(this.taskDir(taskId), 'activity.jsonl'), 'r')
       const info = await handle.stat()
-      const maxBytes = 4 * 1024 * 1024
-      const start = Math.max(0, info.size - maxBytes)
-      const length = info.size - start
-      const buffer = Buffer.alloc(length)
-      await handle.read(buffer, 0, length, start)
-      let text = buffer.toString('utf8')
+      const size = info.size
+      if (size === 0) return []
+      const readRange = async (start, length) => {
+        const buffer = Buffer.alloc(length)
+        await handle.read(buffer, 0, length, start)
+        return buffer.toString('utf8')
+      }
+      // 先用 1 MB 探针估算平均行长，避免固定 4 MB 在长行日志下只恢复几百条。
+      const probeLength = Math.min(size, 1024 * 1024)
+      const probeStart = Math.max(0, size - probeLength)
+      const probe = await readRange(probeStart, probeLength)
+      const probeLines = Math.max(1, (probe.match(/\n/g) || []).length)
+      const averageLine = probeLength / probeLines
+      const targetBytes = Math.min(size, Math.max(4 * 1024 * 1024, Math.ceil(averageLine * 4000 * 1.2)))
+      const start = Math.max(0, size - Math.min(targetBytes, 64 * 1024 * 1024))
+      const length = size - start
+      const text = await readRange(start, length)
+      let body = text
       if (start > 0) {
-        const newline = text.indexOf('\n')
-        if (newline >= 0) text = text.slice(newline + 1)
+        const newline = body.indexOf('\n')
+        if (newline >= 0) body = body.slice(newline + 1)
       }
       const out = []
-      for (const line of text.split('\n')) {
+      for (const line of body.split('\n')) {
         if (!line.trim()) continue
         try { out.push(JSON.parse(line)) } catch { /* 跳过损坏行 */ }
       }
@@ -257,9 +320,44 @@ export class TaskStore {
     }
   }
 
+  async readJsonl(taskId, name) {
+    try {
+      const text = await readFile(this.jsonlPath(taskId, name), 'utf8')
+      const items = []
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue
+        try { items.push(JSON.parse(line)) } catch { /* 跳过损坏行 */ }
+      }
+      return { items, exists: true }
+    } catch {
+      return { items: [], exists: false }
+    }
+  }
+
   async load(taskId) {
     const raw = JSON.parse(await readFile(this.pathOf(taskId), 'utf8'))
     if (!raw || typeof raw !== 'object') throw new Error('task snapshot 损坏')
+    const factsFile = await this.readJsonl(taskId, 'facts')
+    const findingsFile = await this.readJsonl(taskId, 'findings')
+    if (factsFile.exists) {
+      const merged = new Map()
+      for (const f of [...(Array.isArray(raw.facts) ? raw.facts : []), ...factsFile.items]) merged.set(f.id, f)
+      raw.facts = [...merged.values()].sort((a, b) => a.id - b.id).slice(-MAX_FACTS)
+    }
+    if (findingsFile.exists) {
+      const merged = new Map()
+      for (const f of [...(Array.isArray(raw.findings) ? raw.findings : []), ...findingsFile.items]) merged.set(f.id, f)
+      raw.findings = [...merged.values()].sort((a, b) => a.id - b.id).slice(-MAX_FINDINGS)
+    }
+    const entry = this.entryFor(taskId)
+    if (factsFile.exists) {
+      entry.facts = new Set(factsFile.items.map(f => f.id))
+      entry.factLines = factsFile.items.length
+    }
+    if (findingsFile.exists) {
+      entry.findings = new Set(findingsFile.items.map(f => f.id))
+      entry.findingLines = findingsFile.items.length
+    }
     if (!Array.isArray(raw.activities) || raw.activities.length === 0) {
       const activities = await this.readActivities(taskId)
       if (activities.length > 0) {
@@ -345,7 +443,7 @@ export class TaskIndex {
         if (error?.code !== 'EEXIST') throw error
         try {
           const info = await stat(lock)
-          if (Date.now() - info.mtimeMs > 3000) {
+          if (Date.now() - info.mtimeMs > 30000) {
             await rm(lock, { recursive: true, force: true }).catch(() => undefined)
             continue
           }

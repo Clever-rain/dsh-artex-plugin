@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createTask, addActivity, TaskStore, ResourceStore, TaskIndex } from '../graph.js'
+import { createTask, addActivity, recordFact, TaskStore, ResourceStore, TaskIndex } from '../graph.js'
 
 const root = await mkdtemp(join(tmpdir(), 'artex-persist-'))
 try {
@@ -58,6 +58,23 @@ try {
   await index.register(task)
   const index2 = new TaskIndex(indexPath)
   assert.equal(await index2.lookup(task.id), root)
+
+  // P0-2：facts/findings 分片；快照不重复存，二次保存不重复追加
+  const sharded = createTask({
+    id: 't-persist-2', description: 'shard', goal: 'g', goals: ['g'], constraints: [],
+    ownerSession: 'owner', cwd: root, outDir: join(root, '.artex', 'tasks', 't-persist-2'), limits: {},
+  })
+  recordFact(sharded, { summary: 'fact one', outcome: 'found' })
+  recordFact(sharded, { summary: 'fact two' })
+  const shardStore = new TaskStore(root)
+  await shardStore.save(sharded)
+  const shardRaw = JSON.parse(await readFile(shardStore.pathOf(sharded.id), 'utf8'))
+  assert.equal('facts' in shardRaw, false, '快照不应包含 facts')
+  const shardLoaded = await new TaskStore(root).load(sharded.id)
+  assert.equal(shardLoaded.facts.length, 2)
+  await shardStore.save(shardLoaded)
+  const shardReloaded = await new TaskStore(root).load(sharded.id)
+  assert.equal(shardReloaded.facts.length, 2, '重复保存不应重复追加事实')
 
   console.log('OK persistence', { snapshotBytes: snapshot.length })
 } finally {

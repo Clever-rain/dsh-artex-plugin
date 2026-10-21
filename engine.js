@@ -378,8 +378,8 @@ export class ArtexEngine {
     await this.storeFor(rt.task.cwd).tasks.flush(rt.task.id)
   }
 
-  addIntents(task, items) {
-    return addIntentsImpl(this, task, items)
+  addIntents(task, items, options = {}) {
+    return addIntentsImpl(this, task, items, options)
   }
 
   addHint(task, texts) {

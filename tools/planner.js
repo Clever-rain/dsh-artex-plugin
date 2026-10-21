@@ -55,7 +55,7 @@ export function plannerTools({ engine, config }) {
             : []
         if (items.length === 0) throw new Error('intents 或 summary 至少给一个')
         const dropped = Math.max(0, items.length - 4)
-        const results = engine.addIntents(task, items)
+        const results = engine.addIntents(task, items, { notify: role?.role !== 'planner' })
         const created = results.filter(r => r.id > 0)
         const duplicates = results.filter(r => r.duplicate)
         return `已创建 ${created.length} 条意图：${created.map(r => `#${r.id} ${r.summary}`).join('；') || '（无）'}`

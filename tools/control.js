@@ -102,6 +102,7 @@ ${JSON.stringify(snapshot)}`
           : '- （本进程内没有活动任务）'
         const history = []
         for (const id of onDisk.slice(0, 50)) {
+          if (history.length >= 10) break
           if (liveIds.has(id)) continue
           try {
             const owner = await engine.index.ownerOf(id)

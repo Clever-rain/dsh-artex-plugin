@@ -2,13 +2,14 @@
 
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   createTask, addIntents, claimIntent, recordFact, reportFinding, proveGoal, addHint,
   MAX_FACTS, MAX_FINDINGS, MAX_HINTS,
 } from '../model.js'
-import { recordFacts, proveGoal as proveGoalOp } from '../graph-ops.js'
+import { addIntents as addIntentsOp, recordFacts, proveGoal as proveGoalOp } from '../graph-ops.js'
 import { ResourceStore, TaskStore, TaskIndex, isValidTaskId } from '../store.js'
 import { ArtexEngine, DEFAULTS } from '../engine.js'
 import { normalizeConfig } from '../config.js'
@@ -217,6 +218,28 @@ try {
   const protoConfig = normalizeConfig(JSON.parse('{"__proto__":{"polluted":true},"toString":1,"bogusKey":2}'))
   assert.equal(protoConfig.warnings.length >= 3, true)
   assert.equal({}.polluted, undefined)
+
+  // N10：planner 自派意图不触发额外规划轮
+  const n10Task = makeTask('t-audit-14')
+  const n10Events = []
+  const n10Engine = {
+    ...n1Engine,
+    runtimeForTask: () => ({ task: n10Task }),
+    pushEvent: (_rt, e) => n10Events.push(e),
+  }
+  addIntentsOp(n10Engine, n10Task, [{ summary: 'self intent' }], { notify: false })
+  assert.equal(n10Events.some(e => e.kind === 'intent'), false, 'planner 自派意图不应 pushEvent')
+  addIntentsOp(n10Engine, n10Task, [{ summary: 'owner intent' }], { notify: true })
+  assert.equal(n10Events.some(e => e.kind === 'intent'), true, '所有者派意图应 pushEvent')
+
+  // N4：长行 JSONL 的尾读窗口自适应，仍恢复 4000 条
+  const ioStore = new TaskStore(join(root, 'io'))
+  const ioTask = makeTask('t-audit-15')
+  await ioStore.save(ioTask)
+  const activityLine = `${JSON.stringify({ id: 1, intentId: 1, worker: 'work#1', kind: 'step', summary: 'x'.repeat(900), detail: 'y'.repeat(400), at: Date.now() })}\n`
+  writeFileSync(join(ioStore.taskDir(ioTask.id), 'activity.jsonl'), activityLine.repeat(4500))
+  const ioLoaded = await ioStore.load(ioTask.id)
+  assert.equal(ioLoaded.activities.length, 4000)
 
   console.log('OK audit-regressions')
 } finally {
