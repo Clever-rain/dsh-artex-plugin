@@ -138,51 +138,19 @@ max_workers: 3
 | `heartbeatMs` | 600000 | 巡检间隔 |
 | `workerTimeoutMs` | 1200000 | 单 worker 预算 |
 | `plannerTimeoutMs` | 900000 | 单轮 planner 预算 |
+| `mode` | `objective` | 默认任务模式：`objective` / `audit` |
+| `viewMode` | `hybrid` | 全局视野策略：`planner` / `hybrid` / `analyst` |
+| `enableHybrid` | true | hybrid 总开关；false 强制 planner |
+| `saveDebounceMs` | 500 | 快照合并写延迟 |
+| `plannerRetries` | 2 | planner 瞬态失败重试次数 |
+| `allowCrossTaskRead` | false | 是否允许跨 owner/角色读取任务 |
 | `settleGraceMs` | 90000 | 收尾宽限 |
 | `budgetMs` | 0 | 任务总预算（0=不限） |
 | `isolateWorkdir` | false | worker 是否在 `.artex/tasks/<id>/i<n>` 独立 cwd 工作 |
 
 ---
 
-## 4.5 提示词体积（v0.2）
-
-v0.1 把整份 `overview` 以美化 JSON 同时塞给 planner 和每个 worker，重复且昂贵。v0.2 改为**角色投影**：
-
-- `plannerView()`：只留派意图/判目标所需（goals、open/running/recent_done、近 12 条事实、最近发现、hints），去掉与正文重复的 `constraints`/`todos`、空血缘、零写回计数、`stats`。
-- `workerView()`：只留"别重复、别越界"所需（goals 一行、近 5 条事实、发现标题、其他在跑意图的一句话、hints），不再给 worker 看 planner 的待办与全量发现。
-- 两处 JSON 全部改为 `JSON.stringify` 紧凑序列化；`.artex` 落盘快照仍保持可读美化。
-- 任务报告与 `artex_task_status` 新增 `usage`（输入/输出 token、调用次数，按 planner/worker 分角色累计）。
-
-同一份合成任务（4 意图 / 20 事实 / 6 发现）的实测：
-
-| 提示词 | v0.1 | v0.2 | 变化 |
-|---|---|---|---|
-| planner | 8,521 字符 / ≈4,120 token | 4,056 字符 / ≈2,102 token | **-52% 字符 / -49% token** |
-| worker | 6,826 字符 / ≈3,165 token | 1,856 字符 / ≈1,177 token | **-73% 字符 / -63% token** |
-
-`node test/prompt-size.mjs` 可复现该基准。
-
-**真机 A/B**（同一任务：统计本机 LISTEN 端口数；1 个验收目标 / 1 个 worker / ≤2 轮 / 4 分钟预算；token 为 provider usage，v0.1 的数据从子会话日志事后聚合）：
-
-| 指标 | v0.1 | v0.2 | 变化 |
-|---|---|---|---|
-| 输入 token | 12,216 | 8,537 | **-30.1%** |
-| 输出 token | 5,731 | 5,321 | -7.2% |
-| 合计 token | 17,947 | 13,858 | **-22.8%** |
-| 模型调用 | 13 | 12 | -1 |
-| 单次调用平均输入 | 940 | 711 | -24.3% |
-| 用时 | 45s | 42s | -3s |
-| 过程步骤 | 22 | 17 | -5 |
-| 结果 | completed / 1 fact | completed / 1 fact | 一致 |
-
-两点解读：
-
-- 小任务的差距小于提示词本身的差距（-49%/-63%）：输入里还有系统提示、工具 schema 与累积历史，且首轮事实为空、投影几乎没东西可砍。任务越大（事实/意图越多），差距越接近提示词比例。
-- 行为上两端都完成了同一目标、各写回 1 条事实；v0.2 把"主统计 + netstat 交叉核对"拆成了 2 条意图（完成时第 2 条仍 open），v0.1 合并成 1 条。单次运行不足以断言行为差异，只能说明"无回归"。
-
-已知小问题：任务在目标全部证明后完成时，队列里未领取的 open 意图不会被置为 stopped，报告里会同时出现 `done` 与 `open`。计划在 v0.2.1 处理。
-
-## 4.6 双模式与全局认知（v0.3）
+## 4.5 双模式与全局认知
 
 ### 两种成功语义
 
@@ -193,7 +161,7 @@ v0.1 把整份 `overview` 以美化 JSON 同时塞给 planner 和每个 worker�
 
 **objective 的路径树与回溯**：pursue 可带 `path_parent`；某条判死（`failed`）后，规划者从它向上找最近的、仍有未尝试 `blueprint` 的祖先，派下一条。`blueprint` 是候选池，可直接 `state:"open"` 创建，或用 `artex_promote_intent` 提升。
 
-**突破即停、保留现场**：任一条 pursue 证明目标后，引擎先冻结派发 → 给其它在跑的 pursue 发"停止并回报"指令 → 等 `breakthrough_grace_ms`（默认 30s）让它们写回进度 → 到期硬停。这些意图记为 `stopped/sibling_breakthrough`，它们的 facts/findings/输出保留，报告单列"被中止或判死的路径"。
+**突破即停、保留现场**：任一条 pursue 证明目标后，引擎先冻结派发 → 给其它在跑的 pursue 发“停止并回报”指令 → 等 `breakthrough_grace_ms`（默认 30s）让它们写回进度 → 到期硬停。这些意图记为 `stopped/sibling_breakthrough`，它们的 facts/findings/输出保留，报告单列“被中止或判死的路径”。
 
 ### 全局认知（brief）
 
@@ -202,40 +170,31 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 - `delta`：上次规划之后新增/变化的事实、发现、结束的意图；
 - `digest`：确定性的 outcome 计数、意图状态分布、失败路径列表。
 
-`brief` 必须覆盖全任务历史（audit 写覆盖地图，objective 写路径树），已确认结论要带 `fact#id`；落后超过 1 轮会在下一轮提示"已过期"。这样历史信息有固定大小的载体，事实列表不必随轮次线性膨胀。
+`brief` 必须覆盖全任务历史（audit 写覆盖地图，objective 写路径树），已确认结论要带 `fact#id`；落后超过 1 轮会在下一轮提示“已过期”。历史信息有固定大小的载体，事实列表不必随轮次线性膨胀。
 
-### 新增参数
+### 相关参数
 
 | 位置 | 参数 |
 |---|---|
 | `artex_run_task` / `artex_start_task` | `mode`：`objective` / `audit`；`breakthrough_grace_ms` |
 | `artex_add_intent` | `kind`：`pursue` / `enumerate`；`state`：`open` / `blueprint`；`path_parent` |
 | `artex_record_fact` | `outcome`：`found` / `none` / `inconclusive` / `blueprint` |
+| `artex_prove_goal` | `allow_negative`：目标本身是负向结论时，允许 `outcome=none` 作为证据 |
 
-### 实测记录（本机只读 audit）
+### 边界
 
-| 版本 | 结果 | 暴露的问题 → 修复 |
-|---|---|---|
-| v0.3.0 | `max_rounds`，goal 未证明 | 最后一条 worker 刚写完证据、planner 已无机会 `prove_goal` → v0.3.1 收官证明轮 |
-| v0.3.1 | `timeout`，4 条意图全 done 但 goal 未证明 | audit 的 brief 覆盖子项被当成验收标准、持续扩张；预算耗尽路径没有证明轮 → v0.3.2 |
-| v0.3.2 | `completed`，66s / 2 轮 / 12 次调用 / 20.8k tokens | brief 明确"覆盖只用于组织证据，唯一验收维度 goal#1 已满足即停"；未派发的第 2 条意图被标 `stopped/goal_met` |
-
-### 已知边界
-
-- **v0.3.1 收官证明轮**：轮次用尽但目标仍未全部证明时，引擎会强制补一轮规划，只做目标判定与覆盖核对（不再派新意图），避免"最后一条 worker 刚写完证据、planner 已没有机会 prove_goal"。
-- **v0.3.2 收尾证明轮 + audit 收敛**：预算耗尽进入收尾时，若已有事实且目标未全证明，会用宽限时间补一次证明；同时把 audit 的覆盖判据收紧为"任务声明的 goals"，禁止 planner 用 brief 里自想到的子项无限扩张验收范围。
-- `audit` 的"覆盖闭合才允许完成"目前是**提示词级约束**（通过 goals 证据实现），不是引擎硬门禁；真正的覆盖清单工具（含未覆盖项报告）留给后续版本。
-- 专职 `analyst`（周期性只读重综合）只预留了接口与触发点，v0.3 未实现；当前由 planner 自维护 brief + 引擎 digest 承担。
+- audit 的“覆盖闭合才允许完成”由 goals 证据实现，是提示词级约束，不是引擎硬门禁。
+- 轮次用尽时会补一次**收官证明轮**；预算耗尽且已有事实时会补一次**收尾证明轮**，只做目标判定，不再派新意图。
 - 单进程内任务状态在插件重载后清空，历史快照仍在 `.artex/tasks/<id>/`。
 
-## 4.7 独立分析者（analyst，v0.3.3）
+## 4.6 独立分析者（analyst）
 
 全局视野分三层：**引擎 digest**（确定性计数）、**planner brief**（战略权威）、**analyst**（周期性只读重综合）。analyst 通过 `artex_set_analysis` 提交独立分析，planner 读取后自行决定采纳/驳回，并写进 brief——**只有 planner 能改 brief**，避免双写震荡。
 
 | `viewMode` | 行为 | 成本 |
 |---|---|---|
-| `hybrid`（默认，v0.3.4 起） | 按触发运行：audit 每 3 轮或新增事实 ≥8；objective 出现 `failed` 路径；brief 过期 | 中 |
-| `planner` | 不启用 analyst，沿用 v0.3.2 | 最低 |
+| `hybrid`（默认） | 按触发运行：audit 每 3 轮或新增事实 ≥8；objective 出现 `failed` 路径；brief 过期 | 中 |
+| `planner` | 不启用 analyst | 最低 |
 | `analyst` | 每个规划轮都跑一次 | 最高 |
 
 触发与预算（config）：`analystMaxRuns=4`、`analystEveryRounds=3`、`analystFactThreshold=8`、`analystCooldownMs=30000`、`analystTimeoutMs=180000`。
@@ -244,41 +203,39 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 
 | 层级 | 字段 | 默认 | 作用 |
 |---|---|---|---|
-| 插件 | `enableHybrid` | `true` | 总开关；`false` 强制 `planner`（传统模式），忽略 `viewMode` |
+| 插件 | `enableHybrid` | `true` | 总开关；`false` 强制 `planner` |
 | 插件 | `viewMode` | `hybrid` | 精细策略：`planner` / `hybrid` / `analyst` |
-| 任务 | `analyst` | 继承 | `false` 关闭本任务的 analyst（等价 `view_mode: "planner"`） |
+| 任务 | `analyst` | 继承 | `false` 关闭本任务的 analyst |
 | 任务 | `view_mode` | 继承 | 覆盖本任务的 `viewMode` |
 
 生效优先级：`analyst:false` 或 `enableHybrid:false` → `planner`；否则 `view_mode` > `viewMode` > `hybrid`。
 
-**传统非审计模式** = `mode:"objective"` + `analyst:false`（不跑 analyst；保留 v0.3.1/0.3.2 的收尾证明修复）：
+传统非审计模式 = `mode:"objective"` + `analyst:false`：
 
 ```json
 artex_run_task({ "goal": "...", "mode": "objective", "analyst": false, "view_mode": "planner" })
 ```
 
-只想关 analyst、保留 audit 覆盖语义时用 `mode:"audit" + analyst:false`。
+analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**：不能写 fact/finding、不能派意图、不能证明目标、不能改 brief。它的输出建议包含：一致性检查、被忽略的线索（带 trace id）、覆盖缺口或路径重排、下一步建议。
 
-analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**：不能写 fact/finding、不能派意图、不能证明目标、不能改 brief。它的输出建议包含：一致性检查（brief 与事实的矛盾）、被忽略的线索（带 trace id）、覆盖缺口或路径重排、下一步建议。
+短任务通常不会触发 analyst；长审计中它用于纠偏 planner brief 的过时状态、结论过强或资源锚点冲突。
 
-> **为什么默认改成 hybrid（v0.3.4）**：一次 3 维度、5 轮、64 次调用的长审计实测里，planner 的 brief 出现了 4 类失真——维度状态过时（已写回的维度仍标"0 条证据/运行中"）、建议重复证明已达成目标、`fact` 之间双栈措辞矛盾、同一主机资源锚点不一致。analyst 一次运行（6 次调用 / 22.3k token，占该任务 132.4k 的 **16.9%**）就逐条指出了这些问题，planner 在 brief 里明确记录了采纳/驳回。对长审计来说，这份开销换来的纠错价值高于成本；短任务或成本敏感场景可用 `view_mode: "planner"` 关掉。
+## 4.7 数据、索引与权限
 
-## 4.8 数据、索引与权限（v0.3.6）
+- **分片持久化**：`task.json` 只存元数据与图状态；facts / findings / activities 分别落在 `facts.jsonl`、`findings.jsonl`、`activity.jsonl`。JSONL 超过内存上限 2 倍时压实，`task.json` 不回写全量集合。
+- **合并写**：运行中的高频 mutation 走 `saveDebounceMs`（默认 500ms）合并写；收官/停止/插件卸载时强制 flush。
+- **集合上限**：facts 2000、findings 500、hints 200；淘汰时保留 `goals[].evidence` 指向的节点，回读时同样保留。
+- **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd` 与 owner，最多 500 条；换工作区也能按 id 查询历史任务。
+- **读权限**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
+- **敏感数据**：`.artex/` 可能包含证据原文，不要提交到公开仓库；任务 id 经过白名单校验，不能用于路径穿越。
 
-- **快照不再重复存过程日志**：`task.json` 只存图与状态，`activities` 以 `activity.jsonl` 为权威副本；`load` 时回填最近 4000 条。实测 96 步任务的快照从 153 KB 降到约 10 KB 级。
-- **紧凑 + 合并写**：快照用单行 JSON，运行中的高频 mutation 走 `saveDebounceMs`（默认 200ms）合并写；收官/停止/插件卸载时强制 flush，避免丢最近状态。
-- **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd`，换一个工作区/会话也能按 id 查询历史任务；索引最多保留 500 条。
-- **去重语义修正**：`failed` / `stopped` 的方向允许用同一 summary 重试；重复的 `blueprint` 返回已有 id 与状态，便于直接 promote。
-- **读权限收紧**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
-- **配置默认值生效**：`config.mode` 现在作为任务默认模式（任务参数优先）。
-
-## 4.9 架构分层（v0.6.0）
+## 4.8 架构分层
 
 | 模块 | 职责 |
 |---|---|
 | `index.js` | 插件入口：建引擎、注册工具、订阅会话事件、生命周期 |
 | `config.js` | 默认值 + `normalizeConfig`（未知键/非法枚举/类型错误显式告警） |
-| `policy.js` | **角色工具策略单一事实来源**：`TOOL_NAMES` + `ROLE_ALLOW` → 自动推导每个角色的 toolFilter deny |
+| `policy.js` | 角色工具策略单一事实来源：`TOOL_NAMES` + `ROLE_ALLOW` 推导 deny |
 | `engine.js` | 门面：任务生命周期、注册表/存储、stop/dispose、persist |
 | `graph-ops.js` | 图操作门面：意图、事实、发现、brief、分析、目标、资源写回 |
 | `reporting.js` | snapshot / status / report |
@@ -297,100 +254,28 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 | `tools/*.js` | 按域分组：control / read / planner / worker / analysis |
 | `tools-shared.js` | 工具共享层：schema、artifact、presenter、会话/角色校验、run 参数 |
 
-v0.6.0 的拆分结果（纯结构重构，行为不变）：
-
-| 原文件 | 拆分后 |
-|---|---|
-| `engine.js` ~1,270 行 | `engine.js` 395 + `graph-ops.js` 192 + `scheduler.js` 390 + `runner.js` 139 + `analyst.js` 82 + `reporting.js` 58 + `session-indexer.js` 57 + `report.js` 54 + `usage.js` 19 + `util.js` 17 |
-| `graph.js` ~890 行 | `model.js` 295 + `views.js` 267 + `store.js` 261 + 7 行门面 |
-| `tools.js` ~740 行 | `tools-shared.js` 142 + control 153 + planner 172 + worker 142 + read 87 + analysis 33 + 18 行门面 |
-
-拆分只做方法迁移与 `this` → `engine` 参数化，调用方（index / prompts / tests）仍从原路径导入；10 个场景测试保持全绿。v0.5.1 修复了拆分后 control 模块漏导入 `callerOf` 的线上问题，并补了控制工具执行回归。
+提示词采用角色投影：`plannerView` 只保留派意图/判目标所需，`workerView` 只保留“别重复、别越界”所需；JSON 紧凑序列化，analysis 正文不在 JSON 里重复。
 
 ### 工程化
 
 - **CI**：`.github/workflows/test.yml` 在 push / PR 上跑 `npm test`（Node 22）。
-- **许可证**：MIT（`LICENSE`）。
+- **许可证**：MIT。
 - **版本约束**：`engines.dsh >= 0.1.6-alpha.2`。
-- **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，17 个工具都有中文标题、调用 kind 与完成/失败状态，Web UI 不再是裸工具名。
-- **打包**：`package.json` 的 `files` 覆盖全部拆分模块与 `LICENSE`。
+- **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，17 个工具都有中文标题、调用 kind 与完成/失败状态。
+- **打包**：`package.json` 的 `files` 覆盖全部运行模块、配置、图标、locale、LICENSE。
 
-## 4.10 安全与完整性修复（v0.7.0，对应 `issue/2026-10-21` 审计）
+## 4.9 安全与可靠性
 
-审计 19 项：16 项完整修复，3 项部分/保留（P0-2 分片、P1-6 降级收官、P2-1 竞态）：
+- `task_id` 白名单 + 路径包含校验；非法 id 直接拒绝。
+- 读权限默认按 owner/子会话收紧；跨任务读取需显式开关。
+- worker 只能写回自己领到的运行中意图；批量写先整体校验再落图，失败不留半批。
+- `prove_goal` 拒绝负结果（除非目标本身是负向结论且显式 `allow_negative`）、拒绝重复证明、拒绝 blueprint 作证据。
+- 事实写回不触发规划轮，避免事实风暴烧完 `maxRounds`；目标/意图/发现事件按角色唤醒。
+- planner 瞬态失败按 `plannerRetries` 退避重试；持续失败且已有事实时以 `stopped` 保留现场。
+- 索引写入使用目录锁并在锁内合并；`status` 历史列表只列 owner 自己的任务。
+- 运行状态、usage、settling 等字段写入任务快照，报告与 `artex_task_status` 可审计。
 
-| 审计项 | 处置 |
-|---|---|
-| P0-1 `task_id` 路径穿越 | **已修**：`isValidTaskId` 白名单 + `taskDir` 路径包含校验；`resolveTask/loadTask/liveTask` 全部拒绝非法 id |
-| P0-2 长跑集合无上限 | **部分修复**：facts 2000 / findings 500 / hints 200，淘汰时保留目标证据；hint 截断 2000 字符。快照仍整图重写，分片待做 |
-| P0-3 `prove_goal` 不唤醒 | **已修**：证明目标、新增/提升意图、写回事实都 `pushEvent`；探针 04 从"挂 2s+"变为 2s 内完成 |
-| P1-1 `priority` 无效 | **已修**：`selectNextIntent` 按 `priority DESC, id ASC` 出队 |
-| P1-2 worker 跨意图写回 | **已修**：worker 工具强制使用自己的 `intentId`；图操作只接受运行中的意图 |
-| P1-3 控制工具无身份校验 | **已修**：`artex_run_task/start_task` 拒绝任何已注册子会话 |
-| P1-4 负结果/重复证明 | **已修**：`outcome=none` 需显式 `allow_negative=true`；已达成目标不可重复证明；blueprint 不可作证据 |
-| P1-5 缺 summary → `"undefined"` | **已修**：模型层抛错；工具层校验批量 `facts` 的每一条 |
-| P1-6 planner 单次失败报废任务 | **部分修复**：`plannerRetries`（默认 2）指数退避重试；持续失败仍终结 |
-| P1-7 资源 attrs 静默覆盖 | **已修**：记录 `updatedBy` / `attrsByTask` / `conflicts`，保留冲突副本 |
-| P1-8 provider 静默回退 | **已修**：回退时 `logger.warn`，并把实际 provider 写进任务快照 |
-| P2-2 收尾提示丢 kind | **已修**：`settlePrompt(role.role, role.kind)` |
-| P2-3 意图 >4 静默截断 | **已修**：工具返回"另有 N 条未提交" |
-| P2-4 status 全量返回 | **已修**：支持 `ownerSession/taskIds` 过滤，控制工具已传入 |
-| P2-5 索引无锁 | **已修**：`TaskIndex` 目录锁 + 锁内重读合并，10s 陈旧锁自动清理 |
-| P2-6 磁盘任务 id 泄露 | **已修**：无参 status 只列出 owner/自己任务 |
-| P2-7 缺 settling 状态 | **已修**：snapshot 增加 `settling` |
-| P2-8 死导入 | **已修**：engine/scheduler/tools 未使用导入清零（`audit` 脚本复核只剩 0 条） |
-
-**保留 2 项**：
-
-- **P2-1 角色注册竞态**：`roles.set` 仍需在 `startActivation` 返回后进行；要彻底消除需 provider 支持预分配 childId，改动跨服务接口，暂保留。
-- **P0-2 快照仍是整图重写**：集合已有硬上限，但 5000 事实场景仍约 2.3 MB/次；彻底分片（facts JSONL + 索引）留待后续，当前优先保证兼容。
-
-新增回归：`test/audit-regressions-smoke.mjs`（task_id、上限、唤醒、优先级、归属、证明、资源溯源、provider、settling、控制面、planner 重试、索引锁）。
-
-## 4.11 第二轮审计修复（v0.7.1，N1–N7）
-
-| 项 | 处置 |
-|---|---|
-| N1 事实唤醒放大 | **已修**：`recordFacts` 不再 `pushEvent`；事实由 `done`/`finding`/`goal` 统一带出，探针 05 的 fact 触发轮次从 5 降到 **0** |
-| N2 事件渲染错误 | **已修**：`renderTriggers` 增加 `fact`/`intent`/`done` 分支，`default` 改中性措辞；不再出现"意图 #undefined 结束" |
-| N3 批量写非原子 | **已修**：`recordFacts` 先校验整批 summary，再落图；失败时 0 条事实 |
-| N4 JSONL 整份读取 | **部分修复**：`readActivities` 改为尾部 4 MB 读取（探针 147→35 ms）；status 历史优先读索引里的 `ownerSession`，旧索引才回退加载 |
-| N5 配置原型链键 | **已修**：`Object.hasOwn` 判断；`__proto__`/`toString` 等按未知键告警，不抛异常、不污染原型 |
-| N7 重试语义差一 | **已修**：`attempts = 1 + plannerRetries`（默认 2 次重试 = 3 次尝试） |
-| P1-6 无降级收官 | **部分修复**：重试用尽且已有事实时，任务以 `stopped` + "保留现场"结束，不再直接 `failed`；仍未实现无 planner 的证明轮 |
-| P0-2 快照整图重写 | **部分修复**：`saveDebounceMs` 默认 500 ms；分片仍未做（上限态约 2.3 MB/次） |
-| P2-1 角色注册竞态 | **缓解**：`resolve` 未命中角色时让出一个微任务重试一次 |
-| P2-5 锁参数 | **已修**：等待上限 12 s、陈旧阈值 3 s；索引注册失败会告警 |
-
-新增回归：N1 事实不唤醒、N2 渲染语义、N3 批量原子性、N5 原型键；连同首轮回归共 13 类断言。
-
-## 4.12 第三轮审计修复（v0.7.2，N9/N10/N4/P2-5/P0-2）
-
-| 项 | 处置 |
-|---|---|
-| N10 规划者自派意图多烧一轮 | **已修**：`artex_add_intent` 对 planner 角色传 `notify:false`；所有者手工派意图仍唤醒 |
-| N9 历史列表上限被 `continue` 绕过 | **已修**：上限判断移到循环开头 |
-| N4 尾读窗口固定 | **已修**：按平均行长自适应（1 MB 探针 + 目标窗口，最大 64 MB），长行日志仍恢复 4000 条 |
-| P2-5 偷锁方向 | **已修**：陈旧阈值提到 30 s（> 12 s 等待），不再先偷锁后超时 |
-| P0-2 快照整图重写 | **已修**：facts/findings 拆为 append-only JSONL，`task.json` 只存元数据；快照 2.3 MB → **514 B**，单次 save 28.9 → **4.9 ms**；文件超过 2× 上限时压实；旧快照兼容（首次保存补写 JSONL） |
-
-新增回归：N10 自派意图不唤醒、N4 长行尾读 4000 条、facts 分片保存/重载/重复保存。v0.7.3 修复分片加载：无 findings.jsonl 时补空数组，status 不再崩溃。
-
-## 4.13 第五/六轮审计修复（v0.7.4）
-
-| 项 | 处置 |
-|---|---|
-| **N11** 重启后目标证据丢失 | `load` 的 facts/findings 合并改为 `keepWithEvidence`：保留尾部上限 + `goals[].evidence` 指向的节点；无证据时仍按上限截断。探针 14：2001 条回读仍保留最早证据 #3；finding 证据同样保留 |
-| **N10′** prove/promote 仍无条件唤醒 | `prove_goal` / `promote_intent` 接受 `notify` 选项；planner 自证/自提升不唤醒，所有者操作仍 `notify:true`（守住 P0-3）。探针 13：9 轮中 goal 触发 0，证明本身生效 |
-| 回归 | `audit-regressions-smoke` 增加 7 条断言（N11 fact/finding、N10′ 两方向、工具层角色） |
-
-第五/六轮探针 13/14 全部 `[FIXED]`；当前审计开放项为 0（P1-6 仍按设计降级为 `stopped`）。
-
-## 4.14 首个公开版本（v1.0.0）
-
-- 版本号提升到 **1.0.0**，作为对外发布的第一个稳定版本：审计开放项 0（见 `issue/审计报告.md`），测试 7/7、探针 14/14。
-- 公开前脱敏：`bench/` 报告里的本机细节（具体端口/共享计数、系统构建号、防火墙 profile 状态）已改写为等价描述，结论与数据趋势不变。
-- 仓库为 MIT 许可；DSH 宿主版本要求见 `package.json` 的 `engines.dsh`。
+---
 
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
@@ -399,7 +284,7 @@ v0.6.0 的拆分结果（纯结构重构，行为不变）：
 - **goals 子代理**：ARTEX 建任务时先用一个 `goals` agent 抽约束、把目标拆成可核验结果。这里改为 `goals`/`constraints` 参数由调用方直接给出（或退化为单目标），省一次模型调用；约束仍然以最高优先级注入两个角色。
 - **资产图的程序化层级**：ARTEX 的资产图由程序算 `root_domain→subdomain→service→endpoint` 的父子与去重键。通用场景没有这种固定层级，这里退化为 `(type, key||name)` 去重 + 自由 `attrs`。
 - **pause/resume**：用 `artex_stop_task` + 重新 `artex_start_task` 替代；DSH 的子会话本身也可用 `send_message` 续跑。
-- **智能体边界**：ARTEX 用 DB 绑定实现"planner 看不到 worker 工具"；这里用 spawn provider 的 `toolFilter` 在子会话作用域内收掉越界工具，并在 execute 里按会话身份二次校验。
+- **智能体边界**：ARTEX 用 DB 绑定实现“planner 看不到 worker 工具”；这里用 spawn provider 的 `toolFilter` 在子会话作用域内收掉越界工具，并在 execute 里按会话身份二次校验。
 
 **未实现**
 
@@ -410,8 +295,12 @@ v0.6.0 的拆分结果（纯结构重构，行为不变）：
 ## 6. 测试
 
 ```powershell
-node test/graph-smoke.mjs    # 图内核 + 提示词 + 14 个工具 schema
-node test/engine-smoke.mjs   # 用假 subagents 跑完整闭环（3 轮、2 意图、prove_goal 收官、过程索引）
+node test/graph-smoke.mjs          # 图内核、视图、17 个工具 schema、presenter
+node test/engine-smoke.mjs         # 完整闭环、usage、status/report、stop 守卫
+node test/modes-smoke.mjs          # objective/audit、突破停兄弟、证明轮、analyst
+node test/persistence-smoke.mjs    # 分片、JSONL 回填、合并写、索引
+node test/security-smoke.mjs       # 读 ACL、策略一致性、配置归一化
+node test/audit-regressions-smoke.mjs  # 审计回归
 ```
 
 `test/engine-smoke.mjs` 用脚本化的假子会话驱动真实引擎：规划者按态势派意图、worker 写回事实/发现、规划者用证据标记目标，最终断言 `status=completed`、写回计数、trace 检索命中、以及子会话确实收到了越界工具的 deny 列表。
