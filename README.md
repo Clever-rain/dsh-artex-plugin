@@ -1,4 +1,4 @@
-# @local/dsh-artex — 把 ARTEX 的 agent 编排搬进 DSH
+# dsh-artex — 把 ARTEX 的 agent 编排搬进 DSH
 
 一个 Host 插件：用 DSH 原生的 subagent 机制，复刻 ARTEX（`Autumn-27/ARTEX`）的**双图 + 事件驱动 planner/worker 编排**。装上之后模型获得 17 个 `artex_*` 工具，可以：
 
@@ -150,7 +150,7 @@ max_workers: 3
 
 ---
 
-## 4.5 双模式与全局认知
+## 4.1 双模式与全局认知
 
 ### 两种成功语义
 
@@ -187,7 +187,7 @@ planner 每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体�
 - 轮次用尽时会补一次**收官证明轮**；预算耗尽且已有事实时会补一次**收尾证明轮**，只做目标判定，不再派新意图。
 - 单进程内任务状态在插件重载后清空，历史快照仍在 `.artex/tasks/<id>/`。
 
-## 4.6 独立分析者（analyst）
+## 4.2 独立分析者（analyst）
 
 全局视野分三层：**引擎 digest**（确定性计数）、**planner brief**（战略权威）、**analyst**（周期性只读重综合）。analyst 通过 `artex_set_analysis` 提交独立分析，planner 读取后自行决定采纳/驳回，并写进 brief——**只有 planner 能改 brief**，避免双写震荡。
 
@@ -220,7 +220,7 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 
 短任务通常不会触发 analyst；长审计中它用于纠偏 planner brief 的过时状态、结论过强或资源锚点冲突。
 
-## 4.7 数据、索引与权限
+## 4.3 数据、索引与权限
 
 - **分片持久化**：`task.json` 只存元数据与图状态；facts / findings / activities 分别落在 `facts.jsonl`、`findings.jsonl`、`activity.jsonl`。JSONL 超过内存上限 2 倍时压实，`task.json` 不回写全量集合。
 - **合并写**：运行中的高频 mutation 走 `saveDebounceMs`（默认 500ms）合并写；收官/停止/插件卸载时强制 flush。
@@ -229,7 +229,7 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 - **读权限**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
 - **敏感数据**：`.artex/` 可能包含证据原文，不要提交到公开仓库；任务 id 经过白名单校验，不能用于路径穿越。
 
-## 4.8 架构分层
+## 4.4 架构分层
 
 | 模块 | 职责 |
 |---|---|
@@ -264,7 +264,7 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 - **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，17 个工具都有中文标题、调用 kind 与完成/失败状态。
 - **打包**：`package.json` 的 `files` 覆盖全部运行模块、配置、图标、locale、LICENSE。
 
-## 4.9 安全与可靠性
+## 4.5 安全与可靠性
 
 - `task_id` 白名单 + 路径包含校验；非法 id 直接拒绝。
 - 读权限默认按 owner/子会话收紧；跨任务读取需显式开关。
