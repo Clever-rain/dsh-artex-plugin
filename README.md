@@ -376,6 +376,16 @@ v0.6.0 的拆分结果（纯结构重构，行为不变）：
 
 新增回归：N10 自派意图不唤醒、N4 长行尾读 4000 条、facts 分片保存/重载/重复保存。v0.7.3 修复分片加载：无 findings.jsonl 时补空数组，status 不再崩溃。
 
+## 4.13 第五/六轮审计修复（v0.7.4）
+
+| 项 | 处置 |
+|---|---|
+| **N11** 重启后目标证据丢失 | `load` 的 facts/findings 合并改为 `keepWithEvidence`：保留尾部上限 + `goals[].evidence` 指向的节点；无证据时仍按上限截断。探针 14：2001 条回读仍保留最早证据 #3；finding 证据同样保留 |
+| **N10′** prove/promote 仍无条件唤醒 | `prove_goal` / `promote_intent` 接受 `notify` 选项；planner 自证/自提升不唤醒，所有者操作仍 `notify:true`（守住 P0-3）。探针 13：9 轮中 goal 触发 0，证明本身生效 |
+| 回归 | `audit-regressions-smoke` 增加 7 条断言（N11 fact/finding、N10′ 两方向、工具层角色） |
+
+第五/六轮探针 13/14 全部 `[FIXED]`；当前审计开放项为 0（P1-6 仍按设计降级为 `stopped`）。
+
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
 **有意的简化**
