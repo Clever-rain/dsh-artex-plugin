@@ -72,6 +72,8 @@ try {
   assert.equal('facts' in shardRaw, false, '快照不应包含 facts')
   const shardLoaded = await new TaskStore(root).load(sharded.id)
   assert.equal(shardLoaded.facts.length, 2)
+  assert.equal(Array.isArray(shardLoaded.findings), true, '无 findings.jsonl 时应补空数组')
+  assert.equal(shardLoaded.findings.length, 0)
   await shardStore.save(shardLoaded)
   const shardReloaded = await new TaskStore(root).load(sharded.id)
   assert.equal(shardReloaded.facts.length, 2, '重复保存不应重复追加事实')

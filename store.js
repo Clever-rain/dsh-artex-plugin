@@ -349,6 +349,9 @@ export class TaskStore {
       for (const f of [...(Array.isArray(raw.findings) ? raw.findings : []), ...findingsFile.items]) merged.set(f.id, f)
       raw.findings = [...merged.values()].sort((a, b) => a.id - b.id).slice(-MAX_FINDINGS)
     }
+    // 新格式快照不存 facts/findings；对应 JSONL 不存在时也要补空数组。
+    if (!Array.isArray(raw.facts)) raw.facts = []
+    if (!Array.isArray(raw.findings)) raw.findings = []
     const entry = this.entryFor(taskId)
     if (factsFile.exists) {
       entry.facts = new Set(factsFile.items.map(f => f.id))

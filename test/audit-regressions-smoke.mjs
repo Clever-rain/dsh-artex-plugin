@@ -241,6 +241,20 @@ try {
   const ioLoaded = await ioStore.load(ioTask.id)
   assert.equal(ioLoaded.activities.length, 4000)
 
+  // N9：无参 status 的历史列表最多 10 条（上限判断在 continue 之前）
+  const historyIds = Array.from({ length: 15 }, (_, i) => `t-audit-h${i}`)
+  const historyEngine = {
+    roleOf: () => undefined,
+    status: async () => [],
+    cwdFor: async () => root,
+    storeFor: () => ({ tasks: { ids: async () => historyIds } }),
+    index: { ownerOf: async () => 'owner' },
+  }
+  const statusTool = createTools({ engine: historyEngine, config: DEFAULTS }).find(t => t.name === 'artex_task_status')
+  const historyResult = await statusTool.execute({}, { agent: { id: 'owner' } })
+  const historyLines = historyResult.text.split('\n').filter(line => /^- t-audit-h\d+$/.test(line))
+  assert.equal(historyLines.length, 10, `history=${historyLines.length}`)
+
   console.log('OK audit-regressions')
 } finally {
   await rm(root, { recursive: true, force: true })

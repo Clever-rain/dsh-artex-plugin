@@ -26,8 +26,8 @@ export function addIntents(engine, task, items, options = {}) {
         summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}`,
       })
       rt.stalls = 0
-      // planner 在自己这一轮里派意图不需要再唤醒自己；所有者手工派意图仍唤醒。
-      if (options.notify !== false) {
+      // 默认不唤醒：仅工具层显式 notify:true（所有者手工派意图）才唤醒。
+      if (options.notify === true) {
         engine.pushEvent(rt, { kind: 'intent', summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}` })
       }
       void engine.persist(rt)
