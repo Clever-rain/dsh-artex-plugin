@@ -2,7 +2,7 @@
  * 任务快照 / 状态查询 / 最终报告。
  */
 
-import { digestOf } from './graph.js'
+import { digestOf, openIntents, runningIntents } from './graph.js'
 import { formatReport } from './report.js'
 
 export function snapshot(engine, task, live) {
