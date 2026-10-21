@@ -29,6 +29,9 @@ import { interruptChildren as interruptChildrenImpl, interruptChild as interrupt
 import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl } from './scheduler.js'
 import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
 import { recordUsage as recordUsageImpl } from './usage.js'
+import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl } from './graph-ops.js'
+import { snapshot as snapshotImpl, status as statusImpl, report as reportImpl } from './reporting.js'
+import { handleSessionEvent as handleSessionEventImpl } from './session-indexer.js'
 import { oneLine, sleep, textOf } from './util.js'
 import { normalizeConfig } from './config.js'
 import { TOOL_NAMES, denyForRole } from './policy.js'
@@ -302,22 +305,8 @@ export class ArtexEngine {
     return maybeRunAnalystImpl(this, rt, triggers)
   }
   setAnalysis(task, text, citations) {
-    const rt = this.runtimeForTask(task)
-    const analysis = graphSetAnalysis(rt.task, text, citations)
-    if (analysis) {
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'analyst',
-        kind: 'analysis',
-        summary: `提交独立分析（第 ${analysis.round} 轮）`,
-        detail: analysis.text,
-      })
-      void this.persist(rt)
-    }
-    return analysis
+    return setAnalysisImpl(this, task, text, citations)
   }
-
-  /* ---------------------------------------------------------------- worker */
 
   dispatchWorkers(rt) {
     return dispatchWorkersImpl(this, rt)
@@ -387,246 +376,49 @@ export class ArtexEngine {
   }
 
   addIntents(task, items) {
-    const rt = this.runtimeForTask(task)
-    const results = graphAddIntents(rt.task, items)
-    const created = results.filter(r => r.id > 0).map(r => r.id)
-    if (created.length > 0) {
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'planner',
-        kind: 'intent',
-        summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}`,
-      })
-      rt.stalls = 0
-      void this.persist(rt)
-    }
-    return results
+    return addIntentsImpl(this, task, items)
   }
 
   addHint(task, texts) {
-    const rt = this.runtimeForTask(task)
-    const added = []
-    for (const text of texts) {
-      const hint = graphAddHint(rt.task, text)
-      if (hint) added.push(hint)
-    }
-    if (added.length > 0) {
-      this.addActivity(rt, { intentId: null, worker: 'human', kind: 'hint', summary: `新增提示：${oneLine(added.map(h => h.text).join('；'), 200)}` })
-      this.pushEvent(rt, { kind: 'hint', summary: added.map(h => oneLine(h.text, 100)).join('；') })
-      void this.persist(rt)
-    }
-    return added
+    return addHintImpl(this, task, texts)
   }
 
   proveGoal(task, goalId, evidenceId, reason) {
-    const rt = this.runtimeForTask(task)
-    const result = graphProveGoal(rt.task, goalId, evidenceId, reason)
-    if (result.ok) {
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'planner',
-        kind: 'goal',
-        summary: `目标 #${goalId} 标记达成（证据 #${evidenceId}）`,
-        detail: reason || '',
-      })
-      void this.persist(rt)
-    }
-    return result
+    return proveGoalImpl(this, task, goalId, evidenceId, reason)
   }
 
   setTodos(task, items) {
-    const rt = this.runtimeForTask(task)
-    const todos = graphSetTodos(rt.task, items)
-    void this.persist(rt)
-    return todos
+    return setTodosImpl(this, task, items)
   }
-
-  /** 规划者维护全局认知：整体替换、按轮次版本化。 */
   setBrief(task, text, citations) {
-    const rt = this.runtimeForTask(task)
-    const brief = graphSetBrief(rt.task, text, citations)
-    if (brief) {
-      this.addActivity(rt, {
-        intentId: null,
-        worker: 'planner',
-        kind: 'brief',
-        summary: `更新全局认知（第 ${brief.round} 轮）`,
-        detail: brief.text,
-      })
-      void this.persist(rt)
-    }
-    return brief
+    return setBriefImpl(this, task, text, citations)
   }
-
-  /** 把 blueprint 提升为 open，进入 frontier。 */
   promoteIntent(task, intentId) {
-    const rt = this.runtimeForTask(task)
-    const result = graphPromoteIntent(rt.task, intentId)
-    if (result.ok) {
-      this.addActivity(rt, {
-        intentId: result.intent.id,
-        worker: 'planner',
-        kind: 'promote',
-        summary: `蓝图提升为 open：#${result.intent.id}`,
-      })
-      void this.persist(rt)
-    }
-    return result
+    return promoteIntentImpl(this, task, intentId)
   }
 
   roleForIntent(taskId, intentId) {
-    if (!intentId) return undefined
-    for (const role of this.roles.values()) {
-      if (role.taskId === taskId && role.intentId === Number(intentId)) return role
-    }
-    return undefined
+    return roleForIntentImpl(this, taskId, intentId)
   }
 
   recordFacts(task, entries, intentId) {
-    const rt = this.runtimeForTask(task)
-    const facts = entries.map(entry => graphRecordFact(rt.task, {
-      summary: entry.summary,
-      detail: entry.detail,
-      evidence: entry.evidence,
-      confidence: entry.confidence,
-      outcome: entry.outcome,
-      resourceIds: entry.resourceIds ?? entry.resource_ids,
-      intentId: entry.intentId ?? entry.intent_id ?? intentId,
-    }))
-    if (facts.length > 0) {
-      const role = this.roleForIntent(task.id, facts[0].intentId)
-      if (role) {
-        role.writes.facts += facts.length
-        for (const fact of facts) {
-          if (fact.outcome) {
-            role.writes.outcomes = role.writes.outcomes || { found: 0, none: 0, inconclusive: 0, blueprint: 0 }
-            role.writes.outcomes[fact.outcome] += 1
-          }
-        }
-      }
-      this.addActivity(rt, {
-        intentId: intentId ?? facts[0].intentId,
-        worker: 'worker',
-        kind: 'fact',
-        summary: facts.map(f => `#${f.id} ${oneLine(f.summary, 80)}`).join('；'),
-        detail: facts.map(f => `#${f.id} ${f.summary}\n${f.detail || ''}\n${f.evidence || ''}`).join('\n\n'),
-      })
-      void this.persist(rt)
-    }
-    return facts
+    return recordFactsImpl(this, task, entries, intentId)
   }
 
   recordFinding(task, input) {
-    const rt = this.runtimeForTask(task)
-    const finding = graphReportFinding(rt.task, input)
-    const role = this.roleForIntent(task.id, finding.intentId)
-    if (role) role.writes.findings += 1
-    this.addActivity(rt, {
-      intentId: finding.intentId,
-      worker: 'worker',
-      kind: 'finding',
-      summary: `发现 #${finding.id} ${oneLine(finding.title, 100)}`,
-      detail: `${finding.detail || ''}\n${finding.evidence || ''}`,
-    })
-    this.pushEvent(rt, {
-      kind: 'finding',
-      intentId: finding.intentId,
-      summary: `#${finding.id} ${oneLine(finding.title, 120)}（severity=${finding.severity}）`,
-    })
-    void this.persist(rt)
-    return finding
+    return recordFindingImpl(this, task, input)
   }
 
   async addResources(task, items, role) {
-    const rt = this.runtimeForTask(task)
-    const stores = this.storeFor(rt.task.cwd)
-    const results = await stores.resources.upsert(items, rt.task.id)
-    const created = results.filter(r => r.created)
-    if (created.length > 0) {
-      rt.task.stats.resources += created.length
-      if (role && role.writes) role.writes.resources += created.length
-      this.addActivity(rt, {
-        intentId: role?.intentId ?? null,
-        worker: role?.role ?? 'worker',
-        kind: 'resource',
-        summary: `登记资源 ${created.map(r => `#${r.id} ${r.name}`).join('；')}`,
-      })
-      void this.persist(rt)
-    }
-    return results
+    return addResourcesImpl(this, task, items, role)
   }
 
   runtimeForTask(task) {
-    const rt = this.tasks.get(task.id)
-    if (!rt) throw new Error(`ARTEX 任务 ${task.id} 已结束，不能再写入（可用 artex_task_status 查看快照）`)
-    if (rt.finished) throw new Error(`ARTEX 任务 ${task.id} 已结束（${task.status}），不能再写入`)
-    return rt
+    return runtimeForTaskImpl(this, task)
   }
-
-  /* -------------------------------------------------------------- session events */
-
-  /**
-   * 把 worker 子会话的工具调用/结果索引成过程库（ARTEX activity），
-   * 让其它 work 能按关键字回看，而不是只看最终结论。
-   */
   handleSessionEvent(session, event) {
-    try {
-      const sessionId = session?.header?.id ?? session?.id
-      if (!sessionId) return
-      const role = this.roles.get(sessionId)
-      if (!role) return
-      const rt = this.tasks.get(role.taskId)
-      if (!rt || rt.finished) return
-      const data = event?.data
-      if (!data) return
-
-      // 用量统计对所有角色生效（planner 与 worker 都计入任务成本）。
-      if (event.type === 'assistant/message') {
-        this.recordUsage(rt, role, data.usage)
-        if (role.role !== 'worker') return
-        const text = textOf(data.message?.content)
-        if (!text) return
-        this.addActivity(rt, {
-          intentId: role.intentId,
-          worker: 'worker',
-          kind: 'text',
-          summary: oneLine(text, 160),
-          detail: text,
-        })
-        return
-      }
-
-      if (role.role !== 'worker') return
-
-      if (event.type === 'tool/call') {
-        const name = String(data.name || '')
-        if (name.startsWith('artex_')) return // 写回已单独记录，不重复索引
-        role.pending.set(data.callId, { name, arguments: data.arguments })
-        return
-      }
-
-      if (event.type === 'tool/result') {
-        const callId = data.message?.toolCallId ?? data.callId
-        const pending = role.pending.get(callId)
-        if (!pending) return
-        role.pending.delete(callId)
-        const detail = textOf(data.message?.content)
-        this.addActivity(rt, {
-          intentId: role.intentId,
-          worker: 'worker',
-          kind: 'step',
-          tool: pending.name,
-          summary: `${pending.name} ${oneLine(pending.arguments, 140)}`,
-          detail,
-          isError: data.message?.isError === true || data.error !== undefined,
-        })
-      }
-    } catch (error) {
-      this.logger.warn?.(`[artex] session event index failed: ${error?.message || error}`)
-    }
+    return handleSessionEventImpl(this, session, event)
   }
-
-  /** 累计子会话的 provider usage，作为任务成本口径（输出/输入 token 与调用次数）。 */
   recordUsage(rt, role, usage) {
     return recordUsageImpl(this, rt, role, usage)
   }
@@ -649,58 +441,14 @@ export class ArtexEngine {
   /* ----------------------------------------------------------------- views */
 
   snapshot(task, live) {
-    const stateCount = {}
-    for (const intent of task.intents) stateCount[intent.state] = (stateCount[intent.state] || 0) + 1
-    const endsAt = task.endedAt ?? Date.now()
-    return {
-      task_id: task.id,
-      owner_session: task.ownerSession,
-      status: task.status,
-      live: Boolean(live && !live.finished),
-      mode: task.mode || 'objective',
-      view_mode: task.viewMode || this.config.viewMode || 'planner',
-      description: task.description,
-      goal: task.goal,
-      rounds: task.round,
-      limits: task.limits,
-      brief: task.brief?.text || undefined,
-      brief_round: task.brief?.round ?? undefined,
-      analysis: task.analysis?.text || undefined,
-      analysis_round: task.analysis?.round ?? undefined,
-      analysis_runs: task.analysisRuns || 0,
-      digest: digestOf(task),
-      goals: task.goals.map(g => ({ id: g.id, text: g.text, status: g.status, evidence: g.evidence })),
-      intents: {
-        total: task.intents.length,
-        open: openIntents(task).length,
-        running: runningIntents(task).length,
-        by_state: stateCount,
-      },
-      facts: task.facts.length,
-      findings: task.findings.slice(-50).map(f => ({ id: f.id, title: f.title, severity: f.severity, intent_id: f.intentId })),
-      findings_total: task.findings.length,
-      resources: task.stats.resources,
-      usage: task.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
-      hints: task.hints.map(h => h.text),
-      todos: task.todos,
-      elapsed_ms: endsAt - task.createdAt,
-      finish_detail: task.finishDetail,
-      out_dir: task.outDir,
-    }
+    return snapshotImpl(this, task, live)
   }
 
   async status(taskId) {
-    if (taskId) {
-      const rt = this.liveTask(taskId)
-      if (rt) return this.snapshot(rt.task, rt)
-      const stored = await this.loadTask(taskId)
-      if (!stored) throw new Error(`ARTEX 任务 ${taskId} 不存在`)
-      return this.snapshot(stored, undefined)
-    }
-    return [...this.tasks.values()].map(rt => this.snapshot(rt.task, rt))
+    return statusImpl(this, taskId)
   }
 
   report(task) {
-    return formatReport(task)
+    return reportImpl(this, task)
   }
 }

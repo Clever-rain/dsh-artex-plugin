@@ -272,14 +272,17 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 - **读权限收紧**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
 - **配置默认值生效**：`config.mode` 现在作为任务默认模式（任务参数优先）。
 
-## 4.9 架构分层（v0.5.1）
+## 4.9 架构分层（v0.6.0）
 
 | 模块 | 职责 |
 |---|---|
 | `index.js` | 插件入口：建引擎、注册工具、订阅会话事件、生命周期 |
 | `config.js` | 默认值 + `normalizeConfig`（未知键/非法枚举/类型错误显式告警） |
 | `policy.js` | **角色工具策略单一事实来源**：`TOOL_NAMES` + `ROLE_ALLOW` → 自动推导每个角色的 toolFilter deny |
-| `engine.js` | 门面：任务生命周期、图操作、会话事件索引、snapshot/report |
+| `engine.js` | 门面：任务生命周期、注册表/存储、stop/dispose、persist |
+| `graph-ops.js` | 图操作门面：意图、事实、发现、brief、分析、目标、资源写回 |
+| `reporting.js` | snapshot / status / report |
+| `session-indexer.js` | 子会话事件索引（tool/call、tool/result、assistant/message） |
 | `scheduler.js` | 主循环、规划轮、派发 worker、突破停止、收尾与证明轮 |
 | `runner.js` | 子会话执行器：spawn、等待、中断、续跑提示 |
 | `analyst.js` | 独立分析的触发条件与只读运行 |
@@ -288,20 +291,29 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 | `model.js` | 领域模型：goal / intent / fact / finding / brief / analysis |
 | `views.js` | 角色视图与查询：overview / plannerView / workerView / digest / delta / trace |
 | `store.js` | 资源图、任务快照、全局索引 |
-| `prompts.js` | planner / worker / analyst 提示词与报告渲染 |
+| `prompts.js` | planner / worker / analyst 提示词 |
+| `report.js` | 最终报告渲染 |
 | `tools.js` | 17 个模型工具的组合入口 |
 | `tools/*.js` | 按域分组：control / read / planner / worker / analysis |
-| `tools-shared.js` | 工具共享层：schema、artifact、会话/角色校验、run 参数 |
+| `tools-shared.js` | 工具共享层：schema、artifact、presenter、会话/角色校验、run 参数 |
 
-v0.5.0 的拆分结果（纯结构重构，行为不变）：
+v0.6.0 的拆分结果（纯结构重构，行为不变）：
 
 | 原文件 | 拆分后 |
 |---|---|
-| `engine.js` ~1,270 行 | `engine.js` 637 + `scheduler.js` 390 + `runner.js` 139 + `analyst.js` 82 + `usage.js` 19 + `util.js` 17 |
+| `engine.js` ~1,270 行 | `engine.js` 395 + `graph-ops.js` 192 + `scheduler.js` 390 + `runner.js` 139 + `analyst.js` 82 + `reporting.js` 58 + `session-indexer.js` 57 + `report.js` 54 + `usage.js` 19 + `util.js` 17 |
 | `graph.js` ~890 行 | `model.js` 295 + `views.js` 267 + `store.js` 261 + 7 行门面 |
 | `tools.js` ~740 行 | `tools-shared.js` 142 + control 153 + planner 172 + worker 142 + read 87 + analysis 33 + 18 行门面 |
 
 拆分只做方法迁移与 `this` → `engine` 参数化，调用方（index / prompts / tests）仍从原路径导入；10 个场景测试保持全绿。v0.5.1 修复了拆分后 control 模块漏导入 `callerOf` 的线上问题，并补了控制工具执行回归。
+
+### 工程化
+
+- **CI**：`.github/workflows/test.yml` 在 push / PR 上跑 `npm test`（Node 22）。
+- **许可证**：MIT（`LICENSE`）。
+- **版本约束**：`engines.dsh >= 0.1.6-alpha.2`。
+- **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，17 个工具都有中文标题、调用 kind 与完成/失败状态，Web UI 不再是裸工具名。
+- **打包**：`package.json` 的 `files` 覆盖全部拆分模块与 `LICENSE`。
 
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 

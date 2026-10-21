@@ -53,6 +53,53 @@ export function standardize(node) {
   return out
 }
 
+const TOOL_LABELS = {
+  artex_run_task: 'ARTEX 编排',
+  artex_start_task: 'ARTEX 后台任务',
+  artex_task_status: 'ARTEX 状态',
+  artex_stop_task: 'ARTEX 停止',
+  artex_add_hint: 'ARTEX 提示',
+  artex_graph_overview: 'ARTEX 态势',
+  artex_node_detail: 'ARTEX 节点',
+  artex_trace: 'ARTEX 过程',
+  artex_add_intent: 'ARTEX 意图',
+  artex_promote_intent: 'ARTEX 提升意图',
+  artex_set_brief: 'ARTEX brief',
+  artex_prove_goal: 'ARTEX 证明目标',
+  artex_set_todos: 'ARTEX 待办',
+  artex_record_fact: 'ARTEX 事实',
+  artex_report_finding: 'ARTEX 发现',
+  artex_add_resource: 'ARTEX 资源',
+  artex_set_analysis: 'ARTEX 分析',
+}
+
+const TOOL_KINDS = {
+  artex_run_task: 'execute',
+  artex_start_task: 'execute',
+  artex_stop_task: 'execute',
+  artex_add_hint: 'execute',
+  artex_task_status: 'read',
+  artex_graph_overview: 'read',
+  artex_node_detail: 'read',
+  artex_trace: 'read',
+}
+
+const clip = (value, max = 48) => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+const callDetail = (args = {}) => {
+  if (args.task_id) return clip(args.task_id, 24)
+  if (args.goal) return clip(args.goal)
+  if (args.title) return clip(args.title)
+  if (args.summary) return clip(args.summary)
+  if (args.intent_id) return `intent#${args.intent_id}`
+  if (args.id) return `#${args.id}`
+  if (Array.isArray(args.hints) && args.hints.length > 0) return clip(args.hints[0])
+  return ''
+}
+
 export function artifact({ name, description, parameters, execute, concurrent = false }) {
   const definition = {
     name,
@@ -62,6 +109,24 @@ export function artifact({ name, description, parameters, execute, concurrent = 
     async execute(args, exec) {
       const text = await execute(args || {}, exec)
       return { text: String(text ?? '') }
+    },
+    presentCall(args = {}) {
+      const label = TOOL_LABELS[name] || name
+      const detail = callDetail(args)
+      return {
+        card: 'generic',
+        title: detail ? `${label} · ${detail}` : label,
+        kind: TOOL_KINDS[name] || 'other',
+      }
+    },
+    presentResult(args = {}, result) {
+      const label = TOOL_LABELS[name] || name
+      const detail = callDetail(args)
+      const state = result?.isError ? '失败' : '完成'
+      return {
+        card: 'generic',
+        title: detail ? `${label}${state} · ${detail}` : `${label}${state}`,
+      }
     },
   }
   if (concurrent) definition.isConcurrencySafe = () => true

@@ -131,6 +131,13 @@ try {
   const engine = { roleOf: () => undefined, config: {} }
   const tools = createTools({ engine, config: DEFAULTS })
   assert.ok(tools.length >= 14)
+  const runTool = tools.find(t => t.name === 'artex_run_task')
+  assert.equal(typeof runTool.presentCall, 'function')
+  assert.equal(typeof runTool.presentResult, 'function')
+  assert.deepEqual(runTool.presentCall({ goal: '测试目标' }), { card: 'generic', title: 'ARTEX 编排 · 测试目标', kind: 'execute' })
+  assert.match(runTool.presentResult({ goal: '测试目标' }, { isError: false, content: [] }).title, /ARTEX 编排完成/)
+  assert.match(runTool.presentResult({}, { isError: true, content: [] }).title, /ARTEX 编排失败/)
+
   for (const tool of tools) {
     assert.ok(tool.name.startsWith('artex_'), tool.name)
     assert.equal(tool.parameters.type, 'object')

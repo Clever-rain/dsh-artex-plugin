@@ -1,9 +1,13 @@
 {
   "name": "@local/dsh-artex",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "ARTEX-style dual-graph planner/worker orchestration for DeepSeek Harness",
+  "engines": {
+    "dsh": ">=0.1.6-alpha.2"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -12,6 +16,10 @@
   "files": [
     "index.js",
     "engine.js",
+    "graph-ops.js",
+    "reporting.js",
+    "session-indexer.js",
+    "report.js",
     "runner.js",
     "scheduler.js",
     "analyst.js",
@@ -30,7 +38,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs",
