@@ -11,8 +11,10 @@ import {
 import { recordFacts, proveGoal as proveGoalOp } from '../graph-ops.js'
 import { ResourceStore, TaskStore, TaskIndex, isValidTaskId } from '../store.js'
 import { ArtexEngine, DEFAULTS } from '../engine.js'
+import { normalizeConfig } from '../config.js'
 import { snapshot } from '../reporting.js'
 import { selectNextIntent, plannerRound } from '../scheduler.js'
+import { plannerPrompt } from '../prompts.js'
 import { createTools } from '../tools.js'
 
 const root = await mkdtemp(join(tmpdir(), 'artex-audit-'))
@@ -173,6 +175,48 @@ try {
     () => recordTool.execute({ summary: 'x', intent_id: wt.intents[1].id }, { agent: { id: 'child' } }),
     /只能写回自己领到的意图/,
   )
+
+  // N1：事实写回不再唤醒 planner（避免每批事实烧一个规划轮）
+  const n1Events = []
+  const n1Task = makeTask('t-audit-11')
+  addIntents(n1Task, [{ summary: 'collect' }])
+  claimIntent(n1Task, n1Task.intents[0].id, 'work#1')
+  const n1Engine = {
+    runtimeForTask: () => ({ task: n1Task }),
+    roleForIntent: () => ({ writes: { facts: 0, findings: 0, resources: 0, outcomes: {} } }),
+    addActivity: () => ({}),
+    pushEvent: (_rt, e) => n1Events.push(e),
+    persist: () => {},
+  }
+  recordFacts(n1Engine, n1Task, [{ summary: 'fact one' }], n1Task.intents[0].id)
+  assert.equal(n1Events.some(e => e.kind === 'fact'), false, '事实写回不应 pushEvent')
+
+  // N3：批量写前置校验，失败时不应留下半批事实
+  const atomic = makeTask('t-audit-12')
+  addIntents(atomic, [{ summary: 'atomic' }])
+  claimIntent(atomic, atomic.intents[0].id, 'work#1')
+  const atomicEngine = { ...n1Engine, runtimeForTask: () => ({ task: atomic }) }
+  assert.throws(
+    () => recordFacts(atomicEngine, atomic, [{ summary: 'first ok' }, { summary: '   ' }], atomic.intents[0].id),
+    /summary.*不能为空/,
+  )
+  assert.equal(atomic.facts.length, 0, '批量失败不应留下第一条事实')
+
+  // N2：fact / intent 事件渲染为正确语义，不再是"意图结束"
+  const rendered = plannerPrompt({
+    task: makeTask('t-audit-13'),
+    view: { goals: [], digest: {}, delta: {} },
+    round: 2,
+    triggers: [{ kind: 'fact', intentId: 5, summary: '新增事实 #12' }, { kind: 'intent', summary: '新增意图 #9' }],
+  })
+  assert.match(rendered, /新增事实（意图 #5）/)
+  assert.match(rendered, /意图变化：新增意图 #9/)
+  assert.equal(rendered.includes('意图 #undefined 结束'), false)
+
+  // N5：原型链键当作未知配置，不抛异常
+  const protoConfig = normalizeConfig(JSON.parse('{"__proto__":{"polluted":true},"toString":1,"bogusKey":2}'))
+  assert.equal(protoConfig.warnings.length >= 3, true)
+  assert.equal({}.polluted, undefined)
 
   console.log('OK audit-regressions')
 } finally {

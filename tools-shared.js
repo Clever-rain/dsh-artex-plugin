@@ -142,7 +142,12 @@ export function callerOf(engine, exec) {
 }
 
 export async function resolve(engine, exec, taskId) {
-  const caller = callerOf(engine, exec)
+  let caller = callerOf(engine, exec)
+  // P2-1：roles.set 发生在 startActivation 之后，子会话首个工具调用可能早一个微任务。
+  if (!caller.role && taskId) {
+    await Promise.resolve()
+    caller = callerOf(engine, exec)
+  }
   const id = taskId || caller.role?.taskId
   if (!id) throw new Error('缺少 task_id：非 ARTEX 角色会话必须显式指定任务')
   const task = await engine.resolveTask(id)

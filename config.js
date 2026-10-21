@@ -47,7 +47,7 @@ export const DEFAULTS = {
   /** 子会话是否使用任务目录下的独立 cwd。 */
   isolateWorkdir: false,
   /** 快照合并写延迟（毫秒）。 */
-  saveDebounceMs: 200,
+  saveDebounceMs: 500,
   /** 是否允许非 owner/角色会话按 task_id 读取任务。 */
   allowCrossTaskRead: false,
   /** 全局任务索引路径；undefined = ~/.dsh/artex-index.json。 */
@@ -67,12 +67,12 @@ export function normalizeConfig(raw = {}, logger) {
   const config = { ...DEFAULTS }
   const warnings = []
   for (const [key, value] of Object.entries(raw || {})) {
-    if (!(key in DEFAULTS)) {
+    if (!Object.hasOwn(DEFAULTS, key)) {
       warnings.push(`未知配置键 "${key}"，已忽略`)
       continue
     }
     if (value === undefined || value === null) continue
-    if (key in ENUMS) {
+    if (Object.hasOwn(ENUMS, key)) {
       if (ENUMS[key].includes(value)) config[key] = value
       else warnings.push(`配置 ${key} 的值 "${value}" 非法，允许：${ENUMS[key].join(' | ')}；使用默认 ${DEFAULTS[key]}`)
       continue

@@ -34,12 +34,18 @@ function renderTriggers(triggers) {
         return `- 新增战略提示：${ev.summary || ''}`
       case 'goal':
         return `- 新增目标：${ev.summary || ''}`
+      case 'fact':
+        return `- 新增事实（意图 #${ev.intentId ?? '-'}）：${ev.summary || ''}`
+      case 'intent':
+        return `- 意图变化：${ev.summary || ''}`
+      case 'done':
+        return `- 意图 #${ev.intentId} 结束（${ev.state || 'done'}）：${ev.summary || ''}`
       case 'budget':
         return '- 任务预算即将耗尽，进入收尾。'
       case 'final':
         return '- **规划轮次已用尽，本轮是收官证明轮**：只做目标判定与覆盖核对（已有证据够就 prove_goal），不再派新意图。'
       default:
-        return `- 意图 #${ev.intentId} 结束（${ev.state || 'done'}）：${ev.summary || ''}`
+        return `- 事件 ${ev.kind}：${ev.summary || ''}`
     }
   }).join('\n')
 }

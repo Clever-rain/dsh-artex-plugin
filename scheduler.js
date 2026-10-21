@@ -86,7 +86,14 @@ export async function runLoop(engine, rt) {
         }
       }
     } catch (error) {
-      if (!rt.finished) engine.finish(rt, 'failed', String(error?.message || error))
+      if (!rt.finished) {
+        const evidence = t.facts.length + t.findings.length
+        if (evidence > 0) {
+          engine.finish(rt, 'stopped', `planner 连续失败；已保留 ${evidence} 条事实现场，可人工复核（${String(error?.message || error)}）`)
+        } else {
+          engine.finish(rt, 'failed', String(error?.message || error))
+        }
+      }
     } finally {
       await engine.drain(rt, 15000)
       engine.finish(rt, rt.finishedStatus || 'stopped', rt.finishDetail || '引擎退出')
@@ -215,7 +222,9 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
     })
     let outcome
     let lastError
-    const attempts = Math.max(1, Number(engine.config.plannerRetries) || 2)
+    const configuredRetries = engine.config.plannerRetries
+    const retries = configuredRetries == null ? 2 : Math.max(0, Number(configuredRetries) || 0)
+    const attempts = 1 + retries
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
         outcome = await engine.runChild(rt, {

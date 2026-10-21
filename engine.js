@@ -227,7 +227,7 @@ export class ArtexEngine {
     this.tasks.set(id, rt)
     this.evictOld()
     await stores.tasks.save(task)
-    await this.index.register(task).catch(() => undefined)
+    await this.index.register(task).catch((error) => this.logger.warn?.(`[artex] task index register failed: ${error?.message || error}`))
     rt.loop = this.runLoop(rt).catch((error) => {
       this.logger.warn?.(`[artex] task ${id} loop failed: ${error?.message || error}`)
       if (!rt.finished) this.finish(rt, 'failed', String(error?.message || error))

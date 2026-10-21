@@ -104,6 +104,12 @@ ${JSON.stringify(snapshot)}`
         for (const id of onDisk.slice(0, 50)) {
           if (liveIds.has(id)) continue
           try {
+            const owner = await engine.index.ownerOf(id)
+            if (owner) {
+              if (String(owner) === String(agent.id) || (role && String(role.taskId) === String(id))) history.push(id)
+              continue
+            }
+            // 旧索引条目没有 ownerSession：回退加载一次快照。
             const task = await engine.loadTask(id)
             if (!task) continue
             if (String(task.ownerSession) === String(agent.id) || (role && String(role.taskId) === String(id))) history.push(id)

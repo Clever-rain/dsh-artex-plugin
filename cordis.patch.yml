@@ -14,7 +14,7 @@
         budgetMs: 0
         isolateWorkdir: false
         # 快照合并写延迟（毫秒）；仅对运行中的高频 mutation 生效，收官会立即 flush
-        saveDebounceMs: 200
+        saveDebounceMs: 500
         # 读权限：默认仅 owner 与任务自己的子会话可读；true 允许任意会话按 task_id 读取
         allowCrossTaskRead: false
         # hybrid 总开关：默认开启；false=强制传统 planner-only（可在单任务用 analyst:false 覆盖）

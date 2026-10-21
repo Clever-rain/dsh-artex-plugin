@@ -3,7 +3,7 @@
  * 只依赖文件系统，不依赖模型与视图。
  */
 
-import { mkdir, readFile, writeFile, appendFile, rename, readdir, rm, stat } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, appendFile, rename, readdir, rm, stat, open } from 'node:fs/promises'
 import { dirname, join, sep } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -228,10 +228,22 @@ export class TaskStore {
     return next
   }
 
-  /** 从 JSONL 回填过程日志（最多 4000 条，与内存上限一致）。 */
+  /** 从 JSONL 尾部回填过程日志（最多 4000 条），避免整份读取 19 MB 级日志。 */
   async readActivities(taskId) {
+    let handle
     try {
-      const text = await readFile(join(this.taskDir(taskId), 'activity.jsonl'), 'utf8')
+      handle = await open(join(this.taskDir(taskId), 'activity.jsonl'), 'r')
+      const info = await handle.stat()
+      const maxBytes = 4 * 1024 * 1024
+      const start = Math.max(0, info.size - maxBytes)
+      const length = info.size - start
+      const buffer = Buffer.alloc(length)
+      await handle.read(buffer, 0, length, start)
+      let text = buffer.toString('utf8')
+      if (start > 0) {
+        const newline = text.indexOf('\n')
+        if (newline >= 0) text = text.slice(newline + 1)
+      }
       const out = []
       for (const line of text.split('\n')) {
         if (!line.trim()) continue
@@ -240,6 +252,8 @@ export class TaskStore {
       return out.slice(-4000)
     } catch {
       return []
+    } finally {
+      await handle?.close().catch(() => undefined)
     }
   }
 
@@ -304,7 +318,7 @@ export class TaskIndex {
         disk = raw?.items && typeof raw.items === 'object' ? raw.items : {}
       } catch { /* 首次写入 */ }
       this.items = { ...disk, ...this.items }
-      this.items[task.id] = { cwd: task.cwd, updatedAt: now() }
+      this.items[task.id] = { cwd: task.cwd, ownerSession: task.ownerSession, updatedAt: now() }
       const ids = Object.keys(this.items)
       if (ids.length > 500) {
         for (const id of ids.sort((a, b) => (this.items[a].updatedAt || 0) - (this.items[b].updatedAt || 0)).slice(0, ids.length - 500)) {
@@ -319,7 +333,7 @@ export class TaskIndex {
     const lock = `${this.path}.lock`
     await mkdir(dirname(lock), { recursive: true })
     const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < 600; attempt += 1) {
       try {
         await mkdir(lock)
         try {
@@ -331,7 +345,7 @@ export class TaskIndex {
         if (error?.code !== 'EEXIST') throw error
         try {
           const info = await stat(lock)
-          if (Date.now() - info.mtimeMs > 10000) {
+          if (Date.now() - info.mtimeMs > 3000) {
             await rm(lock, { recursive: true, force: true }).catch(() => undefined)
             continue
           }
@@ -347,5 +361,12 @@ export class TaskIndex {
     if (!isValidTaskId(id)) return undefined
     await this.load()
     return this.items[id]?.cwd
+  }
+
+  async ownerOf(taskId) {
+    const id = String(taskId)
+    if (!isValidTaskId(id)) return undefined
+    await this.load()
+    return this.items[id]?.ownerSession
   }
 }

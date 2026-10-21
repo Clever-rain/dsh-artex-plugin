@@ -347,6 +347,23 @@ v0.6.0 的拆分结果（纯结构重构，行为不变）：
 
 新增回归：`test/audit-regressions-smoke.mjs`（task_id、上限、唤醒、优先级、归属、证明、资源溯源、provider、settling、控制面、planner 重试、索引锁）。
 
+## 4.11 第二轮审计修复（v0.7.1，N1–N7）
+
+| 项 | 处置 |
+|---|---|
+| N1 事实唤醒放大 | **已修**：`recordFacts` 不再 `pushEvent`；事实由 `done`/`finding`/`goal` 统一带出，探针 05 的 fact 触发轮次从 5 降到 **0** |
+| N2 事件渲染错误 | **已修**：`renderTriggers` 增加 `fact`/`intent`/`done` 分支，`default` 改中性措辞；不再出现"意图 #undefined 结束" |
+| N3 批量写非原子 | **已修**：`recordFacts` 先校验整批 summary，再落图；失败时 0 条事实 |
+| N4 JSONL 整份读取 | **部分修复**：`readActivities` 改为尾部 4 MB 读取（探针 147→35 ms）；status 历史优先读索引里的 `ownerSession`，旧索引才回退加载 |
+| N5 配置原型链键 | **已修**：`Object.hasOwn` 判断；`__proto__`/`toString` 等按未知键告警，不抛异常、不污染原型 |
+| N7 重试语义差一 | **已修**：`attempts = 1 + plannerRetries`（默认 2 次重试 = 3 次尝试） |
+| P1-6 无降级收官 | **部分修复**：重试用尽且已有事实时，任务以 `stopped` + "保留现场"结束，不再直接 `failed`；仍未实现无 planner 的证明轮 |
+| P0-2 快照整图重写 | **部分修复**：`saveDebounceMs` 默认 500 ms；分片仍未做（上限态约 2.3 MB/次） |
+| P2-1 角色注册竞态 | **缓解**：`resolve` 未命中角色时让出一个微任务重试一次 |
+| P2-5 锁参数 | **已修**：等待上限 12 s、陈旧阈值 3 s；索引注册失败会告警 |
+
+新增回归：N1 事实不唤醒、N2 渲染语义、N3 批量原子性、N5 原型键；连同首轮回归共 13 类断言。
+
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
 **有意的简化**

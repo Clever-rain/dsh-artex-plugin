@@ -137,6 +137,9 @@ export function recordFacts(engine, task, entries, intentId) {
     const rt = engine.runtimeForTask(task)
     const targetId = intentId ?? entries[0]?.intentId ?? entries[0]?.intent_id ?? null
     requireRunningIntent(rt.task, targetId)
+    for (const entry of entries) {
+      if (!String(entry?.summary ?? '').trim()) throw new Error('每条 fact 的 summary 都不能为空')
+    }
     const facts = entries.map(entry => graphRecordFact(rt.task, {
       summary: entry.summary,
       detail: entry.detail,
@@ -164,7 +167,7 @@ export function recordFacts(engine, task, entries, intentId) {
         summary: facts.map(f => `#${f.id} ${oneLine(f.summary, 80)}`).join('；'),
         detail: facts.map(f => `#${f.id} ${f.summary}\n${f.detail || ''}\n${f.evidence || ''}`).join('\n\n'),
       })
-      engine.pushEvent(rt, { kind: 'fact', intentId: targetId, summary: `新增事实 ${facts.map(f => `#${f.id}`).join(' ')}` })
+      // 不唤醒：事实是高频进度数据，由 done/finding/goal 统一带出，避免每批事实烧一个规划轮。
       void engine.persist(rt)
     }
     return facts
