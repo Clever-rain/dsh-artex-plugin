@@ -20,6 +20,8 @@ export const DEFAULTS = {
   workerTimeoutMs: 1200000,
   /** 单轮 planner 的墙钟预算。 */
   plannerTimeoutMs: 900000,
+  /** planner 子会话瞬态失败时的重试次数（不含首次）。 */
+  plannerRetries: 2,
   /** 默认任务模式：objective=达成目的；audit=覆盖评估。 */
   mode: 'objective',
   /** 预算耗尽后的收尾宽限（ARTEX settleDrainGrace 90s）。 */

@@ -14,17 +14,10 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir } from 'node:fs/promises'
 import {
-  TaskStore, ResourceStore, TaskIndex,
-  createTask, addIntents as graphAddIntents, addActivity as graphAddActivity, addHint as graphAddHint,
-  claimIntent, finishIntent, allGoalsMet, plannerView, workerView, recordFact as graphRecordFact,
-  reportFinding as graphReportFinding, setTodos as graphSetTodos, proveGoal as graphProveGoal,
-  digestOf, deltaOf, setBrief as graphSetBrief, promoteIntent as graphPromoteIntent,
-  setAnalysis as graphSetAnalysis,
-  openIntents, runningIntents,
+  TaskStore, ResourceStore, TaskIndex, isValidTaskId,
+  createTask, addActivity as graphAddActivity,
 } from './graph.js'
-import { plannerPrompt, workerPrompt, analystPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
 import { interruptChildren as interruptChildrenImpl, interruptChild as interruptChildImpl, runChild as runChildImpl, awaitChild as awaitChildImpl, outcome as outcomeImpl, abortOnly as abortOnlyImpl, abortOrTimeout as abortOrTimeoutImpl, nudge as nudgeImpl } from './runner.js'
 import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl } from './scheduler.js'
 import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
@@ -32,7 +25,7 @@ import { recordUsage as recordUsageImpl } from './usage.js'
 import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl } from './graph-ops.js'
 import { snapshot as snapshotImpl, status as statusImpl, report as reportImpl } from './reporting.js'
 import { handleSessionEvent as handleSessionEventImpl } from './session-indexer.js'
-import { oneLine, sleep, textOf } from './util.js'
+import { sleep } from './util.js'
 import { normalizeConfig } from './config.js'
 import { TOOL_NAMES, denyForRole } from './policy.js'
 
@@ -103,10 +96,14 @@ export class ArtexEngine {
 
   resolveProvider() {
     const names = this.subagents.list()
-    if (names.includes(this.providerName)) return this.providerName
-    if (names.includes('spawn')) return 'spawn'
-    if (names.length > 0) return names[0]
-    throw new Error('ARTEX 需要至少一个本地 subagent provider（例如 spawn），当前一个都没有注册')
+    const requested = this.providerName
+    if (requested && names.includes(requested)) return requested
+    const fallback = names.includes('spawn') ? 'spawn' : names[0]
+    if (!fallback) throw new Error('ARTEX 需要至少一个本地 subagent provider（例如 spawn），当前一个都没有注册')
+    if (requested && fallback !== requested) {
+      this.logger.warn?.(`[artex] provider "${requested}" 未注册，回退到 "${fallback}"`)
+    }
+    return fallback
   }
 
   roleOf(sessionId) {
@@ -114,11 +111,14 @@ export class ArtexEngine {
   }
 
   liveTask(taskId) {
-    return this.tasks.get(String(taskId))
+    const id = String(taskId)
+    if (!isValidTaskId(id)) return undefined
+    return this.tasks.get(id)
   }
 
   async loadTask(taskId) {
     const id = String(taskId)
+    if (!isValidTaskId(id)) return undefined
     // 先查全局索引（跨 cwd），再回退到本进程已知的 workspace。
     const cwd = await this.index.lookup(id)
     if (cwd) {
@@ -139,10 +139,12 @@ export class ArtexEngine {
   }
 
   async resolveTask(taskId) {
-    const live = this.liveTask(taskId)
+    const id = String(taskId)
+    if (!isValidTaskId(id)) throw new Error(`非法 task_id: ${id}`)
+    const live = this.liveTask(id)
     if (live) return live.task
-    const stored = await this.loadTask(taskId)
-    if (!stored) throw new Error(`ARTEX 任务 ${taskId} 不存在`)
+    const stored = await this.loadTask(id)
+    if (!stored) throw new Error(`ARTEX 任务 ${id} 不存在`)
     return stored
   }
 
@@ -193,6 +195,7 @@ export class ArtexEngine {
         budgetMs: Math.max(0, Number(merged.budgetMs) || 0),
       },
     })
+    task.provider = this.providerName
     const rt = {
       task,
       ownerAgent: agent,
@@ -383,8 +386,8 @@ export class ArtexEngine {
     return addHintImpl(this, task, texts)
   }
 
-  proveGoal(task, goalId, evidenceId, reason) {
-    return proveGoalImpl(this, task, goalId, evidenceId, reason)
+  proveGoal(task, goalId, evidenceId, reason, allowNegative = false) {
+    return proveGoalImpl(this, task, goalId, evidenceId, reason, allowNegative)
   }
 
   setTodos(task, items) {
@@ -444,8 +447,8 @@ export class ArtexEngine {
     return snapshotImpl(this, task, live)
   }
 
-  async status(taskId) {
-    return statusImpl(this, taskId)
+  async status(taskId, options = {}) {
+    return statusImpl(this, taskId, options)
   }
 
   report(task) {

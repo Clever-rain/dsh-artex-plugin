@@ -2,7 +2,18 @@
  * worker 工具组。
  */
 
-import { artifact, callerOf, describe, integer, boolean, strings, isOwner, resolve, requireOwner, requireRole, requireRead, liveRuntime, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
+import { artifact, describe, integer, resolve, requireRole, liveRuntime } from '../tools-shared.js'
+
+/** worker 只能写回自己领到的意图；所有者可显式指定。 */
+function resolveIntentId(role, args) {
+  if (role?.role === 'worker') {
+    if (args.intent_id != null && Number(args.intent_id) !== Number(role.intentId)) {
+      throw new Error(`worker 只能写回自己领到的意图 #${role.intentId}，不能写 #${args.intent_id}`)
+    }
+    return role.intentId
+  }
+  return args.intent_id ?? role?.intentId
+}
 
 export function workerTools({ engine, config }) {
   return [
@@ -46,7 +57,7 @@ task 所有者与 worker 可调用。`,
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
         requireRole(agent, role, task, ['worker'])
         liveRuntime(engine, task)
-        const intentId = args.intent_id ?? role?.intentId ?? undefined
+        const intentId = resolveIntentId(role, args)
         const entries = Array.isArray(args.facts) && args.facts.length > 0
           ? args.facts.map(f => ({
             ...f,
@@ -62,7 +73,9 @@ task 所有者与 worker 可调用。`,
             intentId,
             resourceIds: args.resource_ids,
           }]
-        if (!entries[0].summary) throw new Error('summary 不能为空')
+        for (const entry of entries) {
+          if (!String(entry.summary || '').trim()) throw new Error('每条 fact 的 summary 都不能为空')
+        }
         const facts = engine.recordFacts(task, entries, intentId)
         return `已写回 ${facts.length} 条事实：${facts.map(f => `#${f.id}`).join(' ')}（confidence=${facts.map(f => f.confidence).join(',')}${facts.some(f => f.outcome) ? `, outcome=${facts.map(f => f.outcome || '-').join(',')}` : ''}）`
       },
@@ -96,7 +109,7 @@ task 所有者与 worker 可调用。`,
           severity: args.severity,
           evidence: args.evidence,
           resourceIds: args.resource_ids,
-          intentId: args.intent_id ?? role?.intentId ?? undefined,
+          intentId: resolveIntentId(role, args),
         })
         return `已登记发现 #${finding.id}：${finding.title}（severity=${finding.severity}）。规划者已被唤醒。`
       },

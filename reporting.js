@@ -16,6 +16,8 @@ export function snapshot(engine, task, live) {
       live: Boolean(live && !live.finished),
       mode: task.mode || 'objective',
       view_mode: task.viewMode || engine.config.viewMode || 'planner',
+      provider: task.provider || engine.providerName || engine.config.provider,
+      settling: Boolean(live?.settling),
       description: task.description,
       goal: task.goal,
       rounds: task.round,
@@ -46,7 +48,7 @@ export function snapshot(engine, task, live) {
     }
   }
 
-export async function status(engine, taskId) {
+export async function status(engine, taskId, options = {}) {
     if (taskId) {
       const rt = engine.liveTask(taskId)
       if (rt) return engine.snapshot(rt.task, rt)
@@ -54,7 +56,10 @@ export async function status(engine, taskId) {
       if (!stored) throw new Error(`ARTEX 任务 ${taskId} 不存在`)
       return engine.snapshot(stored, undefined)
     }
-    return [...engine.tasks.values()].map(rt => engine.snapshot(rt.task, rt))
+    const all = [...engine.tasks.values()].map(rt => engine.snapshot(rt.task, rt))
+    if (!options.ownerSession) return all
+    const extra = new Set((options.taskIds || []).map(String))
+    return all.filter(s => String(s.owner_session) === String(options.ownerSession) || extra.has(String(s.task_id)))
   }
 
 export function report(engine, task) {

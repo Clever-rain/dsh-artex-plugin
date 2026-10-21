@@ -315,6 +315,38 @@ v0.6.0 的拆分结果（纯结构重构，行为不变）：
 - **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，17 个工具都有中文标题、调用 kind 与完成/失败状态，Web UI 不再是裸工具名。
 - **打包**：`package.json` 的 `files` 覆盖全部拆分模块与 `LICENSE`。
 
+## 4.10 安全与完整性修复（v0.7.0，对应 `issue/2026-10-21` 审计）
+
+审计 19 项：16 项完整修复，3 项部分/保留（P0-2 分片、P1-6 降级收官、P2-1 竞态）：
+
+| 审计项 | 处置 |
+|---|---|
+| P0-1 `task_id` 路径穿越 | **已修**：`isValidTaskId` 白名单 + `taskDir` 路径包含校验；`resolveTask/loadTask/liveTask` 全部拒绝非法 id |
+| P0-2 长跑集合无上限 | **部分修复**：facts 2000 / findings 500 / hints 200，淘汰时保留目标证据；hint 截断 2000 字符。快照仍整图重写，分片待做 |
+| P0-3 `prove_goal` 不唤醒 | **已修**：证明目标、新增/提升意图、写回事实都 `pushEvent`；探针 04 从"挂 2s+"变为 2s 内完成 |
+| P1-1 `priority` 无效 | **已修**：`selectNextIntent` 按 `priority DESC, id ASC` 出队 |
+| P1-2 worker 跨意图写回 | **已修**：worker 工具强制使用自己的 `intentId`；图操作只接受运行中的意图 |
+| P1-3 控制工具无身份校验 | **已修**：`artex_run_task/start_task` 拒绝任何已注册子会话 |
+| P1-4 负结果/重复证明 | **已修**：`outcome=none` 需显式 `allow_negative=true`；已达成目标不可重复证明；blueprint 不可作证据 |
+| P1-5 缺 summary → `"undefined"` | **已修**：模型层抛错；工具层校验批量 `facts` 的每一条 |
+| P1-6 planner 单次失败报废任务 | **部分修复**：`plannerRetries`（默认 2）指数退避重试；持续失败仍终结 |
+| P1-7 资源 attrs 静默覆盖 | **已修**：记录 `updatedBy` / `attrsByTask` / `conflicts`，保留冲突副本 |
+| P1-8 provider 静默回退 | **已修**：回退时 `logger.warn`，并把实际 provider 写进任务快照 |
+| P2-2 收尾提示丢 kind | **已修**：`settlePrompt(role.role, role.kind)` |
+| P2-3 意图 >4 静默截断 | **已修**：工具返回"另有 N 条未提交" |
+| P2-4 status 全量返回 | **已修**：支持 `ownerSession/taskIds` 过滤，控制工具已传入 |
+| P2-5 索引无锁 | **已修**：`TaskIndex` 目录锁 + 锁内重读合并，10s 陈旧锁自动清理 |
+| P2-6 磁盘任务 id 泄露 | **已修**：无参 status 只列出 owner/自己任务 |
+| P2-7 缺 settling 状态 | **已修**：snapshot 增加 `settling` |
+| P2-8 死导入 | **已修**：engine/scheduler/tools 未使用导入清零（`audit` 脚本复核只剩 0 条） |
+
+**保留 2 项**：
+
+- **P2-1 角色注册竞态**：`roles.set` 仍需在 `startActivation` 返回后进行；要彻底消除需 provider 支持预分配 childId，改动跨服务接口，暂保留。
+- **P0-2 快照仍是整图重写**：集合已有硬上限，但 5000 事实场景仍约 2.3 MB/次；彻底分片（facts JSONL + 索引）留待后续，当前优先保证兼容。
+
+新增回归：`test/audit-regressions-smoke.mjs`（task_id、上限、唤醒、优先级、归属、证明、资源溯源、provider、settling、控制面、planner 重试、索引锁）。
+
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 
 **有意的简化**

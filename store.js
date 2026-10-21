@@ -3,13 +3,18 @@
  * 只依赖文件系统，不依赖模型与视图。
  */
 
-import { mkdir, readFile, writeFile, appendFile, rename, readdir } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { mkdir, readFile, writeFile, appendFile, rename, readdir, rm, stat } from 'node:fs/promises'
+import { dirname, join, sep } from 'node:path'
 import { homedir } from 'node:os'
 
 export const GRAPH_DIR = '.artex'
 
 const now = () => Date.now()
+
+/** 生成规则：t + base36 时间戳 + 4 位 hex；禁止路径分隔符与点。 */
+export function isValidTaskId(taskId) {
+  return /^t[0-9a-z-]{3,40}$/.test(String(taskId ?? ''))
+}
 
 /* ---------------------------------------------------------- resource graph */
 
@@ -59,9 +64,24 @@ export class ResourceStore {
       const key = ResourceStore.keyOf({ ...raw, name })
       const existing = this.items.find(x => ResourceStore.keyOf(x) === key)
       if (existing) {
+        const attrs = raw.attrs && typeof raw.attrs === 'object' ? raw.attrs : null
+        if (attrs) {
+          existing.attrsByTask = existing.attrsByTask || {}
+          if (taskId) existing.attrsByTask[taskId] = { ...(existing.attrsByTask[taskId] || {}), ...attrs }
+          const conflicts = {}
+          for (const [k, v] of Object.entries(attrs)) {
+            if (k in existing.attrs && JSON.stringify(existing.attrs[k]) !== JSON.stringify(v)) conflicts[k] = existing.attrs[k]
+          }
+          if (Object.keys(conflicts).length > 0) {
+            existing.conflicts = existing.conflicts || []
+            existing.conflicts.push({ taskId: taskId || null, at: now(), previous: conflicts })
+            if (existing.conflicts.length > 50) existing.conflicts = existing.conflicts.slice(-50)
+          }
+          existing.attrs = { ...existing.attrs, ...attrs }
+        }
+        existing.updatedBy = taskId || existing.updatedBy || null
         existing.updatedAt = now()
         if (taskId && !existing.tasks.includes(taskId)) existing.tasks.push(taskId)
-        if (raw.attrs && typeof raw.attrs === 'object') existing.attrs = { ...existing.attrs, ...raw.attrs }
         out.push({ id: existing.id, name: existing.name, type: existing.type, created: false })
         continue
       }
@@ -72,6 +92,9 @@ export class ResourceStore {
         name,
         key: raw.key ? String(raw.key) : name,
         attrs: raw.attrs && typeof raw.attrs === 'object' ? raw.attrs : {},
+        attrsByTask: taskId && raw.attrs && typeof raw.attrs === 'object' ? { [taskId]: raw.attrs } : {},
+        conflicts: [],
+        updatedBy: taskId || null,
         createdAt: now(),
         updatedAt: now(),
         tasks: taskId ? [taskId] : [],
@@ -124,7 +147,12 @@ export class TaskStore {
   }
 
   taskDir(taskId) {
-    return join(this.root, 'tasks', taskId)
+    const id = String(taskId)
+    if (!isValidTaskId(id)) throw new Error(`非法 task_id: ${id}`)
+    const tasksRoot = join(this.root, 'tasks')
+    const dir = join(tasksRoot, id)
+    if (!dir.startsWith(tasksRoot + sep)) throw new Error(`非法 task_id: ${id}`)
+    return dir
   }
 
   pathOf(taskId) {
@@ -268,22 +296,56 @@ export class TaskIndex {
   async register(task) {
     if (!task?.id || !task?.cwd) return
     await this.load()
-    this.items[task.id] = { cwd: task.cwd, updatedAt: now() }
-    const ids = Object.keys(this.items)
-    if (ids.length > 500) {
-      for (const id of ids.sort((a, b) => (this.items[a].updatedAt || 0) - (this.items[b].updatedAt || 0)).slice(0, ids.length - 500)) {
-        delete this.items[id]
+    await this.withLock(async () => {
+      // 锁内重新读取磁盘，避免多窗口各自持有旧 items 互相覆盖。
+      let disk = {}
+      try {
+        const raw = JSON.parse(await readFile(this.path, 'utf8'))
+        disk = raw?.items && typeof raw.items === 'object' ? raw.items : {}
+      } catch { /* 首次写入 */ }
+      this.items = { ...disk, ...this.items }
+      this.items[task.id] = { cwd: task.cwd, updatedAt: now() }
+      const ids = Object.keys(this.items)
+      if (ids.length > 500) {
+        for (const id of ids.sort((a, b) => (this.items[a].updatedAt || 0) - (this.items[b].updatedAt || 0)).slice(0, ids.length - 500)) {
+          delete this.items[id]
+        }
+      }
+      await writeAtomic(this.path, JSON.stringify({ items: this.items }))
+    })
+  }
+
+  async withLock(fn) {
+    const lock = `${this.path}.lock`
+    await mkdir(dirname(lock), { recursive: true })
+    const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await mkdir(lock)
+        try {
+          return await fn()
+        } finally {
+          await rm(lock, { recursive: true, force: true }).catch(() => undefined)
+        }
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error
+        try {
+          const info = await stat(lock)
+          if (Date.now() - info.mtimeMs > 10000) {
+            await rm(lock, { recursive: true, force: true }).catch(() => undefined)
+            continue
+          }
+        } catch { /* 锁刚被释放 */ }
+        await delay(20)
       }
     }
-    try {
-      await writeAtomic(this.path, JSON.stringify({ items: this.items }))
-    } catch (error) {
-      this.onError?.(error)
-    }
+    throw new Error('ARTEX 任务索引锁超时')
   }
 
   async lookup(taskId) {
+    const id = String(taskId)
+    if (!isValidTaskId(id)) return undefined
     await this.load()
-    return this.items[String(taskId)]?.cwd
+    return this.items[id]?.cwd
   }
 }

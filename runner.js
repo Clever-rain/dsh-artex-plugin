@@ -2,6 +2,8 @@
  * 子会话执行器：spawn 子会话、等待结果、中断、续跑提示。
  */
 
+import { mkdir } from 'node:fs/promises'
+import { settlePrompt } from './prompts.js'
 import { sleep, textOf } from './util.js'
 
 export function interruptChildren(engine, rt) {
@@ -88,7 +90,7 @@ export async function awaitChild(engine, rt, activation, spec, role) {
     }
 
     // 墙钟预算耗尽：先给收尾机会（ARTEX settlement），宽限期后再硬停。
-    await engine.nudge(rt, activation.childId, settlePrompt(spec.role))
+    await engine.nudge(rt, activation.childId, settlePrompt(role.role, role.kind))
     const grace = Number(rt.task.limits.settleGraceMs) || 0
     const graced = await Promise.race([settled, sleep(grace > 0 ? grace : 0).then(() => ({ kind: 'grace' }))])
     if (graced.kind === 'settled') return engine.outcome(graced.result, role, true)

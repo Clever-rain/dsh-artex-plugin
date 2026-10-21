@@ -2,8 +2,8 @@
  * 调度器：主循环、规划轮、派发 worker、突破停止、收尾与证明轮。
  */
 
-import { allGoalsMet, claimIntent, finishIntent, openIntents, runningIntents, digestOf, deltaOf, plannerView, workerView } from './graph.js'
-import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt, formatReport } from './prompts.js'
+import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView } from './graph.js'
+import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt } from './prompts.js'
 import { oneLine, sleep } from './util.js'
 
 export async function runLoop(engine, rt) {
@@ -214,25 +214,33 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
       detail: triggers.map(x => `${x.kind}:${x.summary || ''}`).join('\n'),
     })
     let outcome
-    try {
-      outcome = await engine.runChild(rt, {
-        role: 'planner',
-        key: `plan-${round}`,
-        label: `ARTEX planner · round ${round}`,
-        prompt,
-        timeoutMs: options.timeoutMs ?? t.limits.plannerTimeoutMs,
-        cwd: engine.config.isolateWorkdir ? t.outDir : undefined,
-      })
-    } catch (error) {
-      engine.addActivity(rt, {
-        intentId: null,
-        worker: 'planner',
-        kind: 'error',
-        summary: `规划第 ${round} 轮失败`,
-        detail: String(error?.message || error),
-      })
-      throw error
+    let lastError
+    const attempts = Math.max(1, Number(engine.config.plannerRetries) || 2)
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        outcome = await engine.runChild(rt, {
+          role: 'planner',
+          key: `plan-${round}`,
+          label: `ARTEX planner · round ${round}`,
+          prompt,
+          timeoutMs: options.timeoutMs ?? t.limits.plannerTimeoutMs,
+          cwd: engine.config.isolateWorkdir ? t.outDir : undefined,
+        })
+        lastError = undefined
+        break
+      } catch (error) {
+        lastError = error
+        engine.addActivity(rt, {
+          intentId: null,
+          worker: 'planner',
+          kind: 'error',
+          summary: `规划第 ${round} 轮失败（第 ${attempt}/${attempts} 次）`,
+          detail: String(error?.message || error),
+        })
+        if (attempt < attempts) await sleep(Math.min(5000, Math.max(200, (t.limits.debounceMs || 800) * attempt)))
+      }
     }
+    if (!outcome) throw lastError
     engine.addActivity(rt, {
       intentId: null,
       worker: 'planner',
@@ -250,11 +258,17 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
    * analyst 只读、只写 analysis，不参与决策；失败不影响规划（记一条 error 活动）。
    */
 
+export function selectNextIntent(task) {
+  return task.intents
+    .filter(i => i.state === 'open')
+    .sort((a, b) => (b.priority ?? 5) - (a.priority ?? 5) || a.id - b.id)[0]
+}
+
 export function dispatchWorkers(engine, rt) {
     if (rt.finished || rt.settling || rt.completing || rt.abort.signal.aborted) return
     const t = rt.task
     while (rt.running.size < t.limits.maxWorkers) {
-      const intent = t.intents.find(i => i.state === 'open')
+      const intent = selectNextIntent(t)
       if (!intent) break
       const workerName = `work#${rt.running.size + 1}`
       claimIntent(t, intent.id, workerName)

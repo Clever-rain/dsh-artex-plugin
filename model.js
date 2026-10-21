@@ -174,10 +174,28 @@ export function finishIntent(task, id, patch) {
   return intent
 }
 
+export const MAX_FACTS = 2000
+export const MAX_FINDINGS = 500
+export const MAX_HINTS = 200
+
+/** 长跑集合的硬上限：优先保留目标证据，其余淘汰最旧条目。 */
+function trimCollection(task, key, max) {
+  const list = task[key]
+  if (!Array.isArray(list) || list.length <= max) return
+  const protectedIds = new Set(task.goals.map(g => g.evidence).filter(Boolean))
+  const keep = []
+  for (let i = 0; i < list.length; i++) {
+    if (i >= list.length - max || protectedIds.has(list[i].id)) keep.push(list[i])
+  }
+  task[key] = keep
+}
+
 export function recordFact(task, input) {
+  const summary = String(input?.summary ?? '').trim()
+  if (!summary) throw new Error('fact.summary 不能为空')
   const fact = {
     id: nextNodeId(task),
-    summary: String(input.summary).trim(),
+    summary,
     detail: input.detail ? String(input.detail) : '',
     evidence: input.evidence ? String(input.evidence) : '',
     confidence: input.confidence === 'inferred' ? 'inferred' : 'observed',
@@ -196,6 +214,7 @@ export function recordFact(task, input) {
       if (fact.outcome) intent.outcomes[fact.outcome] += 1
     }
   }
+  trimCollection(task, 'facts', MAX_FACTS)
   task.updatedAt = now()
   return fact
 }
@@ -217,15 +236,17 @@ export function reportFinding(task, input) {
     const intent = intentById(task, finding.intentId)
     if (intent) intent.writes.findings += 1
   }
+  trimCollection(task, 'findings', MAX_FINDINGS)
   task.updatedAt = now()
   return finding
 }
 
 export function addHint(task, text) {
-  const hint = { id: nextNodeId(task), text: String(text).trim(), createdAt: now(), consumed: false }
+  const hint = { id: nextNodeId(task), text: truncate(String(text).trim(), 2000), createdAt: now(), consumed: false }
   if (!hint.text) return undefined
   task.hints.push(hint)
   task.stats.hints += 1
+  trimCollection(task, 'hints', MAX_HINTS)
   task.updatedAt = now()
   return hint
 }
@@ -280,15 +301,24 @@ export function promoteIntent(task, id) {
   return { ok: true, intent }
 }
 
-export function proveGoal(task, goalId, evidenceId, reason) {  const goal = task.goals.find(g => g.id === Number(goalId))
+export function proveGoal(task, goalId, evidenceId, reason, options = {}) {
+  const goal = task.goals.find(g => g.id === Number(goalId))
   if (!goal) return { ok: false, error: `goal #${goalId} 不存在` }
+  if (goal.status === 'met') return { ok: false, error: `goal #${goalId} 已达成，不能重复证明` }
   const evidence = nodeById(task, evidenceId)
   const evidenceKind = nodeKind(task, evidenceId)
   if (!evidence || (evidenceKind !== 'fact' && evidenceKind !== 'finding')) {
     return { ok: false, error: `evidence_id #${evidenceId} 必须是本任务里已存在的事实(fact)或发现(finding)` }
   }
+  if (evidence.outcome === 'blueprint') {
+    return { ok: false, error: 'blueprint 只是备选路径，不能作为目标达成证据' }
+  }
+  if (evidence.outcome === 'none' && options.allowNegative !== true) {
+    return { ok: false, error: 'outcome=none 是负结果；若目标本身是负向结论（如“无共享”），请显式传 allow_negative=true' }
+  }
   goal.status = 'met'
   goal.evidence = Number(evidenceId)
+  goal.evidenceOutcome = evidence.outcome || 'found'
   goal.reason = reason ? String(reason) : ''
   goal.metAt = now()
   task.updatedAt = now()

@@ -2,7 +2,7 @@
  * planner 工具组。
  */
 
-import { artifact, callerOf, describe, integer, boolean, strings, isOwner, resolve, requireOwner, requireRole, requireRead, liveRuntime, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
+import { artifact, describe, integer, boolean, resolve, requireRole, liveRuntime } from '../tools-shared.js'
 
 export function plannerTools({ engine, config }) {
   return [
@@ -51,14 +51,16 @@ export function plannerTools({ engine, config }) {
         const items = Array.isArray(args.intents) && args.intents.length > 0
           ? args.intents
           : args.summary
-            ? [{ summary: args.summary, parents: args.parents, kind: args.kind, state: args.state, path_parent: args.path_parent }]
+            ? [{ summary: args.summary, parents: args.parents, kind: args.kind, state: args.state, path_parent: args.path_parent, priority: args.priority }]
             : []
         if (items.length === 0) throw new Error('intents 或 summary 至少给一个')
+        const dropped = Math.max(0, items.length - 4)
         const results = engine.addIntents(task, items)
         const created = results.filter(r => r.id > 0)
         const duplicates = results.filter(r => r.duplicate)
         return `已创建 ${created.length} 条意图：${created.map(r => `#${r.id} ${r.summary}`).join('；') || '（无）'}`
           + (duplicates.length > 0 ? `\n跳过重复 ${duplicates.length} 条：${duplicates.map(d => `${d.summary}（已有 #${d.id}，${d.state}）`).join('；')}` : '')
+          + (dropped > 0 ? `\n仅提交前 4 条，另有 ${dropped} 条未提交` : '')
       },
     }),
     artifact({
@@ -71,6 +73,7 @@ export function plannerTools({ engine, config }) {
           goal_id: { type: 'integer', required: true, description: '目标节点 id（见态势 goals[].id）' },
           evidence_id: { type: 'integer', required: true, description: '作为证据的 fact/finding 节点 id' },
           reason: describe('一句话说明为什么这条证据足以证明目标达成'),
+          allow_negative: { type: 'boolean', description: '仅当目标本身是负向结论（如“无共享/未监听”）时设为 true，允许 outcome=none 的事实作为证据；默认拒绝负结果。' },
         },
         required: ['goal_id', 'evidence_id'],
         additionalProperties: false,
@@ -79,7 +82,7 @@ export function plannerTools({ engine, config }) {
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
         requireRole(agent, role, task, ['planner'])
         liveRuntime(engine, task)
-        const result = engine.proveGoal(task, args.goal_id, args.evidence_id, args.reason)
+        const result = engine.proveGoal(task, args.goal_id, args.evidence_id, args.reason, args.allow_negative === true)
         if (!result.ok) throw new Error(result.error)
         const remaining = task.goals.filter(g => g.status !== 'met')
         return `目标 #${args.goal_id} 已标记达成（证据 ${result.kind} #${args.evidence_id}）。`

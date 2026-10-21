@@ -2,7 +2,7 @@
  * read 工具组。
  */
 
-import { artifact, callerOf, describe, integer, boolean, strings, isOwner, resolve, requireOwner, requireRole, requireRead, liveRuntime, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
+import { artifact, describe, integer, resolve, requireRead } from '../tools-shared.js'
 import { overview, detail, listTraces, searchTraces, getTrace } from '../graph.js'
 
 export function readTools({ engine, config }) {

@@ -2,7 +2,7 @@
  * control 工具组。
  */
 
-import { artifact, callerOf, describe, integer, boolean, strings, isOwner, resolve, requireOwner, requireRole, requireRead, liveRuntime, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
+import { artifact, callerOf, describe, strings, isOwner, resolve, requireOwner, requireRead, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
 
 export function controlTools({ engine, config }) {
   const engineNote = config.isolateWorkdir
@@ -19,7 +19,8 @@ export function controlTools({ engine, config }) {
 mode：objective（默认，首个充分突破即收官，可并行 pursue）或 audit（覆盖最大化，enumerate 逐项验证，正负结果都算覆盖）。`,
       parameters: { type: 'object', properties: RUN_PARAMETERS, required: ['goal'], additionalProperties: false },
       async execute(args, exec) {
-        const { agent } = callerOf(engine, exec)
+        const { agent, role } = callerOf(engine, exec)
+        if (role) throw new Error('ARTEX 子会话不能启动新任务（只允许所有者会话）')
         const rt = await engine.startTask({
           agent,
           goal: args.goal,
@@ -47,7 +48,8 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
       description: '后台启动一个 ARTEX 编排任务，立即返回 task_id，不阻塞当前轮。之后用 artex_task_status 查看进度、artex_stop_task 停止、artex_add_hint 注入战略提示。注意：后台任务结束时**不会**自动唤醒本会话，需要你（或用户）主动轮询状态。',
       parameters: { type: 'object', properties: RUN_PARAMETERS, required: ['goal'], additionalProperties: false },
       async execute(args, exec) {
-        const { agent } = callerOf(engine, exec)
+        const { agent, role } = callerOf(engine, exec)
+        if (role) throw new Error('ARTEX 子会话不能启动新任务（只允许所有者会话）')
         const rt = await engine.startTask({
           agent,
           goal: args.goal,
@@ -90,7 +92,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
 
 ${JSON.stringify(snapshot)}`
         }
-        const all = await engine.status()
+        const all = await engine.status(undefined, { ownerSession: agent.id, taskIds: role ? [role.taskId] : [] })
         const live = all.filter(s => String(s.owner_session) === String(agent.id) || (role && String(s.task_id) === String(role.taskId)))
         const cwd = await engine.cwdFor(agent, exec.signal)
         const onDisk = await engine.storeFor(cwd).tasks.ids()
@@ -98,7 +100,16 @@ ${JSON.stringify(snapshot)}`
         const listing = live.length > 0
           ? live.map(t => `- ${t.task_id} [${t.status}] rounds=${t.rounds} facts=${t.facts} findings=${t.findings.length} · ${t.goal}`).join('\n')
           : '- （本进程内没有活动任务）'
-        const history = onDisk.filter(id => !liveIds.has(id)).slice(0, 10)
+        const history = []
+        for (const id of onDisk.slice(0, 50)) {
+          if (liveIds.has(id)) continue
+          try {
+            const task = await engine.loadTask(id)
+            if (!task) continue
+            if (String(task.ownerSession) === String(agent.id) || (role && String(role.taskId) === String(id))) history.push(id)
+          } catch { /* 跳过损坏或不可读的快照 */ }
+          if (history.length >= 10) break
+        }
         return `## 本进程任务
 ${listing}
 ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}`).join('\n')}` : ''}`

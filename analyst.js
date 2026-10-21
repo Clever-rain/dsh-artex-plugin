@@ -4,7 +4,6 @@
 
 import { analystPrompt } from './prompts.js'
 import { digestOf, deltaOf, plannerView } from './graph.js'
-import { sleep } from './util.js'
 
 export async function maybeRunAnalyst(engine, rt, triggers = []) {
     const t = rt.task

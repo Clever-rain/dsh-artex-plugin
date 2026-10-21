@@ -3,7 +3,16 @@
  */
 
 import { oneLine } from './util.js'
+import { intentById } from './model.js'
 import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding } from './graph.js'
+
+function requireRunningIntent(task, intentId) {
+  if (intentId == null) return null
+  const intent = intentById(task, Number(intentId))
+  if (!intent) throw new Error(`意图 #${intentId} 不存在`)
+  if (intent.state !== 'running') throw new Error(`意图 #${intentId} 不在运行中（state=${intent.state}），不能挂写回`)
+  return intent
+}
 
 export function addIntents(engine, task, items) {
     const rt = engine.runtimeForTask(task)
@@ -17,6 +26,7 @@ export function addIntents(engine, task, items) {
         summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}`,
       })
       rt.stalls = 0
+      engine.pushEvent(rt, { kind: 'intent', summary: `新增意图 ${created.map(id => `#${id}`).join(' ')}` })
       void engine.persist(rt)
     }
     return results
@@ -37,9 +47,9 @@ export function addHint(engine, task, texts) {
     return added
   }
 
-export function proveGoal(engine, task, goalId, evidenceId, reason) {
+export function proveGoal(engine, task, goalId, evidenceId, reason, allowNegative = false) {
     const rt = engine.runtimeForTask(task)
-    const result = graphProveGoal(rt.task, goalId, evidenceId, reason)
+    const result = graphProveGoal(rt.task, goalId, evidenceId, reason, { allowNegative })
     if (result.ok) {
       engine.addActivity(rt, {
         intentId: null,
@@ -48,6 +58,7 @@ export function proveGoal(engine, task, goalId, evidenceId, reason) {
         summary: `目标 #${goalId} 标记达成（证据 #${evidenceId}）`,
         detail: reason || '',
       })
+      engine.pushEvent(rt, { kind: 'goal', summary: `目标 #${goalId} 已证明` })
       void engine.persist(rt)
     }
     return result
@@ -108,6 +119,7 @@ export function promoteIntent(engine, task, intentId) {
         kind: 'promote',
         summary: `蓝图提升为 open：#${result.intent.id}`,
       })
+      engine.pushEvent(rt, { kind: 'intent', summary: `蓝图 #${result.intent.id} 提升为 open` })
       void engine.persist(rt)
     }
     return result
@@ -123,6 +135,8 @@ export function roleForIntent(engine, taskId, intentId) {
 
 export function recordFacts(engine, task, entries, intentId) {
     const rt = engine.runtimeForTask(task)
+    const targetId = intentId ?? entries[0]?.intentId ?? entries[0]?.intent_id ?? null
+    requireRunningIntent(rt.task, targetId)
     const facts = entries.map(entry => graphRecordFact(rt.task, {
       summary: entry.summary,
       detail: entry.detail,
@@ -130,7 +144,7 @@ export function recordFacts(engine, task, entries, intentId) {
       confidence: entry.confidence,
       outcome: entry.outcome,
       resourceIds: entry.resourceIds ?? entry.resource_ids,
-      intentId: entry.intentId ?? entry.intent_id ?? intentId,
+      intentId: targetId,
     }))
     if (facts.length > 0) {
       const role = engine.roleForIntent(task.id, facts[0].intentId)
@@ -144,12 +158,13 @@ export function recordFacts(engine, task, entries, intentId) {
         }
       }
       engine.addActivity(rt, {
-        intentId: intentId ?? facts[0].intentId,
+        intentId: targetId,
         worker: 'worker',
         kind: 'fact',
         summary: facts.map(f => `#${f.id} ${oneLine(f.summary, 80)}`).join('；'),
         detail: facts.map(f => `#${f.id} ${f.summary}\n${f.detail || ''}\n${f.evidence || ''}`).join('\n\n'),
       })
+      engine.pushEvent(rt, { kind: 'fact', intentId: targetId, summary: `新增事实 ${facts.map(f => `#${f.id}`).join(' ')}` })
       void engine.persist(rt)
     }
     return facts
@@ -157,7 +172,9 @@ export function recordFacts(engine, task, entries, intentId) {
 
 export function recordFinding(engine, task, input) {
     const rt = engine.runtimeForTask(task)
-    const finding = graphReportFinding(rt.task, input)
+    const targetId = input.intentId ?? input.intent_id ?? null
+    requireRunningIntent(rt.task, targetId)
+    const finding = graphReportFinding(rt.task, { ...input, intentId: targetId })
     const role = engine.roleForIntent(task.id, finding.intentId)
     if (role) role.writes.findings += 1
     engine.addActivity(rt, {
