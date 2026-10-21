@@ -2,7 +2,7 @@
  * control 工具组。
  */
 
-import { artifact, describe, integer, boolean, strings, resolve, requireOwner, requireRole, requireRead, liveRuntime, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
+import { artifact, callerOf, describe, integer, boolean, strings, isOwner, resolve, requireOwner, requireRole, requireRead, liveRuntime, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
 
 export function controlTools({ engine, config }) {
   const engineNote = config.isolateWorkdir

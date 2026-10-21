@@ -272,7 +272,7 @@ analyst 的工具面被 `toolFilter` 收窄为**只读 + `artex_set_analysis`**�
 - **读权限收紧**：默认只有任务所有者与其子会话能读任务；跨会话读取需 `allowCrossTaskRead: true`。
 - **配置默认值生效**：`config.mode` 现在作为任务默认模式（任务参数优先）。
 
-## 4.9 架构分层（v0.5.0）
+## 4.9 架构分层（v0.5.1）
 
 | 模块 | 职责 |
 |---|---|
@@ -301,7 +301,7 @@ v0.5.0 的拆分结果（纯结构重构，行为不变）：
 | `graph.js` ~890 行 | `model.js` 295 + `views.js` 267 + `store.js` 261 + 7 行门面 |
 | `tools.js` ~740 行 | `tools-shared.js` 142 + control 153 + planner 172 + worker 142 + read 87 + analysis 33 + 18 行门面 |
 
-拆分只做方法迁移与 `this` → `engine` 参数化，调用方（index / prompts / tests）仍从原路径导入；10 个场景测试保持全绿。
+拆分只做方法迁移与 `this` → `engine` 参数化，调用方（index / prompts / tests）仍从原路径导入；10 个场景测试保持全绿。v0.5.1 修复了拆分后 control 模块漏导入 `callerOf` 的线上问题，并补了控制工具执行回归。
 
 ## 5. 与 ARTEX 的差异（有意为之 / 尚未实现）
 

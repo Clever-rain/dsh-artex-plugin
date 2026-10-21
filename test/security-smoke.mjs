@@ -45,6 +45,19 @@ const open = createTools({ engine, config: { ...DEFAULTS, allowCrossTaskRead: tr
 const otherResult = await open.find(t => t.name === 'artex_graph_overview').execute({ task_id: task.id }, otherExec)
 assert.ok(otherResult.text.includes(task.id), '开启 allowCrossTaskRead 后应可读')
 
+// 控制工具也要能真正执行（回归：拆分后 control 模块漏导入 callerOf）
+const statusEngine = {
+  ...engine,
+  status: async () => ({
+    task_id: task.id, owner_session: task.ownerSession, status: 'completed', mode: 'objective', view_mode: 'planner',
+    goal: 'g', rounds: 1, intents: { by_state: {} }, facts: 0, findings: [], findings_total: 0,
+    resources: 0, elapsed_ms: 1, finish_detail: '',
+  }),
+}
+const statusTool = createTools({ engine: statusEngine, config: { ...DEFAULTS } }).find(t => t.name === 'artex_task_status')
+const statusResult = await statusTool.execute({ task_id: task.id }, ownerExec)
+assert.ok(statusResult.text.includes(task.id), 'task_status 应能执行')
+
 // config.mode 作为默认值生效
 assert.equal(resolveTaskMode(undefined, 'audit'), 'audit')
 assert.equal(resolveTaskMode('objective', 'audit'), 'objective', '任务参数优先')

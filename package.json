@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-artex",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "type": "module",
   "description": "ARTEX-style dual-graph planner/worker orchestration for DeepSeek Harness",
