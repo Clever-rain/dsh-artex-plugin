@@ -3,7 +3,7 @@
  */
 
 import { oneLine } from './util.js'
-import { intentById } from './model.js'
+import { intentById, danglingParents, findDuplicateFact } from './model.js'
 import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding } from './graph.js'
 
 function requireRunningIntent(task, intentId) {
@@ -14,8 +14,35 @@ function requireRunningIntent(task, intentId) {
   return intent
 }
 
-export function addIntents(engine, task, items, options = {}) {
+/**
+ * 写入前的锚点校验（与 ARTEX tools.go:1037-1066 同一道防线）：
+ * - parents 必须指向已存在的 fact/finding（被 trim 淘汰的旧节点也不能再引用）；
+ * - resource_ids 必须已登记在资源图里。
+ * 校验失败整体拒绝（不留半批），错误信息直接给模型自纠。
+ */
+async function validateAnchors(engine, rt, { parents = [], resourceIds = [] } = {}) {
+  const badParents = danglingParents(rt.task, parents)
+  if (badParents.length > 0) {
+    throw new Error(`parents 只能引用本任务已存在的 fact/finding：${badParents.map(id => `#${id}`).join(' ')} 不是有效的 fact/finding 节点（可能已被截断淘汰）`)
+  }
+  const ids = [...new Set((resourceIds || []).map(Number).filter(n => Number.isFinite(n) && n > 0))]
+  if (ids.length === 0) return
+  const resources = engine.storeFor(rt.task.cwd).resources
+  await resources.load()
+  const missing = ids.filter(id => !resources.has(id))
+  if (missing.length > 0) {
+    throw new Error(`resource_ids 引用了不存在的资源：${missing.map(id => `#${id}`).join(' ')}（先用 artex_add_resource 登记，再引用其 id）`)
+  }
+}
+
+export async function addIntents(engine, task, items, options = {}) {
     const rt = engine.runtimeForTask(task)
+    for (const item of items) {
+      await validateAnchors(engine, rt, {
+        parents: item?.parents,
+        resourceIds: item?.resource_ids ?? item?.resourceIds,
+      })
+    }
     const results = graphAddIntents(rt.task, items)
     const created = results.filter(r => r.id > 0).map(r => r.id)
     if (created.length > 0) {
@@ -142,22 +169,34 @@ export function roleForIntent(engine, taskId, intentId) {
     return undefined
   }
 
-export function recordFacts(engine, task, entries, intentId) {
+export async function recordFacts(engine, task, entries, intentId) {
     const rt = engine.runtimeForTask(task)
     const targetId = intentId ?? entries[0]?.intentId ?? entries[0]?.intent_id ?? null
     requireRunningIntent(rt.task, targetId)
     for (const entry of entries) {
       if (!String(entry?.summary ?? '').trim()) throw new Error('每条 fact 的 summary 都不能为空')
     }
-    const facts = entries.map(entry => graphRecordFact(rt.task, {
-      summary: entry.summary,
-      detail: entry.detail,
-      evidence: entry.evidence,
-      confidence: entry.confidence,
-      outcome: entry.outcome,
-      resourceIds: entry.resourceIds ?? entry.resource_ids,
-      intentId: targetId,
-    }))
+    await validateAnchors(engine, rt, { resourceIds: entries.flatMap(e => e.resourceIds ?? e.resource_ids ?? []) })
+    const facts = []
+    const duplicates = []
+    for (const entry of entries) {
+      // 服务端去重：规范化 summary 命中近期窗口内已有事实时跳过重写，返回已有节点。
+      // stats / intent.writes / outcomes 都不重计——重复证据不改变图景。
+      const dup = findDuplicateFact(rt.task, entry.summary)
+      if (dup) {
+        duplicates.push(dup)
+        continue
+      }
+      facts.push(graphRecordFact(rt.task, {
+        summary: entry.summary,
+        detail: entry.detail,
+        evidence: entry.evidence,
+        confidence: entry.confidence,
+        outcome: entry.outcome,
+        resourceIds: entry.resourceIds ?? entry.resource_ids,
+        intentId: targetId,
+      }))
+    }
     if (facts.length > 0) {
       const role = engine.roleForIntent(task.id, facts[0].intentId)
       if (role) {
@@ -176,16 +215,18 @@ export function recordFacts(engine, task, entries, intentId) {
         summary: facts.map(f => `#${f.id} ${oneLine(f.summary, 80)}`).join('；'),
         detail: facts.map(f => `#${f.id} ${f.summary}\n${f.detail || ''}\n${f.evidence || ''}`).join('\n\n'),
       })
-      // 不唤醒：事实是高频进度数据，由 done/finding/goal 统一带出，避免每批事实烧一个规划轮。
+      // 证据即时落盘（不等待合并写窗口），崩溃也只丢元数据指针；不唤醒规划者。
+      void engine.persistEvidence?.(rt)
       void engine.persist(rt)
     }
-    return facts
+    return { facts, duplicates }
   }
 
-export function recordFinding(engine, task, input) {
+export async function recordFinding(engine, task, input) {
     const rt = engine.runtimeForTask(task)
     const targetId = input.intentId ?? input.intent_id ?? null
     requireRunningIntent(rt.task, targetId)
+    await validateAnchors(engine, rt, { resourceIds: input.resourceIds ?? input.resource_ids })
     const finding = graphReportFinding(rt.task, { ...input, intentId: targetId })
     const role = engine.roleForIntent(task.id, finding.intentId)
     if (role) role.writes.findings += 1
@@ -196,6 +237,8 @@ export function recordFinding(engine, task, input) {
       summary: `发现 #${finding.id} ${oneLine(finding.title, 100)}`,
       detail: `${finding.detail || ''}\n${finding.evidence || ''}`,
     })
+    // 发现是最高价值证据：先即时落盘，再唤醒规划者（不等合并写窗口）。
+    void engine.persistEvidence?.(rt)
     engine.pushEvent(rt, {
       kind: 'finding',
       intentId: finding.intentId,

@@ -11,7 +11,7 @@ export function formatReport(task) {
     ? `\n- 用量：输入 ${usage.input_tokens} / 输出 ${usage.output_tokens} tokens（${usage.calls} 次模型调用）`
     : ''
   const goalLines = task.goals
-    .map(g => `- ${g.status === 'met' ? '✔' : '☐'} [goal#${g.id}] ${g.text}${g.evidence ? `（证据 #${g.evidence}）` : ''}`)
+    .map(g => `- ${g.status === 'met' ? '✔' : '☐'} [goal#${g.id}] ${g.text}${g.evidence ? `（证据 #${g.evidence}${g.evidenceOutcome ? `/${g.evidenceOutcome}` : ''}）` : ''}${g.reason ? ` — ${g.reason}` : ''}`)
     .join('\n')
   const capped = (lines, limit) => lines.length > limit
     ? [...lines.slice(0, limit), `- …另 ${lines.length - limit} 条（见任务快照）`]
@@ -38,7 +38,7 @@ export function formatReport(task) {
 - 目标：${task.goal}
 - 描述：${task.description}
 - 用时：${elapsed}s · 规划轮次：${task.round} · 意图状态：${JSON.stringify(stateCount)}
-- 事实 ${task.facts.length} 条 · 发现 ${task.findings.length} 个 · 资源 ${task.stats.resources} 个 · 过程步骤 ${task.stats.activities} 条${usageLine}
+- 事实 ${task.stats.facts} 条（内存保留 ${task.facts.length}） · 发现 ${task.stats.findings} 个 · 资源 ${task.stats.resources} 个 · 过程步骤 ${task.stats.activities} 条${usageLine}
 
 ## 全局认知（planner brief）
 ${brief ? '```markdown\n' + brief + '\n```' : '（未建立）'}

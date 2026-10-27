@@ -132,8 +132,8 @@ ${modeRules}
 
 1. **整合**：读 delta（上轮新增事实/发现/结束的意图）、digest（确定性计数与失败路径）、brief。
 2. **更新 brief**：并入新结论、删掉/修正被推翻的判断、更新覆盖或路径状态、写下下一步。
-3. **判目标**：用 \`artex_prove_goal(goal_id, evidence_id, reason)\` 逐条证明；最后一条证明后任务自动完成。量化目标先核对实测值。
-4. **派意图**：一次 \`artex_add_intent\`（≤4 条），summary 写清"对什么做什么、为什么"，用 \`parents\` 引用 brief/事实里的依据。
+3. **判目标**：用 \`artex_prove_goal(goal_id, evidence_id, reason)\` 逐条证明；最后一条证明后任务自动完成。量化目标先核对实测值。**证据红线**：\`confidence=inferred\` 的推断事实不能作证据（服务端硬拒）；blueprint、outcome=none（除非目标本身是负向结论且显式 allow_negative）同样被拒。证据不够就派意图去验证，不要硬证。
+4. **派意图**：一次 \`artex_add_intent\`（≤4 条），summary 写清"对什么做什么、为什么"，用 \`parents\` 引用 brief/事实里的依据（只能引用仍存在的 fact/finding id，过期被截断的节点会被服务端拒收）。
 5. **更新待办**：\`artex_set_todos\` 整体替换。
 
 ## 工具
@@ -152,6 +152,7 @@ ${renderTodos(task.todos)}
 > 只对【前置已满足】的下一步派意图；判断依据是态势里的事实，不是待办状态。
 
 ### 态势（含 delta 与 digest）
+${view?.degraded === true ? `\n⚠ **本轮态势为降级视图**（投影构建失败：${view.degraded_reason || 'unknown'}）。请你只基于 brief 与本轮事件做目标判定与收尾性维护，不要依据假定事实派生新的调查方向。\n` : ''}
 \`\`\`json
 ${json({ ...view, mode })}
 \`\`\`
@@ -208,8 +209,9 @@ ${kindRules}
 
 边发现边写，别攒到最后被步数/预算耗尽丢掉。
 - **新资源/实体 → \`artex_add_resource\`**：以后要反复引用的对象，只登记对象本身。
-- **结论/观察 → \`artex_record_fact\`**：多个观察合并成**一条**；给 \`evidence\`；标 \`confidence\`（observed/inferred）与 \`outcome\`（found/none/inconclusive/blueprint）。只写增量。
-- **已验证成果 → \`artex_report_finding\`**：只有本次真实复现、有可复现证据才用；"看起来像/推断可行"写成 inferred 的 fact。
+- **结论/观察 → \`artex_record_fact\`**：多个观察合并成**一条**；给 \`evidence\`；标 \`confidence\`（observed/inferred）与 \`outcome\`（found/none/inconclusive/blueprint）。只写增量——**summary 与近期已有事实重复时服务端会去重跳过**（返回已有 id），不要把同一结论换措辞重写。
+- **已验证成果 → \`artex_report_finding\`**：只有本次真实复现、有可复现证据才用；"看起来像/推断可行"写成 inferred 的 fact（inferred 不能用于 prove_goal）。
+- 锚点：\`resource_ids\` 只能引用已登记的资源 id，未知 id 会被拒收。
 
 ## 复用别人的过程
 
@@ -290,6 +292,11 @@ export function settlePrompt(role, kind) {
     return '【预算即将耗尽】不要再开新方向。把已经测过的候选逐条写回（命中 found / 未命中 none / 无法判定 inconclusive），然后用一句纯文本总结"已测哪些、剩哪些"，结束。'
   }
   return '【预算即将耗尽】不要再开新动作。把这条路径目前的进度写回：成功的证据写成 finding/observed fact，失败写成 outcome=none（附证据），其它可行路径写成 outcome=blueprint；然后用一句纯文本总结这条路径的状态，结束。'
+}
+
+/** 巡检唤醒：worker 静默超阈值时的存活确认提示（ARTEX 心跳复查在跑 work）。 */
+export function stallNudgePrompt() {
+  return '【巡检】你已经很久没有动作或写回了。如果仍在进行中：用一句纯文本汇报现状并继续；如果已经得出结论或受阻：立刻按写回纪律写回（成功的 finding/observed fact，失败的 outcome=none，其它可行路径 outcome=blueprint），然后结束。'
 }
 
 /** 目标已由别的路径达成：停止兄弟路径但保留现场。 */

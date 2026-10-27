@@ -105,8 +105,9 @@ export function addIntents(task, items, options = {}) {
   for (const raw of items.slice(0, limit)) {
     const summary = String(raw?.summary ?? raw?.text ?? '').trim()
     if (!summary) continue
-    // 失败/中止的方向允许用同一 summary 重试；blueprint 返回已有 id 供 promote。
-    const dup = task.intents.find(i => i.summary === summary && !['failed', 'stopped'].includes(i.state))
+    // 失败/中止/启动受阻的方向允许用同一 summary 重试；blueprint 返回已有 id 供 promote。
+    // blocked 目前只由 worker 启动失败（provider/资源类瞬态错误）产生，允许重派原方向。
+    const dup = task.intents.find(i => i.summary === summary && !['failed', 'stopped', 'blocked'].includes(i.state))
     if (dup && options.allowDuplicate !== true) {
       out.push({ id: dup.id, duplicate: true, state: dup.state, summary })
       continue
@@ -152,6 +153,41 @@ function normalizeIds(value) {
   return list.map(x => Number(x)).filter(x => Number.isFinite(x) && x > 0)
 }
 
+/** 规范化比对文本：大小写与折叠空白不影响判定。 */
+export function normalizeSummaryText(text) {
+  return String(text || '').toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+/** 事实写回去重的回看窗口（条）：只在近期范围内比对，长任务开销恒定。 */
+export const FACT_DEDUP_WINDOW = 500
+
+/**
+ * 按规范化 summary 在最近窗口内查重，返回已存在的同义事实（不入库、不计数）。
+ * 与 addIntents 的服务端去重是同一道防线：写回纪律靠提示词，兜底靠这里。
+ */
+export function findDuplicateFact(task, summary, ignoreId = 0) {
+  const key = normalizeSummaryText(summary)
+  if (!key) return undefined
+  const list = task.facts
+  const start = Math.max(0, list.length - FACT_DEDUP_WINDOW)
+  for (let i = list.length - 1; i >= start; i -= 1) {
+    const existing = list[i]
+    if (existing.id !== ignoreId && normalizeSummaryText(existing.summary) === key) return existing
+  }
+  return undefined
+}
+
+/**
+ * 血缘锚点校验：parents 只能指向已存在的 fact/finding（提示词纪律写死这一点）。
+ * 返回非法 id 列表（空数组 = 全部合法）；引用被 trim 掉的旧节点也算非法。
+ */
+export function danglingParents(task, parents) {
+  return (Array.isArray(parents) ? parents : []).filter((id) => {
+    const kind = nodeKind(task, id)
+    return kind !== 'fact' && kind !== 'finding'
+  })
+}
+
 export function claimIntent(task, id, worker) {
   const intent = intentById(task, id)
   if (!intent || intent.state !== 'open') return undefined
@@ -178,11 +214,14 @@ export const MAX_FACTS = 2000
 export const MAX_FINDINGS = 500
 export const MAX_HINTS = 200
 
-/** 长跑集合的硬上限：优先保留目标证据，其余淘汰最旧条目。 */
+/** 长跑集合的硬上限：优先保留目标证据与 brief/analysis 的引用，其余淘汰最旧条目。 */
 function trimCollection(task, key, max) {
   const list = task[key]
   if (!Array.isArray(list) || list.length <= max) return
   const protectedIds = new Set(task.goals.map(g => g.evidence).filter(Boolean))
+  // brief/analysis 的 citations 与目标证据同权：否则 trim 后 brief 里的 fact#id 会悬空。
+  for (const id of task.brief?.citations || []) protectedIds.add(id)
+  for (const id of task.analysis?.citations || []) protectedIds.add(id)
   const keep = []
   for (let i = 0; i < list.length; i++) {
     if (i >= list.length - max || protectedIds.has(list[i].id)) keep.push(list[i])
@@ -315,6 +354,9 @@ export function proveGoal(task, goalId, evidenceId, reason, options = {}) {
   }
   if (evidence.outcome === 'none' && options.allowNegative !== true) {
     return { ok: false, error: 'outcome=none 是负结果；若目标本身是负向结论（如“无共享”），请显式传 allow_negative=true' }
+  }
+  if (evidence.confidence === 'inferred') {
+    return { ok: false, error: 'confidence=inferred 的推断事实不能作为目标达成证据：请先在目标上验证，升级为 observed 事实或 finding 后再标记' }
   }
   goal.status = 'met'
   goal.evidence = Number(evidenceId)

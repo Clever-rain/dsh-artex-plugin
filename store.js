@@ -10,6 +10,9 @@ import { MAX_FACTS, MAX_FINDINGS } from './model.js'
 
 export const GRAPH_DIR = '.artex'
 
+/** activity.jsonl 单卷上限：超过后轮转为 activity.1.jsonl（仅保留一档历史卷）。 */
+export const MAX_ACTIVITY_BYTES = 64 * 1024 * 1024
+
 const now = () => Date.now()
 
 /** 生成规则：t + base36 时间戳 + 4 位 hex；禁止路径分隔符与点。 */
@@ -107,6 +110,11 @@ export class ResourceStore {
     return out
   }
 
+  /** 锚点校验用：资源 id 是否存在于资源图。调用前须 await load()。 */
+  has(id) {
+    return this.items.some(x => x.id === Number(id))
+  }
+
   list(filter = {}) {
     const q = filter.q ? String(filter.q).toLowerCase() : ''
     return this.items
@@ -158,6 +166,7 @@ export class TaskStore {
     this.paths = new Map()
     this.pending = new Map()
     this.written = new Map()
+    this.activityBytes = new Map()
     this.onError = options.onError
     this.lastError = undefined
   }
@@ -228,6 +237,24 @@ export class TaskStore {
     }
   }
 
+  /**
+   * 证据（facts/findings）即时落盘：不走 scheduleSave 的合并写窗口。
+   * save() 仍负责元数据快照；这里只把新事实/发现追加进 JSONL（按 entry 内 id 幂等），
+   * 进程崩溃最多丢元数据指针，不丢已确认的结论本身。
+   */
+  appendEvidence(task) {
+    const prev = this.paths.get(task.id) ?? Promise.resolve()
+    const next = prev.then(async () => {
+      const entry = this.entryFor(task.id)
+      await this.appendNew(task, entry)
+    }).catch((error) => {
+      this.lastError = error
+      this.onError?.(error)
+    })
+    this.paths.set(task.id, next)
+    return next
+  }
+
   /** Persist metadata + append only new facts/findings (atomic rename, compact JSON). */
   save(task) {
     const path = this.pathOf(task.id)
@@ -277,6 +304,18 @@ export class TaskStore {
     await Promise.all([...this.pending.keys()].map(id => this.flush(id)))
   }
 
+  /**
+   * 任务终态后回收该任务的内存写入状态（promise 链 / 已写 id 集 / 字节计数），
+   * 磁盘快照与 JSONL 保留，之后仍可 load 复载（会重建这些条目）。
+   */
+  release(taskId) {
+    this.written.delete(taskId)
+    this.pending.delete(taskId)
+    this.paths.delete(taskId)
+    this.paths.delete(`${taskId}:activity`)
+    this.activityBytes.delete(join(this.taskDir(taskId), 'activity.jsonl'))
+  }
+
   /** Append-only process log, so long runs survive the in-memory activity cap. */
   appendActivity(task, activity) {
     const path = join(this.taskDir(task.id), 'activity.jsonl')
@@ -284,7 +323,16 @@ export class TaskStore {
     const prev = this.paths.get(`${task.id}:activity`) ?? Promise.resolve()
     const next = prev.then(async () => {
       await mkdir(dirname(path), { recursive: true })
+      // 轮转：超上限先归档为 activity.1.jsonl（覆盖旧档），审计日志不无边际增长。
+      // 回填窗口只读当前卷；归档卷仍留在磁盘上可人工查阅。
+      const bytes = this.activityBytes.get(path) ?? await stat(path).then(s => s.size).catch(() => 0)
+      let base = bytes
+      if (bytes > MAX_ACTIVITY_BYTES) {
+        await rename(path, path.replace(/\.jsonl$/, '.1.jsonl')).catch(() => undefined)
+        base = 0
+      }
       await appendFile(path, line, 'utf8')
+      this.activityBytes.set(path, base + Buffer.byteLength(line))
     }).catch((error) => {
       this.lastError = error
       this.onError?.(error)

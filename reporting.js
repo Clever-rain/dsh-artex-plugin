@@ -9,6 +9,15 @@ export function snapshot(engine, task, live) {
     const stateCount = {}
     for (const intent of task.intents) stateCount[intent.state] = (stateCount[intent.state] || 0) + 1
     const endsAt = task.endedAt ?? Date.now()
+    // 证据节点的可信度/结局：让 prove 链在快照与报告里闭环（reason 不再只躺在库里）。
+    const evidenceMeta = (id) => {
+      if (!id) return {}
+      const node = task.facts.find(f => f.id === Number(id)) || task.findings.find(f => f.id === Number(id))
+      return {
+        evidence_confidence: node?.confidence || (node ? 'finding' : undefined),
+        evidence_missing: node ? undefined : true,
+      }
+    }
     return {
       task_id: task.id,
       owner_session: task.ownerSession,
@@ -18,6 +27,7 @@ export function snapshot(engine, task, live) {
       view_mode: task.viewMode || engine.config.viewMode || 'planner',
       provider: task.provider || engine.providerName || engine.config.provider,
       settling: Boolean(live?.settling),
+      degraded: live?.lastViewError ? { reason: live.lastViewError, consecutive_failures: live.viewFailures || 0 } : undefined,
       description: task.description,
       goal: task.goal,
       rounds: task.round,
@@ -28,16 +38,27 @@ export function snapshot(engine, task, live) {
       analysis_round: task.analysis?.round ?? undefined,
       analysis_runs: task.analysisRuns || 0,
       digest: digestOf(task),
-      goals: task.goals.map(g => ({ id: g.id, text: g.text, status: g.status, evidence: g.evidence })),
+      goals: task.goals.map(g => ({
+        id: g.id,
+        text: g.text,
+        status: g.status,
+        evidence: g.evidence,
+        evidence_outcome: g.evidenceOutcome,
+        reason: g.reason || undefined,
+        ...evidenceMeta(g.evidence),
+      })),
       intents: {
         total: task.intents.length,
         open: openIntents(task).length,
         running: runningIntents(task).length,
         by_state: stateCount,
       },
-      facts: task.facts.length,
+      facts: task.stats.facts,
+      facts_kept: task.facts.length,
+      facts_truncated: task.stats.facts > task.facts.length || undefined,
       findings: task.findings.slice(-50).map(f => ({ id: f.id, title: f.title, severity: f.severity, intent_id: f.intentId })),
-      findings_total: task.findings.length,
+      findings_total: task.stats.findings,
+      findings_kept: task.findings.length,
       resources: task.stats.resources,
       usage: task.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
       hints: task.hints.map(h => h.text),
