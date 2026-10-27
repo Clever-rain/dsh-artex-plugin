@@ -22,6 +22,7 @@ export function workerTools({ engine, config }) {
       description: `执行者写回：把本意图得到的**结论/观察/判断**写进探索图（不是资源，也不是已验证成果）。
 纪律：多个观察汇总成**一条**事实（summary 一句话 + detail 展开），默认就写一条；只写增量；只写真实看到的——给 evidence，标 confidence。
 outcome 用于覆盖/路径判定：found=发现/验证成功；none=按方法测过但未命中（负结果，算覆盖）；inconclusive=无法判定；blueprint=其它可行路径的蓝图（不执行）。
+服务端护栏：summary 与近期已有事实重复会被去重跳过（返回已有 id，不重复计数）；resource_ids 必须是已登记的资源 id，悬空引用整体拒绝。
 task 所有者与 worker 可调用。`,
       parameters: {
         type: 'object',
@@ -76,8 +77,11 @@ task 所有者与 worker 可调用。`,
         for (const entry of entries) {
           if (!String(entry.summary || '').trim()) throw new Error('每条 fact 的 summary 都不能为空')
         }
-        const facts = engine.recordFacts(task, entries, intentId)
-        return `已写回 ${facts.length} 条事实：${facts.map(f => `#${f.id}`).join(' ')}（confidence=${facts.map(f => f.confidence).join(',')}${facts.some(f => f.outcome) ? `, outcome=${facts.map(f => f.outcome || '-').join(',')}` : ''}）`
+        const { facts, duplicates } = await engine.recordFacts(task, entries, intentId)
+        return `已写回 ${facts.length} 条事实：${facts.map(f => `#${f.id}`).join(' ') || '（无新增）'}（confidence=${facts.map(f => f.confidence).join(',') || '-'}${facts.some(f => f.outcome) ? `, outcome=${facts.map(f => f.outcome || '-').join(',')}` : ''}）`
+          + (duplicates.length > 0
+            ? `\n去重跳过 ${duplicates.length} 条重复事实，指向已有：${duplicates.map(f => `#${f.id}`).join(' ')}（如需更新请在该事实上派生新结论）`
+            : '')
       },
     }),
     artifact({
@@ -103,7 +107,7 @@ task 所有者与 worker 可调用。`,
         requireRole(agent, role, task, ['worker'])
         liveRuntime(engine, task)
         if (!String(args.title || '').trim()) throw new Error('title 不能为空')
-        const finding = engine.recordFinding(task, {
+        const finding = await engine.recordFinding(task, {
           title: args.title,
           detail: args.detail,
           severity: args.severity,

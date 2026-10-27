@@ -45,7 +45,11 @@ export function overview(task, options = {}) {
       recent_done: done.map(i => briefIntent(task, i)),
     },
     facts: {
-      total: task.facts.length,
+      // total 用累计真值而不是内存窗口长度：trim 后 len() 会静默失真。
+      total: task.stats.facts,
+      kept: task.facts.length,
+      truncated: task.stats.facts > task.facts.length || undefined,
+      filtered: q ? true : undefined,
       recent: recent.map(f => ({
         id: f.id,
         summary: f.summary,
@@ -59,14 +63,16 @@ export function overview(task, options = {}) {
       severity: f.severity,
       intent_id: f.intentId,
     })),
-    findings_total: task.findings.length,
+    findings_total: task.stats.findings,
+    findings_kept: task.findings.length,
+    findings_truncated: task.findings.length > 50 || undefined,
     hints: task.hints.map(h => ({ id: h.id, text: h.text })),
     todos: task.todos,
     stats: {
       round: task.round,
-      intents_total: task.intents.length,
-      facts_total: task.facts.length,
-      findings_total: task.findings.length,
+      intents_total: task.stats.intents,
+      facts_total: task.stats.facts,
+      findings_total: task.stats.findings,
       resources_total: task.stats.resources,
     },
   }
@@ -83,8 +89,15 @@ export function digestOf(task) {
   for (const i of task.intents) states[i.state] = (states[i.state] || 0) + 1
   return {
     mode: task.mode,
-    facts: { total: task.facts.length, by_outcome: byOutcome },
-    findings: task.findings.length,
+    // by_outcome 只统计内存窗口内的事实；total 是累计真值，kept 标注窗口深度。
+    facts: {
+      total: task.stats.facts,
+      kept: task.facts.length,
+      truncated: task.stats.facts > task.facts.length || undefined,
+      by_outcome: byOutcome,
+    },
+    findings: task.stats.findings,
+    findings_kept: task.findings.length,
     intents: states,
     failed_paths: task.intents
       .filter(i => i.state === 'failed')
@@ -169,7 +182,9 @@ export function plannerView(task, options = {}) {
         .map(i => briefRow(i, true)),
     },
     facts: {
-      total: task.facts.length,
+      total: task.stats.facts,
+      kept: task.facts.length,
+      truncated: task.stats.facts > task.facts.length || undefined,
       recent: facts.filter(f => !deltaFactIds.has(f.id)).slice(-factsLimit).reverse().map(f => ({
         id: f.id,
         summary: truncate(f.summary, 160),
@@ -178,6 +193,7 @@ export function plannerView(task, options = {}) {
         intent_id: f.intentId,
       })),
     },
+    findings_total: task.stats.findings,
     findings: task.findings.slice(-20).map(f => ({
       id: f.id,
       title: truncate(f.title, 100),
@@ -199,8 +215,8 @@ export function workerView(task, intent, options = {}) {
     mode: task.mode,
     kind: intent.kind,
     goals: task.goals.map(g => `${g.id}.[${g.status}] ${truncate(g.text, 80)}`),
-    facts_total: task.facts.length,
-    findings_total: task.findings.length,
+    facts_total: task.stats.facts,
+    findings_total: task.stats.findings,
     facts_recent: task.facts.slice(-factsLimit).reverse().map(f => `#${f.id} [${f.confidence}${f.outcome ? `/${f.outcome}` : ''}] ${truncate(f.summary, 80)}`),
     findings: task.findings.slice(-8).map(f => `#${f.id} ${truncate(f.title, 60)}`),
   }
@@ -229,6 +245,38 @@ export function detail(task, id) {
     base.from_intent = n.intentId ? intentById(task, n.intentId)?.summary : undefined
   }
   return base
+}
+
+/**
+ * 态势投影构建失败时的降级视图：收官/收尾证明轮用它继续，
+ * planner 只能依据 brief 与本轮事件谨慎判定（明确禁止扩展性决策）。
+ * 只含防御性渲染的目标与计数，保证自身不再抛错。
+ */
+export function degradedView(task, error) {
+  const safeText = (value, max = 160) => {
+    try {
+      return truncate(String(value ?? ''), max)
+    } catch {
+      return ''
+    }
+  }
+  return {
+    mode: task.mode === 'audit' ? 'audit' : 'objective',
+    degraded: true,
+    degraded_reason: String(error || 'unknown'),
+    digest: undefined,
+    delta: undefined,
+    goals: (Array.isArray(task.goals) ? task.goals : []).map(g => ({
+      id: g?.id,
+      text: safeText(g?.text),
+      status: g?.status || 'open',
+      ...(g?.evidence ? { evidence: g.evidence } : {}),
+    })),
+    intents: { open: [], running: [], blueprints: [], recent_done: [] },
+    facts: { total: Number(task?.stats?.facts) || 0, kept: 0, truncated: true, recent: [] },
+    findings: [],
+    hints: [],
+  }
 }
 
 /** Which intents ran, and how many trace steps each has. */

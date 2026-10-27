@@ -19,7 +19,7 @@ import {
   createTask, addActivity as graphAddActivity,
 } from './graph.js'
 import { interruptChildren as interruptChildrenImpl, interruptChild as interruptChildImpl, runChild as runChildImpl, awaitChild as awaitChildImpl, outcome as outcomeImpl, abortOnly as abortOnlyImpl, abortOrTimeout as abortOrTimeoutImpl, nudge as nudgeImpl } from './runner.js'
-import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl } from './scheduler.js'
+import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl, checkStalledWorkers as checkStalledWorkersImpl } from './scheduler.js'
 import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
 import { recordUsage as recordUsageImpl } from './usage.js'
 import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl } from './graph-ops.js'
@@ -214,6 +214,10 @@ export class ArtexEngine {
       lastAnalystAt: 0,
       lastAnalystFactCount: 0,
       lastAnalystRound: 0,
+      stalledNudges: new Map(),
+      workerSeq: 0,
+      viewFailures: 0,
+      lastViewError: undefined,
       finished: false,
       startedAt: Date.now(),
       done: undefined,
@@ -226,7 +230,16 @@ export class ArtexEngine {
     rt.done = new Promise((resolve) => { rt.doneResolve = resolve })
     this.tasks.set(id, rt)
     this.evictOld()
-    await stores.tasks.save(task)
+    try {
+      // save 设计上是自吞错的（写进 lastError）：对比前后引用识别本次失败。
+      // 启动期落盘失败直接失败，不留一个永不结束的孤儿 runtime 在 tasks 表里。
+      const prevError = stores.tasks.lastError
+      await stores.tasks.save(task)
+      if (stores.tasks.lastError && stores.tasks.lastError !== prevError) throw stores.tasks.lastError
+    } catch (error) {
+      this.tasks.delete(id)
+      throw new Error(`ARTEX 任务 ${id} 初始化落盘失败：${error?.message || error}`)
+    }
     await this.index.register(task).catch((error) => this.logger.warn?.(`[artex] task index register failed: ${error?.message || error}`))
     rt.loop = this.runLoop(rt).catch((error) => {
       this.logger.warn?.(`[artex] task ${id} loop failed: ${error?.message || error}`)
@@ -315,6 +328,10 @@ export class ArtexEngine {
     return dispatchWorkersImpl(this, rt)
   }
 
+  checkStalledWorkers(rt) {
+    return checkStalledWorkersImpl(this, rt)
+  }
+
   async runWorker(rt, intent, workerName) {
     return runWorkerImpl(this, rt, intent, workerName)
   }
@@ -365,12 +382,35 @@ export class ArtexEngine {
 
   addActivity(rt, input) {
     const activity = graphAddActivity(rt.task, input)
+    // 心跳查房的时钟：任何带 intentId 的动作都算"这条意图还活着"。
+    if (activity.intentId) {
+      const intent = rt.task.intents.find(i => i.id === activity.intentId)
+      if (intent) intent.lastActivityAt = activity.at
+      rt.stalledNudges?.delete(activity.intentId)
+    }
     void this.storeFor(rt.task.cwd).tasks.appendActivity(rt.task, activity)
     return activity
   }
 
   persist(rt) {
     return this.storeFor(rt.task.cwd).tasks.scheduleSave(rt.task, Number(this.config.saveDebounceMs) || 200)
+  }
+
+  /** 证据（facts/findings）即时落盘：不走合并写窗口，崩溃不丢已确认结论。 */
+  persistEvidence(rt) {
+    return this.storeFor(rt.task.cwd).tasks.appendEvidence(rt.task)
+  }
+
+  /** 任务终态后回收持久化层的内存写入状态（快照/JSONL 保留可重载）。 */
+  releaseStore(rt) {
+    this.storeFor(rt.task.cwd).tasks.release(rt.task.id)
+  }
+
+  /** 距离任务级预算耗尽还剩多少毫秒；未设预算返回 Infinity。 */
+  remainingBudgetMs(rt) {
+    const budget = Number(rt?.task?.limits?.budgetMs) || 0
+    if (budget <= 0) return Infinity
+    return Math.max(0, (Number(rt.startedAt) || Date.now()) + budget - Date.now())
   }
 
   /** 立即落盘（收官/停止时用），并清掉合并写队列。 */

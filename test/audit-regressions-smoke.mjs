@@ -9,14 +9,24 @@ import {
   createTask, addIntents, claimIntent, recordFact, reportFinding, proveGoal, addHint,
   MAX_FACTS, MAX_FINDINGS, MAX_HINTS,
 } from '../model.js'
-import { addIntents as addIntentsOp, recordFacts, proveGoal as proveGoalOp, promoteIntent as promoteIntentOp } from '../graph-ops.js'
-import { ResourceStore, TaskStore, TaskIndex, isValidTaskId } from '../store.js'
+import { addIntents as addIntentsOp, recordFacts, recordFinding, proveGoal as proveGoalOp, promoteIntent as promoteIntentOp } from '../graph-ops.js'
+import { ResourceStore, TaskStore, TaskIndex, isValidTaskId, MAX_ACTIVITY_BYTES } from '../store.js'
 import { ArtexEngine, DEFAULTS } from '../engine.js'
 import { normalizeConfig } from '../config.js'
 import { snapshot } from '../reporting.js'
-import { selectNextIntent, plannerRound } from '../scheduler.js'
+import { selectNextIntent, plannerRound, dispatchWorkers, runWorker, finishWorker, checkStalledWorkers } from '../scheduler.js'
 import { plannerPrompt } from '../prompts.js'
 import { createTools } from '../tools.js'
+import { normalizeStopReason } from '../util.js'
+
+/** 通用引擎 stub：只含 graph-ops/finishWorker 真正触达的方法。 */
+const n1EngineFor = (task) => ({
+  runtimeForTask: () => ({ task }),
+  roleForIntent: () => undefined,
+  addActivity: () => ({}),
+  pushEvent: () => {},
+  persist: () => {},
+})
 
 const root = await mkdtemp(join(tmpdir(), 'artex-audit-'))
 try {
@@ -73,9 +83,9 @@ try {
     pushEvent: () => {},
     persist: () => {},
   }
-  assert.throws(() => recordFacts(stub, attr, [{ summary: 'x' }], attr.intents[0].id), /不在运行中/)
+  await assert.rejects(() => recordFacts(stub, attr, [{ summary: 'x' }], attr.intents[0].id), /不在运行中/)
   claimIntent(attr, attr.intents[0].id, 'work#1')
-  const written = recordFacts(stub, attr, [{ summary: 'x' }], attr.intents[0].id)
+  const { facts: written } = await recordFacts(stub, attr, [{ summary: 'x' }], attr.intents[0].id)
   assert.equal(written[0].intentId, attr.intents[0].id)
 
   // P0-3：证明/新增意图会 pushEvent（唤醒主循环）
@@ -189,7 +199,7 @@ try {
     pushEvent: (_rt, e) => n1Events.push(e),
     persist: () => {},
   }
-  recordFacts(n1Engine, n1Task, [{ summary: 'fact one' }], n1Task.intents[0].id)
+  await recordFacts(n1Engine, n1Task, [{ summary: 'fact one' }], n1Task.intents[0].id)
   assert.equal(n1Events.some(e => e.kind === 'fact'), false, '事实写回不应 pushEvent')
 
   // N3：批量写前置校验，失败时不应留下半批事实
@@ -197,7 +207,7 @@ try {
   addIntents(atomic, [{ summary: 'atomic' }])
   claimIntent(atomic, atomic.intents[0].id, 'work#1')
   const atomicEngine = { ...n1Engine, runtimeForTask: () => ({ task: atomic }) }
-  assert.throws(
+  await assert.rejects(
     () => recordFacts(atomicEngine, atomic, [{ summary: 'first ok' }, { summary: '   ' }], atomic.intents[0].id),
     /summary.*不能为空/,
   )
@@ -227,9 +237,9 @@ try {
     runtimeForTask: () => ({ task: n10Task }),
     pushEvent: (_rt, e) => n10Events.push(e),
   }
-  addIntentsOp(n10Engine, n10Task, [{ summary: 'self intent' }], { notify: false })
+  await addIntentsOp(n10Engine, n10Task, [{ summary: 'self intent' }], { notify: false })
   assert.equal(n10Events.some(e => e.kind === 'intent'), false, 'planner 自派意图不应 pushEvent')
-  addIntentsOp(n10Engine, n10Task, [{ summary: 'owner intent' }], { notify: true })
+  await addIntentsOp(n10Engine, n10Task, [{ summary: 'owner intent' }], { notify: true })
   assert.equal(n10Events.some(e => e.kind === 'intent'), true, '所有者派意图应 pushEvent')
 
   // N4：长行 JSONL 的尾读窗口自适应，仍恢复 4000 条
@@ -317,6 +327,245 @@ try {
   await proveTool.execute({ task_id: goalTask.id, goal_id: goalTask.goals[0].id, evidence_id: proofFact.id }, { agent: { id: 'owner' } })
   assert.equal(notifyArgs[0]?.notify, false, 'planner 调用 prove_goal 应传 notify:false')
   assert.equal(notifyArgs[1]?.notify, true, 'owner 调用 prove_goal 应传 notify:true')
+
+  // N12：facts/findings 写回即时落盘 JSONL——不 save 也能重启读回
+  const evidStore = new TaskStore(join(root, 'evid'))
+  const evidTask = makeTask('t-audit-20')
+  const evidEngine = {
+    runtimeForTask: () => ({ task: evidTask }),
+    roleForIntent: () => undefined,
+    addActivity: () => ({}),
+    pushEvent: () => {},
+    persist: () => {},
+    persistEvidence: (rt) => evidStore.appendEvidence(rt.task),
+  }
+  addIntents(evidTask, [{ summary: 'evid work' }])
+  claimIntent(evidTask, evidTask.intents[0].id, 'work#1')
+  await recordFacts(evidEngine, evidTask, [{ summary: 'crash-proof fact', outcome: 'found' }], evidTask.intents[0].id)
+  await recordFinding(evidEngine, evidTask, { title: 'crash-proof finding', severity: 'high', intentId: evidTask.intents[0].id })
+  await evidStore.save(evidTask) // save 与 appendEvidence 共享任务链：等它完成即等齐所有即时落盘
+  const evidLoaded = await evidStore.load(evidTask.id)
+  assert.equal(evidLoaded.facts.some(f => f.summary === 'crash-proof fact'), true, 'fact 应已即时落盘')
+  assert.equal(evidLoaded.findings.some(f => f.title === 'crash-proof finding'), true, 'finding 应已即时落盘')
+
+  // N13：planner 子会话超时进入重试；force 轮不重试
+  const t13 = makeTask('t-audit-21')
+  let p13calls = 0
+  const e13 = {
+    config: { ...DEFAULTS, plannerRetries: 2 },
+    addActivity: () => ({}),
+    persist: () => {},
+    maybeRunAnalyst: async () => {},
+    runChild: async () => {
+      p13calls += 1
+      if (p13calls === 1) return { text: '', stopReason: 'timeout', timedOut: true }
+      return { text: 'ok', output: [], stopReason: 'completed', timedOut: false }
+    },
+  }
+  await plannerRound(e13, { task: t13, abort: new AbortController(), finished: false }, [], {})
+  assert.equal(p13calls, 2, `planner 超时应重试一次（calls=${p13calls}）`)
+  assert.equal(t13.round, 1, '超时重试不应多烧轮次')
+  const t13b = makeTask('t-audit-21b')
+  let p13bcalls = 0
+  await plannerRound({ ...e13, runChild: async () => { p13bcalls += 1; return { text: '', stopReason: 'timeout', timedOut: true } } },
+    { task: t13b, abort: new AbortController(), finished: false }, [], { force: true })
+  assert.equal(p13bcalls, 1, `force/收官轮超时不重试（calls=${p13bcalls}）`)
+
+  // N14：态势投影构建失败走降级通道——非 force 不烧轮；连续三次抛出；force 用降级视图
+  const t14 = makeTask('t-audit-22')
+  Object.defineProperty(t14, 'facts', { get() { throw new Error('corrupt projection') }, configurable: true })
+  let c14 = 0
+  let lastPrompt14 = ''
+  const e14 = {
+    config: { ...DEFAULTS, plannerRetries: 0 },
+    addActivity: () => ({}),
+    persist: () => {},
+    maybeRunAnalyst: async () => {},
+    runChild: async (rt, spec) => {
+      c14 += 1
+      lastPrompt14 = spec.prompt
+      return { text: 'ok', output: [], stopReason: 'completed', timedOut: false }
+    },
+  }
+  const rt14 = { task: t14, abort: new AbortController(), finished: false }
+  await plannerRound(e14, rt14, [], {}) // 第 1 次失败：降级跳过
+  assert.equal(c14, 0, '投影失败不应发起模型调用')
+  assert.equal(t14.round, 0, `投影失败不应烧轮次（round=${t14.round}）`)
+  await plannerRound(e14, rt14, [], {}) // 第 2 次失败：仍降级跳过
+  assert.equal(c14, 0)
+  await assert.rejects(() => plannerRound(e14, rt14, [], {}), /corrupt projection/, '连续 3 次投影失败应抛出交收尾')
+  const t14c = makeTask('t-audit-22c')
+  Object.defineProperty(t14c, 'facts', { get() { throw new Error('corrupt projection') }, configurable: true })
+  const rt14c = { task: t14c, abort: new AbortController(), finished: false }
+  await plannerRound(e14, rt14c, [], { force: true })
+  assert.match(lastPrompt14, /降级视图/, 'force 轮应使用降级视图继续')
+
+  // N15：事实服务端去重——规范化 summary 命中窗口内已有事实则跳过，不重复计数
+  const t15 = makeTask('t-audit-23')
+  addIntents(t15, [{ summary: 'dedup work' }])
+  claimIntent(t15, t15.intents[0].id, 'work#1')
+  const e15 = {
+    runtimeForTask: () => ({ task: t15 }),
+    roleForIntent: () => undefined,
+    addActivity: () => ({}),
+    pushEvent: () => {},
+    persist: () => {},
+  }
+  const first = await recordFacts(e15, t15, [{ summary: 'Port 22 OPEN' }], t15.intents[0].id)
+  const second = await recordFacts(e15, t15, [{ summary: '  port 22   open ' }], t15.intents[0].id)
+  assert.equal(second.facts.length, 0, '重复摘要不应新增事实')
+  assert.equal(second.duplicates.length, 1, '应返回被命中的既有事实')
+  assert.equal(second.duplicates[0].id, first.facts[0].id)
+  assert.equal(t15.facts.length, 1)
+  assert.equal(t15.stats.facts, 1, '重复事实不应计入 stats')
+  assert.equal(t15.intents[0].writes.facts, 1, '重复事实不应重复计 writes')
+
+  // N16：prove_goal 拒绝 inferred 推断证据
+  const t16 = makeTask('t-audit-24')
+  const inferred = recordFact(t16, { summary: '推断的目标达成', confidence: 'inferred', outcome: 'found' })
+  const observed = recordFact(t16, { summary: '观测到的目标达成', confidence: 'observed', outcome: 'found' })
+  assert.match(proveGoal(t16, 1, inferred.id, 'r').error || '', /inferred/)
+  assert.equal(proveGoal(t16, 1, observed.id, 'r').ok, true, 'observed 证据应可证明')
+
+  // N17：锚点校验——悬空 parents / resource_ids 整体拒绝
+  const t17 = makeTask('t-audit-25')
+  await assert.rejects(
+    () => addIntentsOp(n1EngineFor(t17), t17, [{ summary: 'parents-test', parents: [999] }]),
+    /只能引用本任务已存在的 fact\/finding/,
+    '悬空 parents 必须拒绝',
+  )
+  assert.equal(t17.intents.length, 0, '被拒批次不应留下半个意图')
+  const [anchorIntent] = await addIntentsOp(n1EngineFor(t17), t17, [{ summary: 'ok', parents: [] }])
+  assert.ok(anchorIntent.id > 0)
+  const anchorResources = new ResourceStore(join(root, 'anchor-res'))
+  await anchorResources.upsert([{ type: 'host', name: 'known-host' }], 't-anchor')
+  const e17 = {
+    ...n1EngineFor(t17),
+    storeFor: () => ({ resources: anchorResources }),
+  }
+  claimIntent(t17, t17.intents[0].id, 'work#1')
+  await assert.rejects(
+    () => recordFacts(e17, t17, [{ summary: 'anchor fact', resourceIds: [999] }], t17.intents[0].id),
+    /引用了不存在的资源/,
+  )
+  const ok17 = await recordFacts(e17, t17, [{ summary: 'anchor fact ok', resourceIds: [anchorResources.items[0].id] }], t17.intents[0].id)
+  assert.equal(ok17.facts.length, 1, '合法 resource_ids 应通过')
+  await assert.rejects(
+    () => addIntentsOp(e17, t17, [{ summary: 'anchor intent', resource_ids: [999] }]),
+    /引用了不存在的资源/,
+  )
+
+  // N18：trim 保护 brief/analysis 的 citations，拷捕次数够多也不悬空
+  const t18 = makeTask('t-audit-26')
+  t18.brief = { text: 'b', round: 0, citations: [recordFact(t18, { summary: 'BRIEF-REF' }).id] }
+  t18.analysis = { text: 'a', round: 0, citations: [recordFact(t18, { summary: 'ANALYSIS-REF' }).id] }
+  for (let i = 0; i < MAX_FACTS + 20; i += 1) recordFact(t18, { summary: `t18 noise ${i}` })
+  assert.ok(t18.facts.length <= MAX_FACTS + 2)
+  assert.equal(t18.facts.some(f => f.summary === 'BRIEF-REF'), true, 'brief 引用的事实必须保留')
+  assert.equal(t18.facts.some(f => f.summary === 'ANALYSIS-REF'), true, 'analysis 引用的事实必须保留')
+
+  // N19：stopReason 归一 + provider error 不再是 no_evidence 的 exhausted
+  assert.equal(normalizeStopReason('Length'), 'max-tokens')
+  assert.equal(normalizeStopReason('interrupted'), 'aborted')
+  assert.equal(normalizeStopReason('timedout'), 'timeout')
+  assert.equal(normalizeStopReason('FAILED'), 'error')
+  const t19 = makeTask('t-audit-27')
+  addIntents(t19, [{ summary: 'error intent', kind: 'pursue' }])
+  claimIntent(t19, t19.intents[0].id, 'work#1')
+  finishWorker(n1EngineFor(t19), { task: t19, siblingStops: new Set(), settling: false, finished: false }, t19.intents[0], {
+    text: 'provider exploded', stopReason: 'error', timedOut: false,
+    writes: { facts: 0, findings: 0, resources: 0, outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 } },
+  })
+  assert.equal(t19.intents[0].state, 'blocked', `provider error 应为 blocked（got ${t19.intents[0].state}）`)
+  assert.equal(t19.intents[0].reason, 'provider exploded')
+
+  // N20：worker 启动瞬态错误自动重排一次（回炉 open，不烧意图名额）
+  const t20 = makeTask('t-audit-28')
+  addIntents(t20, [{ summary: 'retry intent', kind: 'pursue' }])
+  claimIntent(t20, t20.intents[0].id, 'work#1')
+  let spawnFails = 0
+  const e20 = {
+    config: { ...DEFAULTS },
+    runChild: async () => { spawnFails += 1; throw new Error('429 rate limit exceeded') },
+    finishWorker: (rt, intent, outcome) => finishWorker(e20, rt, intent, outcome),
+    addActivity: () => ({}),
+    pushEvent: () => {},
+    persist: () => {},
+  }
+  const rt20 = { abort: new AbortController(), finished: false, settling: false, siblingStops: new Set(), task: t20 }
+  await runWorker(e20, rt20, t20.intents[0], 'work#1')
+  assert.equal(t20.intents[0].state, 'open', `瞬态错误应自动重排为 open（got ${t20.intents[0].state}）`)
+  assert.equal(t20.intents[0].retries, 1)
+  assert.equal(spawnFails, 1)
+  claimIntent(t20, t20.intents[0].id, 'work#2')
+  await runWorker(e20, rt20, t20.intents[0], 'work#2')
+  assert.equal(t20.intents[0].state, 'blocked', '第二次瞬态错误应落为 blocked（重排机会已用掉）')
+
+  // N21：activity.jsonl 超上限轮转为 .1，计数器清零
+  const rotateStore = new TaskStore(join(root, 'rotate'))
+  const rotateTask = makeTask('t-audit-29')
+  await rotateStore.appendActivity(rotateTask, { id: 1, intentId: null, worker: 'w', kind: 'step', summary: 's', detail: '', at: Date.now() })
+  const rotatePath = join(rotateStore.taskDir(rotateTask.id), 'activity.jsonl')
+  rotateStore.activityBytes.set(rotatePath, MAX_ACTIVITY_BYTES + 1) // 直接喂过限计数，避免真写 64MB
+  await rotateStore.appendActivity(rotateTask, { id: 2, intentId: null, worker: 'w', kind: 'step', summary: 's2', detail: '', at: Date.now() })
+  const { readFile } = await import('node:fs/promises')
+  const rotated = await readFile(join(rotateStore.taskDir(rotateTask.id), 'activity.1.jsonl'), 'utf8')
+  assert.match(rotated, /"id":1/, '旧卷应归档为 activity.1.jsonl')
+  const fresh = await readFile(rotatePath, 'utf8')
+  assert.match(fresh, /"id":2/)
+  assert.equal(fresh.includes('"id":1'), false, '新卷不应残留旧条目')
+  assert.ok(rotateStore.activityBytes.get(rotatePath) < 1024, '轮转后计数器应清零重计')
+
+  // N22：worker 命名跨轮不重名（单调 workerSeq）
+  const t22 = makeTask('t-audit-30')
+  t22.limits.maxWorkers = 3 // makeTask 不填 limits 默认值，这里显式给并发上限
+  addIntents(t22, [{ summary: 'w-a' }, { summary: 'w-b' }, { summary: 'w-c' }])
+  const rt22 = { task: t22, running: new Map(), abort: new AbortController(), finished: false, settling: false, completing: false }
+  const e22 = {
+    ...n1EngineFor(t22),
+    runWorker: () => new Promise(() => {}),
+  }
+  dispatchWorkers(e22, rt22) // 默认 maxWorkers=3，三条同时领取
+  assert.deepEqual(t22.intents.map(i => i.worker), ['work#1', 'work#2', 'work#3'])
+  rt22.running.delete(t22.intents[0].id)
+  dispatchWorkers(e22, rt22) // 没有 open 意图可领，不应再命名
+  assert.deepEqual(t22.intents.map(i => i.worker).filter(Boolean).length, 3)
+
+  // N23：任务级预算夹逼剩余时间
+  const budgetEngine = new ArtexEngine({ ctx: { get: () => undefined }, config: { ...DEFAULTS, indexPath: join(root, 'idx-budget.json') }, logger: { warn: () => {} } })
+  const nowB = Date.now()
+  assert.equal(budgetEngine.remainingBudgetMs({ task: { limits: { budgetMs: 0 } }, startedAt: nowB }), Infinity)
+  const remaining = budgetEngine.remainingBudgetMs({ task: { limits: { budgetMs: 5000 } }, startedAt: nowB - 4000 })
+  assert.ok(remaining <= 1200 && remaining >= 0, `remaining=${remaining}`)
+  assert.equal(budgetEngine.remainingBudgetMs({ task: { limits: { budgetMs: 1000 } }, startedAt: nowB - 10000 }), 0)
+
+  // N24：心跳查房——静默先唤醒，仍静默则强制中断
+  const t24 = makeTask('t-audit-31')
+  addIntents(t24, [{ summary: 'stalled work' }])
+  claimIntent(t24, t24.intents[0].id, 'work#1')
+  const stallMs2 = Math.max(2 * (DEFAULTS.heartbeatMs || 600000), 2 * 60 * 1000)
+  t24.intents[0].startedAt = Date.now() - stallMs2 * 3
+  let nudged24 = 0
+  let interrupted24 = 0
+  const e24 = {
+    addActivity: () => ({}),
+    nudge: () => { nudged24 += 1; return Promise.resolve() },
+    interruptChild: () => { interrupted24 += 1 },
+  }
+  const rt24 = {
+    task: { ...t24, limits: { ...t24.limits, heartbeatMs: DEFAULTS.heartbeatMs || 600000 }, intents: t24.intents },
+    running: new Map([[t24.intents[0].id, Promise.resolve()]]),
+    children: new Map([[`intent-${t24.intents[0].id}`, 'child-1']]),
+    stalledNudges: new Map(),
+    finished: false,
+    settling: false,
+  }
+  checkStalledWorkers(e24, rt24)
+  assert.equal(nudged24, 1, '超静默阈值应先唤醒')
+  assert.equal(interrupted24, 0)
+  checkStalledWorkers(e24, rt24)
+  assert.equal(nudged24, 1, '已唤醒过的不再重复唤醒')
+  assert.equal(interrupted24, 1, '唤醒后仍静默应强制中断')
 
   console.log('OK audit-regressions')
 } finally {

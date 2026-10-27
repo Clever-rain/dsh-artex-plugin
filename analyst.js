@@ -54,12 +54,14 @@ export async function maybeRunAnalyst(engine, rt, triggers = []) {
       detail: `facts_since=${factsSince} failed_since=${failedSince} stale=${stale}`,
     })
     try {
+      const timeoutMs = Number(engine.config.analystTimeoutMs) || 180000
+      const remaining = engine.remainingBudgetMs(rt)
       const outcome = await engine.runChild(rt, {
         role: 'analyst',
         key: `analyst-${t.round}`,
         label: `ARTEX analyst · round ${t.round}`,
         prompt: analystPrompt({ task: t, view }),
-        timeoutMs: Number(engine.config.analystTimeoutMs) || 180000,
+        timeoutMs: remaining === Infinity ? timeoutMs : Math.max(1000, Math.min(timeoutMs, remaining)),
         cwd: engine.config.isolateWorkdir ? t.outDir : undefined,
       })
       engine.addActivity(rt, {

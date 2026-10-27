@@ -12,7 +12,8 @@ export function plannerTools({ engine, config }) {
 - kind：\`pursue\`=追一条路径（成功即停、失败写 none 并回溯）；\`enumerate\`=枚举验证一批候选（命中也不停）。
 - state：\`open\` 进入队列；\`blueprint\` 只登记为候选，之后可用 artex_promote_intent 提升。
 - path_parent：pursue 在路径树里的上级意图，用于失败回溯。
-提交前与 open/running/blueprint/recent_done 去重；已判死（failed）的方向不要原样重派。
+提交前与 open/running/blueprint/recent_done 去重；已判死（failed）的方向不要原样重派；启动受阻（blocked，多为瞬态错误）的方向可以原样重派。
+锚点校验：parents 只能引用仍存在的 fact/finding id；resource_ids 必须是已登记的资源 id——悬空引用会被服务端拒绝（整批不入库）。
 只读任务所有者与 planner 可调用。`,
       parameters: {
         type: 'object',
@@ -55,7 +56,7 @@ export function plannerTools({ engine, config }) {
             : []
         if (items.length === 0) throw new Error('intents 或 summary 至少给一个')
         const dropped = Math.max(0, items.length - 4)
-        const results = engine.addIntents(task, items, { notify: role?.role !== 'planner' })
+        const results = await engine.addIntents(task, items, { notify: role?.role !== 'planner' })
         const created = results.filter(r => r.id > 0)
         const duplicates = results.filter(r => r.duplicate)
         return `已创建 ${created.length} 条意图：${created.map(r => `#${r.id} ${r.summary}`).join('；') || '（无）'}`
@@ -65,7 +66,7 @@ export function plannerTools({ engine, config }) {
     }),
     artifact({
       name: 'artex_prove_goal',
-      description: '规划者专用：用一条已存在的 fact 或 finding 作为证据，标记某条目标达成。**所有目标都被标记后任务自动完成**（这是唯一的收官方式）。证据必须真实存在于本任务；目标含可量化条件时先核对态势里的实测值，未达标禁止标记。',
+      description: '规划者专用：用一条已存在的 fact 或 finding 作为证据，标记某条目标达成。**所有目标都被标记后任务自动完成**（这是唯一的收官方式）。证据必须真实存在于本任务；目标含可量化条件时先核对态势里的实测值，未达标禁止标记。证据分级硬约束：`confidence=inferred` 的推断事实不能作证据（先去验证升级），blueprint 不可作证据，outcome=none 仅在目标本身是负向结论且显式传 allow_negative 时可用。',
       parameters: {
         type: 'object',
         properties: {

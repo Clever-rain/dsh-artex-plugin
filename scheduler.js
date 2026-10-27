@@ -2,9 +2,18 @@
  * 调度器：主循环、规划轮、派发 worker、突破停止、收尾与证明轮。
  */
 
-import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView } from './graph.js'
-import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt } from './prompts.js'
-import { oneLine, sleep } from './util.js'
+import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView, degradedView } from './graph.js'
+import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt, stallNudgePrompt } from './prompts.js'
+import { oneLine, sleep, classifyError, retryBackoffMs, isRetryWorthless, normalizeStopReason } from './util.js'
+
+/** 子会话墙钟与任务剩余预算取 min：预算尾巴上新起的子会话不能超 budget 一整段。 */
+function clampToBudget(engine, rt, timeoutMs) {
+  const remaining = typeof engine.remainingBudgetMs === 'function' ? engine.remainingBudgetMs(rt) : Infinity
+  if (remaining === Infinity) return timeoutMs
+  const ms = Number(timeoutMs) || 0
+  if (ms <= 0) return Math.max(1000, remaining)
+  return Math.max(1000, Math.min(ms, remaining))
+}
 
 export async function runLoop(engine, rt) {
     const t = rt.task
@@ -76,6 +85,7 @@ export async function runLoop(engine, rt) {
         const ev = await engine.waitEvent(rt, t.limits.heartbeatMs)
         if (rt.abort.signal.aborted || rt.finished) break
         if (ev !== 'heartbeat') await engine.sleepOrAbort(rt, t.limits.debounceMs)
+        else engine.checkStalledWorkers(rt) // 心跳除了规划，也复查在跑 work 的静默量
         if (rt.abort.signal.aborted || rt.finished) break
         const triggers = rt.events.splice(0)
         if (t.round >= t.limits.maxRounds) continue
@@ -98,6 +108,7 @@ export async function runLoop(engine, rt) {
       await engine.drain(rt, 15000)
       engine.finish(rt, rt.finishedStatus || 'stopped', rt.finishDetail || '引擎退出')
       await engine.flushPersist(rt)
+      engine.releaseStore(rt) // 回收持久化层内存状态；快照/JSONL 保留可重载
       rt.doneResolve(t)
       engine.cleanupRoles(rt)
     }
@@ -202,17 +213,42 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
     t.lastPlannerRoundAt = Date.now()
     const staleBrief = Boolean(t.brief) && (round - t.brief.round) > 1
     await engine.maybeRunAnalyst(rt, triggers)
-    const prompt = plannerPrompt({
-      task: t,
-      view: plannerView(t, {
+    // 态势构建与子会话重试分离：投影构建失败走降级通道，不再炸掉整个任务。
+    let view
+    try {
+      view = plannerView(t, {
         factsLimit: 5,
         digest: digestOf(t),
         delta: deltaOf(t, since),
         staleBrief,
-      }),
-      triggers,
-      round,
-    })
+      })
+      rt.viewFailures = 0
+      rt.lastViewError = undefined
+    } catch (error) {
+      rt.viewFailures = (rt.viewFailures || 0) + 1
+      rt.lastViewError = String(error?.message || error)
+      engine.addActivity(rt, {
+        intentId: null,
+        worker: 'planner',
+        kind: 'error',
+        summary: `态势投影构建失败（连续第 ${rt.viewFailures} 次）`,
+        detail: rt.lastViewError,
+      })
+      engine.logger?.warn?.(`[artex] plannerView failed: ${rt.lastViewError}`)
+      void engine.persist(rt)
+      if (options.force) {
+        // 收官/收尾证明轮退无可退：降级视图继续，planner 依据 brief 与本轮事件谨慎判定。
+        view = degradedView(t, rt.lastViewError)
+      } else if (rt.viewFailures >= 3) {
+        throw error // 连续三次：仍按旧语义交给 runLoop 统一收尾（保留现场）
+      } else {
+        // 短暂降级：本轮不发生规划、轮次让回，等下个事件或心跳重建视图。
+        t.round -= 1
+        t.lastPlannerRoundAt = since
+        return
+      }
+    }
+    const prompt = plannerPrompt({ task: t, view, triggers, round })
     engine.addActivity(rt, {
       intentId: null,
       worker: 'planner',
@@ -229,24 +265,42 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
       try {
         outcome = await engine.runChild(rt, {
           role: 'planner',
-          key: `plan-${round}`,
-          label: `ARTEX planner · round ${round}`,
+          key: `plan-${round}-a${attempt}`,
+          label: `ARTEX planner · round ${round}${attempt > 1 ? ` · retry ${attempt}` : ''}`,
           prompt,
-          timeoutMs: options.timeoutMs ?? t.limits.plannerTimeoutMs,
+          timeoutMs: clampToBudget(engine, rt, options.timeoutMs ?? t.limits.plannerTimeoutMs),
           cwd: engine.config.isolateWorkdir ? t.outDir : undefined,
         })
+        if (outcome?.timedOut && !options.force && !rt.abort.signal.aborted && attempt < attempts) {
+          // 子会话静默超时与启动瞬态失败同级：消耗一次重试，轮次不重计。
+          engine.addActivity(rt, {
+            intentId: null,
+            worker: 'planner',
+            kind: 'error',
+            summary: `规划第 ${round} 轮子会话超时（第 ${attempt}/${attempts} 次，重试）`,
+          })
+          outcome = undefined
+          continue
+        }
         lastError = undefined
         break
       } catch (error) {
+        const category = classifyError(error)
         lastError = error
         engine.addActivity(rt, {
           intentId: null,
           worker: 'planner',
           kind: 'error',
-          summary: `规划第 ${round} 轮失败（第 ${attempt}/${attempts} 次）`,
+          summary: `规划第 ${round} 轮失败（第 ${attempt}/${attempts} 次，${category}）`,
           detail: String(error?.message || error),
         })
-        if (attempt < attempts) await sleep(Math.min(5000, Math.max(200, (t.limits.debounceMs || 800) * attempt)))
+        // context 类错误重试同一提示没有意义，快速失败交给收尾；其余按类别退避。
+        if (isRetryWorthless(category)) break
+        if (attempt < attempts) {
+          const backoff = retryBackoffMs(category, attempt)
+          if (typeof engine.sleepOrAbort === 'function') await engine.sleepOrAbort(rt, backoff)
+          else await sleep(backoff)
+        }
       }
     }
     if (!outcome) throw lastError
@@ -279,7 +333,9 @@ export function dispatchWorkers(engine, rt) {
     while (rt.running.size < t.limits.maxWorkers) {
       const intent = selectNextIntent(t)
       if (!intent) break
-      const workerName = `work#${rt.running.size + 1}`
+      // 单调递增的全任务序号：跨轮不重名，日志/血缘里不再出现"两个 work#2"。
+      rt.workerSeq = (rt.workerSeq || 0) + 1
+      const workerName = `work#${rt.workerSeq}`
       claimIntent(t, intent.id, workerName)
       engine.addActivity(rt, {
         intentId: intent.id,
@@ -308,16 +364,36 @@ export async function runWorker(engine, rt, intent, workerName) {
         kind: intent.kind,
         label: `ARTEX worker · intent #${intent.id}`,
         prompt,
-        timeoutMs: t.limits.workerTimeoutMs,
+        timeoutMs: clampToBudget(engine, rt, t.limits.workerTimeoutMs),
         cwd: engine.config.isolateWorkdir ? `${t.outDir}/i${intent.id}` : undefined,
       })
     } catch (error) {
+      const message = String(error?.message || error)
+      const category = classifyError(error)
+      // 启动类瞬态错误自动重排一次：意图回炉 open，下一拍 dispatch 重领，planner 不必换措辞重派。
+      if (['rate_limit', 'server', 'network'].includes(category)
+        && (intent.retries || 0) < 1
+        && !rt.abort.signal.aborted && !rt.finished) {
+        intent.retries = (intent.retries || 0) + 1
+        finishIntent(t, intent.id, { state: 'open', output: '', reason: `auto_retry(${category})`, writes: intent.writes })
+        intent.endedAt = undefined
+        engine.addActivity(rt, {
+          intentId: intent.id,
+          worker: workerName,
+          kind: 'system',
+          summary: `worker 启动失败（${category}），意图 #${intent.id} 自动重排一次`,
+          detail: message,
+        })
+        engine.pushEvent(rt, { kind: 'intent', summary: `意图 #${intent.id} 启动失败自动重排（${category}）` })
+        void engine.persist(rt)
+        return
+      }
       engine.finishWorker(rt, intent, {
         text: '',
         stopReason: 'error',
         timedOut: false,
         writes: { facts: 0, findings: 0, resources: 0, outcomes: { found: 0, none: 0, inconclusive: 0, blueprint: 0 } },
-        error: String(error?.message || error),
+        error: `[${category}] ${message}`,
       })
       return
     }
@@ -330,19 +406,24 @@ export function finishWorker(engine, rt, intent, outcome) {
     const outcomes = writes.outcomes || { found: 0, none: 0, inconclusive: 0, blueprint: 0 }
     let state
     let reason
+    const stopReason = normalizeStopReason(outcome.stopReason)
     if (outcome.error) {
       state = 'blocked'
       reason = outcome.error
     } else if (rt.siblingStops?.has(intent.id)) {
       state = 'stopped'
       reason = t.mode === 'audit' ? 'goal_met' : 'sibling_breakthrough'
-    } else if (outcome.timedOut) {
+    } else if (stopReason === 'error') {
+      // provider 返回 error：与启动失败同类，记 blocked 而不是 no_evidence exhausted。
+      state = 'blocked'
+      reason = oneLine(outcome.text || 'provider error', 160)
+    } else if (outcome.timedOut || stopReason === 'timeout') {
       state = 'exhausted'
       reason = 'worker 预算耗尽'
-    } else if (outcome.stopReason === 'aborted') {
+    } else if (stopReason === 'aborted') {
       state = 'stopped'
       reason = 'aborted'
-    } else if (outcome.stopReason === 'max-tokens') {
+    } else if (stopReason === 'max-tokens') {
       state = 'exhausted'
       reason = 'max_tokens'
     } else if (intent.kind === 'pursue') {
@@ -376,6 +457,49 @@ export function finishWorker(engine, rt, intent, outcome) {
       summary: `${oneLine(intent.summary, 100)}${outcome.text ? ` → ${oneLine(outcome.text, 160)}` : ''}`,
     })
     void engine.persist(rt)
+  }
+
+  /* -------------------------------------------------------------- watchdog */
+
+  /**
+   * 心跳查房：在跑 worker 静默超过阈值（2× 心跳，且至少 2 分钟）→ 先发唤醒提示；
+   * 下个心跳仍无动静 → 强制中断（finishWorker 按 aborted 归 stopped，planner 可重派该方向）。
+   * “还活着”的判定时钟挂在 engine.addActivity：任何带 intentId 的写回/进程事件都会清零。
+   */
+export function checkStalledWorkers(engine, rt) {
+    if (rt.finished || rt.settling) return
+    const t = rt.task
+    const heartbeat = Number(t.limits.heartbeatMs) || 600000
+    const stallMs = Math.max(2 * heartbeat, 2 * 60 * 1000)
+    const now = Date.now()
+    for (const intentId of rt.running.keys()) {
+      const intent = t.intents.find(i => i.id === intentId)
+      if (!intent) continue
+      const last = intent.lastActivityAt || intent.startedAt || now
+      if (now - last < stallMs) continue
+      rt.stalledNudges = rt.stalledNudges || new Map()
+      const nudges = rt.stalledNudges.get(intentId) || 0
+      const childId = rt.children.get(`intent-${intentId}`)
+      if (nudges === 0) {
+        rt.stalledNudges.set(intentId, 1)
+        engine.addActivity(rt, {
+          intentId,
+          worker: 'engine',
+          kind: 'system',
+          summary: `意图 #${intentId} 静默超过 ${Math.round(stallMs / 60000)} 分钟，发送唤醒提示`,
+        })
+        if (childId) void engine.nudge(rt, childId, stallNudgePrompt())
+        continue
+      }
+      engine.addActivity(rt, {
+        intentId,
+        worker: 'engine',
+        kind: 'system',
+        summary: `意图 #${intentId} 唤醒后仍静默，强制中断（stopped，可被重派）`,
+      })
+      rt.stalledNudges.delete(intentId)
+      if (childId) engine.interruptChild(rt, childId)
+    }
   }
 
   /* ------------------------------------------------------------------ child */
