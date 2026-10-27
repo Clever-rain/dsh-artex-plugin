@@ -195,6 +195,7 @@ export const LIMIT_KEYS = {
   settle_grace_ms: 'settleGraceMs',
   breakthrough_grace_ms: 'breakthroughGraceMs',
   budget_ms: 'budgetMs',
+  max_tokens: 'maxTokens',
 }
 
 export function pickLimits(args) {
@@ -217,6 +218,10 @@ export const RUN_PARAMETERS = {
   max_rounds: integer('规划轮次上限（默认 24），达到后结束任务。'),
   max_stalls: integer('连续多少轮规划没有产出可执行方向就停止（默认 2）。'),
   budget_ms: integer('任务级墙钟预算（毫秒，默认 0 = 不限）。耗尽后先让 worker 收尾再停。'),
+  max_tokens: integer('任务级 token 预算（input+output 合计，默认 0 = 不限）。超限先走收尾证明轮，再按 stopped 收口并保留现场。'),
+  allowed_tools: strings('可选：子会话允许使用的基础工具白名单（非 artex_*；精确名）。给了它，其它已知写/执行类宿主工具会被 toolFilter 收掉。pentest 场景推荐显式给出允许命令行工具。'),
+  read_only: { type: 'boolean', description: '可选：只读模式——子会话被收掉一切已知写/执行类宿主工具（edit/write/pwsh/terminal/workflow 等），只能靠读工具与 artex 写回工作。' },
+  allowed_paths: strings('可选：子会话允许操作的路径白名单；当前以提示词强约束注入（DSH 不给插件 OS 级路径沙箱），与 isolateWorkdir 叠加。'),
   worker_timeout_ms: integer('单个 worker 的墙钟预算（毫秒，默认 1200000 = 20 分钟）。'),
   planner_timeout_ms: integer('单轮 planner 的墙钟预算（毫秒，默认 900000）。'),
   heartbeat_ms: integer('无任何变动时的巡检间隔（毫秒，默认 600000）。'),

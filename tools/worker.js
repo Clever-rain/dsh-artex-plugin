@@ -22,7 +22,9 @@ export function workerTools({ engine, config }) {
       description: `执行者写回：把本意图得到的**结论/观察/判断**写进探索图（不是资源，也不是已验证成果）。
 纪律：多个观察汇总成**一条**事实（summary 一句话 + detail 展开），默认就写一条；只写增量；只写真实看到的——给 evidence，标 confidence。
 outcome 用于覆盖/路径判定：found=发现/验证成功；none=按方法测过但未命中（负结果，算覆盖）；inconclusive=无法判定；blueprint=其它可行路径的蓝图（不执行）。
+证据硬门：\`outcome=found\` **必须**给 evidence（服务端现场拒收）；\`inferred\` 的推断请如实标注，别当 observed 用。
 服务端护栏：summary 与近期已有事实重复会被去重跳过（返回已有 id，不重复计数）；resource_ids 必须是已登记的资源 id，悬空引用整体拒绝。
+碰见两条节点给出相反结论 → artex_record_conflict 把矛盾落成图上边的结构化对象（别只在 summary 里嚷嚷）。
 task 所有者与 worker 可调用。`,
       parameters: {
         type: 'object',
@@ -96,7 +98,7 @@ task 所有者与 worker 可调用。`,
           title: { type: 'string', required: true, description: '一句话成果标题' },
           detail: describe('详细说明：是什么、影响、复现步骤'),
           severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info', 'unknown'], description: '严重度/重要性（默认 unknown）' },
-          evidence: describe('可复现证据：命令/请求 + 关键输出，或复现步骤'),
+          evidence: { type: 'string', required: true, description: '可复现证据（必填，服务端硬门）：命令/请求 + 关键输出，或复现步骤。没复现的请走 artex_record_fact(confidence=inferred)' },
           resource_ids: { type: 'array', items: { type: 'integer' }, description: '关联资源 id' },
         },
         required: ['title'],

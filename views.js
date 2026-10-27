@@ -3,7 +3,7 @@
  * 只读投影，不修改图。
  */
 
-import { intentById, nodeById, nodeKind, openIntents, runningIntents, truncate } from './model.js'
+import { intentById, nodeById, nodeKind, openIntents, runningIntents, truncate, intentDepsSatisfied } from './model.js'
 
 /* ---------------------------------------------------------------- queries */
 
@@ -95,9 +95,17 @@ export function digestOf(task) {
       kept: task.facts.length,
       truncated: task.stats.facts > task.facts.length || undefined,
       by_outcome: byOutcome,
+      retracted: task.facts.filter(f => f.retracted === true).length || undefined,
     },
     findings: task.stats.findings,
     findings_kept: task.findings.length,
+    findings_by_status: {
+      open: task.findings.filter(f => (f.status || 'open') === 'open').length,
+      verified: task.findings.filter(f => f.status === 'verified').length,
+      rejected: task.findings.filter(f => f.status === 'rejected').length,
+      needs_retest: task.findings.filter(f => f.status === 'needs_retest').length,
+    },
+    conflicts: Array.isArray(task.conflicts) ? task.conflicts.length : 0,
     intents: states,
     failed_paths: task.intents
       .filter(i => i.state === 'failed')
@@ -147,6 +155,10 @@ export function plannerView(task, options = {}) {
     if (intent.kind === 'pursue') row.kind = 'pursue'
     if (intent.pathParent) row.path_parent = intent.pathParent
     if (intent.parents.length > 0) row.parents = intent.parents
+    if (Array.isArray(intent.dependsOn) && intent.dependsOn.length > 0) {
+      row.depends_on = intent.dependsOn
+      if (!intentDepsSatisfied(task, intent)) row.blocked_by_deps = true
+    }
     const yields = intentYields(task, intent.id)
     if (yields.length > 0) row.yields = yields
     if (intent.writes.facts || intent.writes.findings || intent.writes.resources) row.writes = intent.writes
@@ -229,6 +241,46 @@ export function workerView(task, intent, options = {}) {
   if (done.length > 0) view.recent_done = done.map(i => `#${i.id} ${i.state} ${truncate(i.summary, 60)}`)
   if (task.hints.length > 0) view.hints = task.hints.map(h => truncate(h.text, 100))
   return view
+}
+
+/**
+ * 确定性的覆盖矩阵（无模型参与）：每条目标，按关键字匹配统计与之相关的事实/发现。
+ * gap = 目标未证明、且证据/相关事实都为空——audit 收口前应被消化或显式接受。
+ */
+export function coverageOf(task) {
+  const rows = []
+  for (const g of task.goals) {
+    const haystack = (n) => `${n.summary ?? ''}\n${n.detail ?? ''}\n${n.title ?? ''}`
+    const tokens = [...new Set((String(g.text).toLowerCase().match(/[a-z0-9_]{2,}|[一-鿿]{2,}/g)) || [])]
+    const links = (list) => (tokens.length > 0 ? list.filter(n => tokens.some(t => haystack(n).toLowerCase().includes(t))) : [])
+    const factsLinked = links(task.facts)
+    const findingsLinked = links(task.findings)
+    const evidenceNode = g.evidence ? nodeById(task, g.evidence) : undefined
+    rows.push({
+      id: g.id,
+      text: truncate(String(g.text ?? ''), 160),
+      status: g.status,
+      evidence: g.evidence ?? undefined,
+      evidence_outcome: evidenceNode?.outcome ?? g.evidenceOutcome ?? undefined,
+      facts_linked: factsLinked.length,
+      findings_linked: findingsLinked.length,
+      outcomes: {
+        found: factsLinked.filter(f => f.outcome === 'found').length,
+        none: factsLinked.filter(f => f.outcome === 'none').length,
+        inconclusive: factsLinked.filter(f => f.outcome === 'inconclusive').length,
+      },
+      gap: g.status !== 'met' && factsLinked.length === 0 && findingsLinked.length === 0 && !g.evidence,
+      keywords: tokens.slice(0, 6),
+    })
+  }
+  return {
+    mode: task.mode,
+    goals: rows,
+    gaps: rows.filter(r => r.gap).map(r => r.id),
+    covered: rows.length - rows.filter(r => r.gap).length,
+    total: rows.length,
+    conflicts_total: Array.isArray(task.conflicts) ? task.conflicts.length : 0,
+  }
 }
 
 /** Full node content for node_detail. */

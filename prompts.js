@@ -138,7 +138,10 @@ ${modeRules}
 
 ## 工具
 
-- 写：\`artex_set_brief\`、\`artex_add_intent\`（kind=pursue/enumerate，state=open/blueprint）、\`artex_promote_intent\`、\`artex_prove_goal\`、\`artex_set_todos\`
+- 写：\`artex_set_brief\`、\`artex_add_intent\`（kind=pursue/enumerate，state=open/blueprint）、\`artex_promote_intent\`、\`artex_prove_goal\`、\`artex_set_todos\`、\`artex_retract_fact\`（发现旧结论被推翻时使用）、\`artex_retest_finding\`
+- 复合协议：一轮要同时"改 brief / 派多个意图 / 换待办 / 证目标"时，**优先**用 \`artex_plan\` 一次提交 {decision, intents[], todos[], proofs[]}，服务端逐段执行——比分散多调用更稳，也更容易写成审计轨迹。
+- 串行链：意图加 \`depends_on:[意图id]\` 声明显式前置——前置未 done 不会被领取，你把链写清即可，不必手工跑待办驱动。
+- 覆盖（audit）：\`artex_coverage_report\` 看确定性覆盖缺口；收口前尽量消化 gap（派 enumerate 验证或显式接受）。
 - 读：\`artex_graph_overview\`、\`artex_node_detail\`、\`artex_trace\`
 - \`artex_add_resource\` 一般由 worker 调用。
 
@@ -161,6 +164,26 @@ ${json({ ...view, mode })}
 }
 
 /* ---------------------------------------------------------------- worker */
+
+/** 任务级工具/沙箱策略的提示词表述（真实边界在 spawn 的 toolFilter；这是给模型的纪律说明）。 */
+function renderTaskPolicy(task) {
+  const policy = task?.policy || {}
+  const lines = []
+  if (policy.readOnly === true) {
+    lines.push(`## 任务策略：只读模式
+本次任务的 spawn 已被收掉写/执行类宿主工具（edit/write/pwsh/terminal/workflow 等）。**你只可以读、分析、通过 artex_* 工具写回**，不要尝试任何会改变目标系统状态的命令。`)
+  }
+  if (Array.isArray(policy.allowedTools) && policy.allowedTools.length > 0) {
+    lines.push(`## 任务策略：基础工具白名单
+除 artex_* 工具外，你只能使用：${policy.allowedTools.join(', ')}。其余宿主工具已在 toolFilter 被关闭，不要试图绕过。`)
+  }
+  if (Array.isArray(policy.allowedPaths) && policy.allowedPaths.length > 0) {
+    lines.push(`## 任务策略：路径白名单
+所有文件操作只允许落在以下路径里（不在范围内的一律不碰）：
+${policy.allowedPaths.map(p => `- ${p}`).join('\n')}`)
+  }
+  return lines.length > 0 ? `\n${lines.join('\n\n')}\n` : ''
+}
 
 export function workerPrompt({ task, intent, view }) {
   const constraints = task.constraints.length > 0
@@ -198,6 +221,7 @@ export function workerPrompt({ task, intent, view }) {
 任务：#${task.id}「${task.description}」（总目标：${task.goal}）
 操作约束：
 ${constraints}
+${renderTaskPolicy(task)}
 
 ## 你领到的意图
 
@@ -297,6 +321,48 @@ export function settlePrompt(role, kind) {
 /** 巡检唤醒：worker 静默超阈值时的存活确认提示（ARTEX 心跳复查在跑 work）。 */
 export function stallNudgePrompt() {
   return '【巡检】你已经很久没有动作或写回了。如果仍在进行中：用一句纯文本汇报现状并继续；如果已经得出结论或受阻：立刻按写回纪律写回（成功的 finding/observed fact，失败的 outcome=none，其它可行路径 outcome=blueprint），然后结束。'
+}
+
+/* ------------------------------------------------------------- verifier */
+
+/** 独立验证者：只复现单条 finding，不做任何规划性动作。 */
+export function verifierPrompt({ task, finding }) {
+  const evidence = finding.evidence?.trim() || '（worker 未给 evidence）'
+  const intent = task.intents.find(i => i.id === finding.intentId)
+  return `# 你的身份：ARTEX 独立验证者（verifier）
+
+你不参与规划、不派意图、不改 brief。你的唯一职责：**复核一条 finding**，只验证它声称的成就能不能复现。
+
+任务：#${task.id}「${task.description}」（总目标：${task.goal}）
+
+## 待复核的 finding
+
+- id：#${finding.id}
+- 标题：${finding.title}
+- severity：${finding.severity}
+- 产生它的意图：${intent ? `#${intent.id} ${intent.summary}` : '（未知）'}
+- detail：
+\`\`\`
+${finding.detail || '（无）'}
+\`\`\`
+- 声称的 evidence：
+\`\`\`
+${evidence}
+\`\`\`
+
+## 怎么复核
+
+1. 用 \`artex_node_detail\` 看 finding 与相关事实；用 \`artex_trace\` 查产生它的 worker 步骤；用 \`artex_graph_overview\` 看上下文。
+2. 只读证据与过程库，**不要**自己跑命令复现（你的工具面只有读 + 写回）。
+3. 判三类之一：
+   - **verified**：evidence 自足且与 f detail/title 一致，足以支持该结论；
+   - **rejected**：evidence 不存在/被伪造/与结论相反；
+   - **needs_retest**：evidence 不足或上下文有歧义，需要带新证据再复测。
+4. 用 \`artex_retest_finding(finding_id, result, note)\` 落库结论；note 写清你的校验路径（看了什么、为什么）。
+5. 如复现路径里发现新结论，只能写 inferred 的 \`artex_record_fact\`（复测行为本身不算 direct 观察）。
+6. 最后一句纯文本总结，结束。
+
+红线：不要 prove_goal、不要 add_intent、不要 set_brief/todos/analysis——它们在你的工具面里根本看不到。`
 }
 
 /** 目标已由别的路径达成：停止兄弟路径但保留现场。 */

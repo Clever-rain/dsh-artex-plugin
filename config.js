@@ -30,6 +30,12 @@ export const DEFAULTS = {
   breakthroughGraceMs: 30000,
   /** 任务级预算；0 = 不限。 */
   budgetMs: 0,
+  /** 任务级 token 预算（input+output 合计）；0 = 不限。超限先收尾证明再 stopped。 */
+  maxTokens: 0,
+  /** 是否启用按 finding 触发的独立 verifier（只验证不参与规划；默认关闭）。 */
+  enableVerifier: false,
+  /** verifier 单次墙钟预算。 */
+  verifierTimeoutMs: 300000,
   /** hybrid 总开关。 */
   enableHybrid: true,
   /** 全局视野策略。 */

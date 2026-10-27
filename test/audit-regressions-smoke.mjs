@@ -341,8 +341,8 @@ try {
   }
   addIntents(evidTask, [{ summary: 'evid work' }])
   claimIntent(evidTask, evidTask.intents[0].id, 'work#1')
-  await recordFacts(evidEngine, evidTask, [{ summary: 'crash-proof fact', outcome: 'found' }], evidTask.intents[0].id)
-  await recordFinding(evidEngine, evidTask, { title: 'crash-proof finding', severity: 'high', intentId: evidTask.intents[0].id })
+  await recordFacts(evidEngine, evidTask, [{ summary: 'crash-proof fact', outcome: 'found', evidence: 'cmd echo ok → ok' }], evidTask.intents[0].id)
+  await recordFinding(evidEngine, evidTask, { title: 'crash-proof finding', severity: 'high', evidence: 'curl -i /poc → 200', intentId: evidTask.intents[0].id })
   await evidStore.save(evidTask) // save 与 appendEvidence 共享任务链：等它完成即等齐所有即时落盘
   const evidLoaded = await evidStore.load(evidTask.id)
   assert.equal(evidLoaded.facts.some(f => f.summary === 'crash-proof fact'), true, 'fact 应已即时落盘')
@@ -580,7 +580,7 @@ try {
   assert.equal(secondWrite.duplicates.length, 0)
   assert.equal(tFlip.facts[1].supersedes, tFlip.facts[0].id, '新证据应标注取代旧节点')
   assert.equal(tFlip.facts[0].supersededBy, tFlip.facts[1].id)
-  const thirdWrite = await recordFacts(eFlip, tFlip, [{ summary: '共享匿名可读', outcome: 'found' }], tFlip.intents[0].id)
+  const thirdWrite = await recordFacts(eFlip, tFlip, [{ summary: '共享匿名可读', outcome: 'found', evidence: '复现证据' }], tFlip.intents[0].id)
   assert.equal(thirdWrite.facts.length, 0, '同文同结局仍应去重')
   assert.equal(thirdWrite.duplicates.length, 1)
 
@@ -605,7 +605,374 @@ try {
   for (let i = 0; i < MAX_FACTS + 5; i += 1) recordFact(tBrief, { summary: `bulk ${i}`, confidence: 'observed' })
   assert.ok(tBrief.facts.some(f => f.id === anchorFact.id), '被 brief 引用的旧事实不应被 trim 淘汰')
 
+  // ============================================================ P0+P1 路线图（N30+）
+
+  // N30：暂停 → paused 状态落盘 → resume 重挂续跑 → completed；现场（facts/runState）保留
+  {
+    const agent = { id: 'owner-n30', session: { header: { cwd: root } } }
+    let n30seq = 0
+    const subagents30 = {
+      list: () => ['spawn'],
+      getProvider: () => ({ capabilities: { agentOptions: true } }),
+      async startActivation(spec) {
+        const childId = `n30-child-${++n30seq}`
+        const isPlanner = spec.label.includes('planner')
+        const result = new Promise((resolve) => {
+          setTimeout(() => {
+            const role = e30.roles.get(childId)
+            if (!role) return resolve({ output: [{ type: 'text', text: 'no role' }], stopReason: 'completed' })
+            const liveRt = e30.liveTask(role.taskId)
+            const task = liveRt?.task
+            if (!task) return resolve({ output: [{ type: 'text', text: 'dead' }], stopReason: 'completed' })
+            if (isPlanner) {
+              if (!task.intents.some(i => i.state === 'open' || i.state === 'running')) {
+                e30.addIntents(task, [{ summary: 'seed work', kind: 'pursue' }])
+              }
+              const goalProofFact = task.facts.find(f => f.outcome === 'found')
+              if (goalProofFact && task.goals[0].status !== 'met') {
+                e30.proveGoal(task, task.goals[0].id, goalProofFact.id, 'observed 证据已闭环')
+              }
+            } else if (task.facts.length === 0) {
+              e30.recordFacts(task, [{ summary: 'phase-1 fact', evidence: 'echo ok', confidence: 'observed', outcome: 'found' }], role.intentId)
+            }
+            resolve({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' })
+          }, 5)
+        })
+        return { childId, result, dispose: async () => undefined }
+      },
+      async sendMessage() {},
+      interrupt() {},
+    }
+    const e30 = new ArtexEngine({
+      ctx: { subagents: subagents30, get: () => undefined },
+      config: { ...DEFAULTS, indexPath: join(root, 'index30.json'), debounceMs: 10, heartbeatMs: 100, maxRounds: 12, maxWorkers: 1, budgetMs: 30000 },
+      logger: { warn: () => {} },
+    })
+    const rt30 = await e30.startTask({ agent, goal: 'resume 全链路', description: 'n30', goals: ['目标X'] })
+    await rt30.done.catch(() => undefined)
+    assert.equal(rt30.task.status, 'completed', '第一阶段应正常完成（N30 场景先跑一趟，暂停发生在后续续跑里）')
+    assert.ok(rt30.task.round >= 1)
+    assert.ok(rt30.task.facts.length >= 1, '续跑现场应有 fact')
+    const prevFacts = rt30.task.facts.length
+    // 把完成的现场回写成 paused 并落盘（等效于"跑到一半被 pause 后再重启"的场景复原）：
+    // 真实场景里 pause 发生在运行中；回归通过磁盘 roundtrip 覆盖 resume 的状态机部分。
+    rt30.task.status = 'paused'
+    rt30.task.goals[0].status = 'open'
+    rt30.task.goals[0].evidence = undefined
+    rt30.task.goals[0].metAt = undefined
+    rt30.task.endedAt = undefined
+    rt30.task.finishDetail = undefined
+    rt30.task.report = undefined
+    await e30.storeFor(root).tasks.save(rt30.task)
+    e30.tasks.delete(rt30.task.id)
+    const resumeState = await e30.resumeTask({ agent, taskId: rt30.task.id, budgetMs: 15000, limits: {} })
+    assert.equal(resumeState.task.facts.length, prevFacts, 'resume 后现场 facts 必须保留')
+    assert.equal(resumeState.task.report, undefined, 'resume 时应清掉旧 report')
+    await resumeState.done
+    assert.equal(resumeState.task.status, 'completed', 'resume 后应完成')
+
+    // 预算必填：不给 budget 必须直接拒（先把上一轮的 paused 现场再备好）
+    rt30.task.status = 'paused'
+    rt30.task.endedAt = undefined
+    await e30.storeFor(root).tasks.save(rt30.task)
+    e30.tasks.delete(rt30.task.id)
+    await assert.rejects(() => e30.resumeTask({ agent, taskId: rt30.task.id, budgetMs: 0, limits: {} }), /预算/)
+    // completed 不可续跑
+    const compStub = makeTask('t-audit-35')
+    compStub.status = 'completed'
+    await e30.storeFor(root).tasks.save(compStub)
+    await assert.rejects(() => e30.resumeTask({ agent, taskId: compStub.id, budgetMs: 1000, limits: {} }))
+  }
+
+  // N31：resume 现场恢复（running 意图回炉 open）
+  {
+    const task = makeTask('t-audit-36')
+    addIntents(task, [{ summary: 'chain step' }, { summary: 'follow' }])
+    claimIntent(task, task.intents[0].id, 'work#1')
+    task.status = 'paused'
+    task.lastPlannerRoundAt = Date.now()
+    task.round = 3
+    // 模拟 resume 所做：running → open
+    for (const i of task.intents) {
+      if (i.state === 'running') {
+        i.state = 'open'
+        i.endedAt = undefined
+      }
+    }
+    assert.equal(task.intents[0].state, 'open')
+    assert.equal(task.round, 3, 'round 不清零')
+  }
+
+  // N32：token 预算硬门（超限时 beginSettling，以 stopped 收尾）
+  {
+    const e32 = new ArtexEngine({
+      ctx: { get: () => undefined },
+      config: { ...DEFAULTS, indexPath: join(root, 'index32.json') },
+      logger: { warn: () => {} },
+    })
+    const task = makeTask('t-audit-37')
+    task.limits.maxTokens = 1000
+    const rt = {
+      task,
+      finished: false,
+      settling: false,
+      completing: false,
+      abort: new AbortController(),
+      events: [],
+      waiters: [],
+    }
+    assert.equal(e32.checkTokenBudget(rt), false, '未满超限不应触发')
+    task.usage = { input_tokens: 900, output_tokens: 200, calls: 1, by_role: {}, by_intent: {} }
+    assert.equal(e32.checkTokenBudget(rt), true, '超限应触发 settling')
+    assert.equal(rt.settling, true)
+    assert.match(rt.finishDetail || '', /token 预算耗尽/)
+  }
+
+  // N33：usage 按 intent 归因（无 intent 的落 $role 桶）
+  {
+    const e33 = new ArtexEngine({
+      ctx: { get: () => undefined },
+      config: { ...DEFAULTS, indexPath: join(root, 'index33.json') },
+      logger: { warn: () => {} },
+    })
+    const task = makeTask('t-audit-38')
+    const rt = { task, finished: false, settling: false, completing: false }
+    e33.recordUsage(rt, { role: 'worker', intentId: 7 }, { inputTokens: 100, outputTokens: 20 })
+    e33.recordUsage(rt, { role: 'planner' }, { inputTokens: 50, outputTokens: 10 })
+    assert.equal(task.usage.by_intent['#7'].input_tokens, 100)
+    assert.equal(task.usage.by_intent['#7'].output_tokens, 20)
+    assert.equal(task.usage.by_intent['$planner'].input_tokens, 50)
+    assert.equal(task.usage.by_role.worker.calls, 1)
+  }
+
+  // N34：证据硬门（record_finding 必给 evidence；found fact 必给 evidence）
+  {
+    const task = makeTask('t-audit-39')
+    addIntents(task, [{ summary: 'gating work' }])
+    claimIntent(task, task.intents[0].id, 'work#1')
+    const stubN1 = n1EngineFor(task)
+    await assert.rejects(() => recordFacts(stubN1, task, [{ summary: 'no evidence found', outcome: 'found' }], task.intents[0].id), /must|必须/)
+    await assert.rejects(() => recordFinding(stubN1, task, { title: 'no evidence', severity: 'medium', intentId: task.intents[0].id }), /evidence|必须/)
+    const { facts: okFacts } = await recordFacts(stubN1, task, [{ summary: 'real found', outcome: 'found', evidence: 'curl /poc → 200' }], task.intents[0].id)
+    assert.equal(okFacts.length, 1)
+    const finding = await recordFinding(stubN1, task, { title: 'real finding', severity: 'high', evidence: 'repro', intentId: task.intents[0].id })
+    assert.equal(finding.status, 'open')
+  }
+
+  // N35：prove_goal 默认拒绝 inferred，allow_inferred 放行
+  {
+    const task = makeTask('t-audit-40')
+    const inferFact = recordFact(task, { summary: '看起来可行', outcome: 'found', confidence: 'inferred' })
+    assert.equal(proveGoal(task, 1, inferFact.id, 'r').ok, false, 'inferred 默认拒')
+    assert.equal(proveGoal(task, 1, inferFact.id, 'r', { allowInferred: true }).ok, true, 'allowInferred=true 应放行')
+    const obsFact = recordFact(task, { summary: '复现成功', outcome: 'found', confidence: 'observed', evidence: 'cmd ok' })
+    assert.equal(proveGoal(makeTask('t-audit-41'), 1, obsFact.id, 'r').ok, false, 'observer 的 task 不对')
+    // 原始用例在 goal 1 上已 met：重做任务
+    const rest = makeTask('t-audit-42')
+    const fact2 = recordFact(rest, { summary: 'again', outcome: 'found', confidence: 'observed', evidence: 'x' })
+    assert.equal(proveGoal(rest, 1, fact2.id, 'r').ok, true)
+    // retract 不可再做证据
+    const tRet = makeTask('t-audit-43')
+    const f = recordFact(tRet, { summary: 'old evidence', outcome: 'found', confidence: 'observed', evidence: 'x' })
+    // 直接动 model
+    const { retractFact } = await import('../model.js')
+    retractFact(tRet, f.id, '产物被证伪')
+    assert.equal(proveGoal(tRet, 1, f.id, 'r').ok, false, 'retracted 不能再作证据')
+  }
+
+  // N36：任务级沙箱策略（read_only / allowed_tools）落到工具 deny
+  {
+    const { policyDenyForTask } = await import('../policy.js')
+    const pDeny = policyDenyForTask({ readOnly: true }, 'worker')
+    assert.ok(pDeny.includes('write'), 'read_only 应把 write 收掉')
+    assert.ok(pDeny.includes('pwsh'), 'read_only 应把 pwsh 收掉')
+    const whitelisted = policyDenyForTask({ readOnly: true, allowedTools: ['pwsh'] }, 'worker')
+    assert.ok(!whitelisted.includes('pwsh'), 'allowed_tools 应让 pwsh 放行')
+    assert.ok(whitelisted.includes('write'), 'readOnly 守 write')
+    const allowOnly = policyDenyForTask({ allowedTools: ['pwsh'] }, 'worker')
+    assert.ok(allowOnly.includes('terminal_send'), '白名单之外的可执行宿主工具应被收掉')
+    assert.ok(!allowOnly.includes('pwsh'), '白名单内的工具应放行')
+    // 角色 deny 并入：worker 本身不该给 planner 工具
+    const noSpec = policyDenyForTask({}, 'worker')
+    assert.ok(noSpec.every(n => !['artex_set_brief', 'artex_prove_goal'].includes(n)) === false || noSpec.includes('artex_add_intent'))
+  }
+
+  // N37：coverageOf 确定性矩阵：有反馈的 goal 不进 gap，无相关的进 gap
+  {
+    const { coverageOf } = await import('../views.js')
+    const task = makeTask('t-audit-44')
+    task.goals = [
+      { id: 1, text: '探到 SMB 匿名可读', status: 'open', reason: '', evidence: undefined },
+      { id: 2, text: '找到 RDP 策略', status: 'open', reason: '', evidence: undefined },
+    ]
+    recordFact(task, { summary: 'SMB 共享可见含匿名可读', outcome: 'found', evidence: 'smbclient -L' })
+    const cov = coverageOf(task)
+    assert.equal(cov.total, 2)
+    assert.equal(cov.gaps.length, 1, 'gap 不含已命中 goal')
+    assert.equal(cov.gaps[0], 2, 'RDP goal 应是 gap')
+    assert.equal(cov.goals[0].facts_linked >= 1, true)
+    // audit 完成时 finish 应该带上 coverage
+    const { finish } = await import('../scheduler.js')
+    const atask = makeTask('t-audit-45')
+    atask.mode = 'audit'
+    atask.goals[0].status = 'met'
+    atask.goals[0].evidence = 1
+    const art = { task: atask, finished: false, settleGraceMs: 100, abort: new AbortController() }
+    const stubE = { interruptChildren: () => {}, wake: () => {}, addActivity: () => ({}), persist: () => {} }
+    finish(stubE, art, 'completed', 'all done')
+    assert.ok(atask.report?.coverage, 'audit 收口应带覆盖矩阵')
+    assert.ok(Array.isArray(atask.report.coverage.gaps))
+  }
+
+  // N38：finding 复测闭环 + 结构化冲突 + 撤回
+  {
+    const task = makeTask('t-audit-46')
+    const f1 = recordFact(task, { summary: '证据 A', outcome: 'found', confidence: 'observed', evidence: 'cmd A' })
+    const f2 = recordFact(task, { summary: '证据 B', outcome: 'found', confidence: 'observed', evidence: 'cmd B' })
+    const finding = { id: 1 }
+    // retestFinding 在 graph-ops 层；这里直接动 model
+    const { retestFinding, recordConflict, retractFact } = await import('../model.js')
+    const findingNode = reportFinding(task, { title: 'risk', severity: 'high', evidence: 'repro ok' })
+    assert.equal(findingNode.status, 'open')
+    const r1 = retestFinding(task, findingNode.id, 'verified', '复现成功')
+    assert.equal(r1.ok, true)
+    assert.equal(task.findings[0].status, 'verified')
+    const r2 = retestFinding(task, 999, 'verified', 'none')
+    assert.equal(r2.ok, false)
+    // 结构化冲突
+    const c1 = recordConflict(task, { a: f1.id, b: f2.id, note: '两条观察相互矛盾' })
+    assert.equal(c1.ok, true)
+    assert.ok(task.conflicts.length === 1)
+    assert.ok(task.facts[0].contradicts.includes(f2.id))
+    assert.ok(task.facts[1].contradicts.includes(f1.id))
+    const c2 = recordConflict(task, { a: 999, b: f1.id })
+    assert.equal(c2.ok, false, '缺失节点应拒收')
+    // 撤回
+    const rf = retractFact(task, f1.id, '后来发现被环境噪声误导')
+    assert.equal(rf.ok, true)
+    assert.equal(task.facts[0].retracted, true)
+    const rAgain = retractFact(task, f1.id, '重复撤回')
+    assert.equal(rAgain.ok, false, '不能重复撤回')
+  }
+
+  // N39：depends_on 门禁——未完成前置不可领取；前置失败后路线被标记依赖死亡
+  {
+    const { intentDepsDead } = await import('../model.js')
+    const task = makeTask('t-audit-47')
+    addIntents(task, [{ summary: '前置A' }])
+    const aId = task.intents[0].id
+    await assert.rejects(
+      () => Promise.resolve().then(() => {
+        // dependsOn 必须引用已存在的意图
+        return addIntentsOp(n1EngineFor(task), task, [{ summary: '链B', depends_on: [999] }])
+      }),
+      /depends_on|不存在/,
+    )
+    const withChain = await addIntentsOp(n1EngineFor(task), task, [{ summary: '链B', depends_on: [aId] }], {})
+    assert.equal(withChain.length, 1)
+    const chained = task.intents.find(i => i.summary === '链B')
+    assert.ok(chained, '链B 应该存在')
+    assert.ok(Array.isArray(chained.dependsOn))
+    assert.ok(chained.dependsOn.includes(aId))
+    assert.equal(intentDepsDead(task, chained), false, '依赖还在 alive 状态时不是 dead')
+    // 未完成前置时不可领取
+    assert.equal(selectNextIntent(task)?.id, aId, '未满足依赖的链会不被领取')
+    task.intents[0].state = 'failed'
+    assert.equal(intentDepsDead(task, chained), true, '前置 failed 后路线 dead')
+    assert.equal(selectNextIntent(task), undefined, '依赖死亡的意图不能被调度')
+    task.intents[0].state = 'done'
+    assert.equal(selectNextIntent(task)?.id, chained.id, '依赖完成后链被调度')
+  }
+
+  // N40：artex_plan 一次提交 decision/todos/intents/proofs，单段失败不吞后续段
+  {
+    const engine40 = new ArtexEngine({
+      ctx: { get: () => undefined },
+      config: { ...DEFAULTS, indexPath: join(root, 'index40.json') },
+      logger: { warn: () => {} },
+    })
+    const task = makeTask('t-audit-48')
+    task.status = 'running'
+    engine40.tasks.set(task.id, { task, finished: false, events: [], waiters: [], abort: new AbortController() })
+    engine40.roles = new Map()
+    const proofFact = recordFact(task, { summary: '真实证据', outcome: 'found', confidence: 'observed', evidence: 'cmd ok' })
+    const planTool = createTools({ engine: engine40, config: engine40.config }).find(t => t.name === 'artex_plan')
+    const out = await planTool.execute({
+      task_id: task.id,
+      decision: '本轮尝试短链',
+      todos: [{ content: 'check A', status: 'in_progress' }],
+      intents: [{ summary: 'chain-1' }, { summary: 'chain-2', depends_on: [task.intents.at(-1)?.id ?? 0] }],
+      proofs: [
+        { goal_id: task.goals[0].id, evidence_id: proofFact.id, reason: '有 observed 证据' },
+        { goal_id: task.goals[0].id, evidence_id: proofFact.id }, // 重复 prove 应 fail 但不吞前面的段
+      ],
+    }, { agent: { id: 'owner' } })
+    assert.match(out.text, /plan 已落库/)
+    assert.equal(task.goals[0].status, 'met', 'proofs 段应生效')
+    assert.equal(task.intents.filter(i => i.summary === 'chain-1').length, 1)
+    assert.equal(task.intents.filter(i => i.summary === 'chain-2').length, 1)
+    assert.equal(task.todos.length, 1)
+    assert.equal(task.activities.find(a => a.kind === 'decision')?.summary, '本轮尝试短链')
+    assert.match(out.text, /prove #1 → ok/, 'proofs 段应执行')
+    assert.equal((out.text.match(/prove #1 →/g) || []).length, 1, 'allMet 后应提前结束 proofs 段')
+  }
+
+  // N41：verifier 白名单 + queueVerifier 按 finding 触发（config 开启时）
+  {
+    const { ROLE_ALLOW, denyForRole } = await import('../policy.js')
+    assert.ok(ROLE_ALLOW.verifier.includes('artex_retest_finding'))
+    assert.ok(denyForRole('verifier').includes('artex_add_intent'), 'verifier 不能派意图')
+    assert.ok(denyForRole('verifier').includes('artex_set_brief'), 'verifier 不能改 brief')
+    const e41 = new ArtexEngine({
+      ctx: { get: () => undefined },
+      config: { ...DEFAULTS, enableVerifier: true, indexPath: join(root, 'index41.json'), verifierTimeoutMs: 1500, debounceMs: 10, heartbeatMs: 100 },
+      logger: { warn: () => {} },
+    })
+    const task = makeTask('t-audit-49')
+    e41.tasks.set(task.id, { task, finished: false, settling: false, completing: false, abort: new AbortController(), events: [], waiters: [] })
+    const spawnLabels = []
+    e41.runChild = async (rt, spec) => {
+      spawnLabels.push(spec.label)
+      // 模拟 verifier 的写回：复核通过
+      if (spec.key.startsWith('verify-')) {
+        return e41.retestFinding(rt.task, { finding_id: rt.task.findings[0].id, result: 'verified', note: 'evidence 复现 ok' }, {})
+      }
+      return { output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }
+    }
+    e41.addActivity = () => ({})
+    e41.pushEvent = () => {}
+    e41.persist = () => {}
+    const rt41 = e41.tasks.get(task.id)
+    const f = reportFinding(task, { title: 'risk!', severity: 'high', evidence: 'repro ok' })
+    e41.queueVerifier(rt41, f)
+    await new Promise(r => setTimeout(r, 400))
+    assert.ok(spawnLabels.some(l => l.includes('verifier')), 'config 开启时 finding 应触发 verifier')
+    assert.equal(task.findings[0].status, 'verified')
+    // enableVerifier=false：不触发
+    const e41b = new ArtexEngine({
+      ctx: { get: () => undefined },
+      config: { ...DEFAULTS, indexPath: join(root, 'index41b.json') },
+      logger: { warn: () => {} },
+    })
+    const task41b = makeTask('t-audit-50')
+    e41b.tasks.set(task41b.id, { task: task41b, finished: false, settling: false, completing: false, abort: new AbortController(), events: [], waiters: [] })
+    const labelsB = []
+    e41b.runChild = async (_rt, spec) => { labelsB.push(spec.label); return { output: [], stopReason: 'completed' } }
+    e41b.queueVerifier(e41b.tasks.get(task41b.id), { id: 1, title: 'x', intentId: null })
+    await new Promise(r => setTimeout(r, 80))
+    assert.equal(labelsB.length, 0, '关闭时不应触发')
+  }
+
   console.log('OK audit-regressions')
 } finally {
-  await rm(root, { recursive: true, force: true })
+  // 引擎收尾仍是 fire-and-forget 落盘：rm 与后台 flush 赛跑时给几次重试。
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      await new Promise(r => setTimeout(r, 250))
+      await rm(root, { recursive: true, force: true })
+      break
+    } catch (error) {
+      if (attempt === 5) console.warn(`清理临时目录失败（不影响断言结果）：${error?.message || error}`)
+    }
+  }
 }

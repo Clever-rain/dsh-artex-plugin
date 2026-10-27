@@ -4,7 +4,7 @@
 
 import { oneLine } from './util.js'
 import { intentById, danglingParents, findDuplicateFact, findSameSummaryFact } from './model.js'
-import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding } from './graph.js'
+import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding, retestFinding as graphRetestFinding, recordConflict as graphRecordConflict, retractFact as graphRetractFact } from './graph.js'
 
 function requireRunningIntent(task, intentId) {
   if (intentId == null) return null
@@ -42,8 +42,14 @@ export async function addIntents(engine, task, items, options = {}) {
         parents: item?.parents,
         resourceIds: item?.resource_ids ?? item?.resourceIds,
       })
+      // 显式串行依赖：只能引用此前已存在的意图（同批内部暂不互引，跨轮加链更可控）。
+      const deps = [...new Set([...(item?.depends_on ?? item?.dependsOn ?? [])].flat().map(Number).filter(n => Number.isFinite(n) && n > 0))]
+      const missing = deps.filter(id => !intentById(rt.task, id))
+      if (missing.length > 0) {
+        throw new Error(`depends_on 引用了不存在的意图：${missing.map(id => `#${id}`).join(' ')}（先派前置意图，再挂依赖）`)
+      }
     }
-    const results = graphAddIntents(rt.task, items)
+    const results = graphAddIntents(rt.task, items, { max: options.max })
     const created = results.filter(r => r.id > 0).map(r => r.id)
     if (created.length > 0) {
       engine.addActivity(rt, {
@@ -79,7 +85,7 @@ export function addHint(engine, task, texts) {
 
 export function proveGoal(engine, task, goalId, evidenceId, reason, allowNegative = false, options = {}) {
     const rt = engine.runtimeForTask(task)
-    const result = graphProveGoal(rt.task, goalId, evidenceId, reason, { allowNegative })
+    const result = graphProveGoal(rt.task, goalId, evidenceId, reason, { allowNegative, allowInferred: options.allowInferred === true })
     if (result.ok) {
       engine.addActivity(rt, {
         intentId: null,
@@ -177,6 +183,12 @@ export async function recordFacts(engine, task, entries, intentId) {
       if (!String(entry?.summary ?? '').trim()) throw new Error('每条 fact 的 summary 都不能为空')
     }
     await validateAnchors(engine, rt, { resourceIds: entries.flatMap(e => e.resourceIds ?? e.resource_ids ?? []) })
+    // 证据硬门禁：outcome=found 必须能给得出证据（P0-3）；"看起来像"写成 inferred 而不是 found。
+    for (const entry of entries) {
+      if (entry?.outcome === 'found' && !String(entry.evidence ?? '').trim()) {
+        throw new Error('outcome=found 的事实必须给 evidence（命令输出/返回体等复现凭据）；推断请落 inferred')
+      }
+    }
     const facts = []
     const duplicates = []
     for (const entry of entries) {
@@ -235,6 +247,10 @@ export async function recordFinding(engine, task, input) {
     const targetId = input.intentId ?? input.intent_id ?? null
     requireRunningIntent(rt.task, targetId)
     await validateAnchors(engine, rt, { resourceIds: input.resourceIds ?? input.resource_ids })
+    // 证据硬门禁：finding 必须有可复现证据（P0-3），不然只是"看着像"。
+    if (!String(input.evidence ?? '').trim()) {
+      throw new Error('report_finding 必须给 evidence：发现是已验证成果，需要可复现凭据（命令/回包/复现步骤）。没复现的请记为 inferred fact。')
+    }
     const finding = graphReportFinding(rt.task, { ...input, intentId: targetId })
     const role = engine.roleForIntent(task.id, finding.intentId)
     if (role) role.writes.findings += 1
@@ -247,6 +263,8 @@ export async function recordFinding(engine, task, input) {
     })
     // 发现是最高价值证据：先即时落盘，再唤醒规划者（不等合并写窗口）。
     void engine.persistEvidence?.(rt)
+    // 独立 verifier：按 finding 触发、串行复核、只验证不参与规划。
+    engine.queueVerifier?.(rt, finding)
     engine.pushEvent(rt, {
       kind: 'finding',
       intentId: finding.intentId,
@@ -280,6 +298,61 @@ export function runtimeForTask(engine, task) {
     if (!rt) throw new Error(`ARTEX 任务 ${task.id} 已结束，不能再写入（可用 artex_task_status 查看快照）`)
     if (rt.finished) throw new Error(`ARTEX 任务 ${task.id} 已结束（${task.status}），不能再写入`)
     return rt
+  }
+
+  /* ----------------------------------------------------------- lifecycle */
+
+/** finding 复测闭环（verifier/planner/owner）：状态落到节点上随快照持久化。 */
+export function retestFinding(engine, task, input, options = {}) {
+    const rt = engine.runtimeForTask(task)
+    const result = graphRetestFinding(rt.task, input.finding_id ?? input.findingId, input.result, input.note)
+    if (!result.ok) throw new Error(result.error)
+    engine.addActivity(rt, {
+      intentId: result.finding.intentId ?? null,
+      worker: options.worker || 'verifier',
+      kind: 'verify',
+      summary: `finding #${result.finding.id} 复测为 ${input.result}${input.note ? `：${oneLine(input.note, 120)}` : ''}`,
+      detail: input.note || '',
+    })
+    void engine.persistEvidence?.(rt)
+    void engine.persist(rt)
+    return result.finding
+  }
+
+/** 结构化冲突记录：两条节点给相反结论时，保留双方并在图上互为 contradicts。 */
+export function recordConflict(engine, task, input) {
+    const rt = engine.runtimeForTask(task)
+    const result = graphRecordConflict(rt.task, input)
+    if (!result.ok) throw new Error(result.error)
+    engine.addActivity(rt, {
+      intentId: input.intentId ?? input.intent_id ?? null,
+      worker: input.worker || 'analyst',
+      kind: 'conflict',
+      summary: `冲突 #${result.conflict.id}：#${result.conflict.a} ↔ #${result.conflict.b}`,
+      detail: input.note || '',
+    })
+    // 冲突即规划信号：让 planner 立刻看到矛盾，不要等下一轮巡检。
+    engine.pushEvent(rt, { kind: 'conflict', summary: `证据冲突 #${result.conflict.a} ↔ #${result.conflict.b}` })
+    void engine.persist(rt)
+    return result.conflict
+  }
+
+/** 撤回一条事实：留档但 prove_goal 拒绝使用（纠正旧图，不假装没发生过）。 */
+export function retractFact(engine, task, input) {
+    const rt = engine.runtimeForTask(task)
+    const result = graphRetractFact(rt.task, input.fact_id ?? input.factId, input.reason)
+    if (!result.ok) throw new Error(result.error)
+    engine.addActivity(rt, {
+      intentId: result.fact.intentId ?? null,
+      worker: input.worker || 'planner',
+      kind: 'retract',
+      summary: `撤回 fact #${result.fact.id}${input.reason ? `：${oneLine(input.reason, 120)}` : ''}`,
+      detail: input.reason || '',
+    })
+    engine.pushEvent(rt, { kind: 'fact', summary: `fact #${result.fact.id} 已撤回` })
+    void engine.persistEvidence?.(rt)
+    void engine.persist(rt)
+    return result.fact
   }
 
   /* -------------------------------------------------------------- session events */
