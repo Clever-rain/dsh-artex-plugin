@@ -3,7 +3,7 @@
  */
 
 import { oneLine } from './util.js'
-import { intentById, danglingParents, findDuplicateFact } from './model.js'
+import { intentById, danglingParents, findDuplicateFact, findSameSummaryFact } from './model.js'
 import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding } from './graph.js'
 
 function requireRunningIntent(task, intentId) {
@@ -180,14 +180,16 @@ export async function recordFacts(engine, task, entries, intentId) {
     const facts = []
     const duplicates = []
     for (const entry of entries) {
-      // 服务端去重：规范化 summary 命中近期窗口内已有事实时跳过重写，返回已有节点。
+      // 服务端去重：规范化 summary + 相同结局命中近期窗口时跳过重写，返回已有节点。
       // stats / intent.writes / outcomes 都不重计——重复证据不改变图景。
-      const dup = findDuplicateFact(rt.task, entry.summary)
+      // 结局不同 = 新证据（audit 里"先判无、重测命中"是常态），不能当重复丢掉（N26）。
+      const dup = findDuplicateFact(rt.task, entry.summary, 0, entry.outcome)
       if (dup) {
         duplicates.push(dup)
         continue
       }
-      facts.push(graphRecordFact(rt.task, {
+      const prior = findSameSummaryFact(rt.task, entry.summary)
+      const recorded = graphRecordFact(rt.task, {
         summary: entry.summary,
         detail: entry.detail,
         evidence: entry.evidence,
@@ -195,7 +197,13 @@ export async function recordFacts(engine, task, entries, intentId) {
         outcome: entry.outcome,
         resourceIds: entry.resourceIds ?? entry.resource_ids,
         intentId: targetId,
-      }))
+      })
+      // 同文不同结局：保留新证据，并双向标注取代关系，报告里能看出结论被翻过。
+      if (prior && prior.outcome !== recorded.outcome && rt.task.facts.includes(prior)) {
+        recorded.supersedes = prior.id
+        prior.supersededBy = recorded.id
+      }
+      facts.push(recorded)
     }
     if (facts.length > 0) {
       const role = engine.roleForIntent(task.id, facts[0].intentId)

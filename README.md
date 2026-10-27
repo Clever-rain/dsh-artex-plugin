@@ -273,14 +273,15 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 - worker 只能写回自己领到的、正在运行的意图；批量写先整体校验再落图，失败不留半批。
 - `prove_goal` 拒绝负结果（目标本身是负向结论时要显式 `allow_negative`）、拒绝重复证明、拒绝拿 blueprint 作证据；**`confidence=inferred` 的推断事实也不能作证据**，想证就得先派意图把推断升级成 observed/finding。
 - **锚点硬校验**：意图的 `parents` 只能挂仍存在的 fact/finding，`resource_ids` 必须是已登记的资源 id；悬空引用整批拒绝，规划者按报错自纠。trim 证据淘汰保护集除了 `goals[].evidence` 还包括 brief/analysis 的 citations。
-- **事实服务端去重**：规范化 summary（小写、折叠空白）命中近期 500 条窗口就不入库不重复计数，工具有"去重跳过 N 条→既有 #id"的回执。
+- **事实服务端去重**：规范化 summary（小写、折叠空白）命中近期 500 条窗口、且**结局相同**时才跳过；结局不同（audit 里"先判无、重测命中"）按新证据入库，并双向标注 `supersedes` / `supersededBy`，报告里能看出结论被翻过。
 - **证据即时落盘**：fact/finding 写回立刻追加进 JSONL（不等合并写窗口），进程崩溃最多丢元数据指针，不丢已确认结论。
 - 事实写回不触发规划轮，避免事实风暴把 `maxRounds` 烧完；目标、意图、发现这三类事件按角色唤醒。
 - planner 瞬态失败按 `plannerRetries` + 错误分类退避重试（rate_limit 长冷却、context 类直接快速失败）；**子会话静默超时也计入重试**；持续失败且已经有事实时，以 `stopped` 收尾、保留现场。**态势投影构建失败走降级通道**：非强制轮不烧轮次直接跳过，连续 3 次才把错误交给收尾；强制轮用降级视图继续（planner 被提示只做收尾判定）。
 - **worker 启动瞬态错误自动重排一次**（rate_limit/server/network 回炉 open，下一拍重领）；启动后 provider 返回 `error` 的停止原因归一化成 `blocked` 而不是误判成 no_evidence。
-- **心跳查房**：在跑 worker 静默超过 2× 心跳先发自检提示，下个心跳仍静默则强制中断（记 `stopped`，可被 planner 重派）；任何带 intentId 的写回都会重置静默时钟。
+- **心跳查房**：在跑 worker 静默超过 2× 心跳先发自检提示，下个心跳仍静默则强制中断（记 `stopped`，可被 planner 重派）；只有真实子会话的写回/工具事件会重置静默时钟——引擎自己的巡检记录不算存活信号，否则中断永远不会发生。
 - **预算夹逼**：子会话墙钟恒等于 `min(timeoutMs, 任务剩余预算)`，planner、worker、analyst 一视同仁；任务结束回收持久化层内存状态，启动落盘失败不留孤儿 runtime。
-- worker 命名单调递增跨轮不重名；`activity.jsonl` 单卷超 64MB 轮转为 `activity.1.jsonl`。
+- worker 命名单调递增跨轮不重名；`activity.jsonl` 单卷超 64MB 轮转为 `activity.1.jsonl`；任务终态回收内存后不再追加 JSONL（避免已落盘 id 集被清空后整批重写）。
+- 写工具（`artex_record_fact` / `artex_add_intent` / `artex_report_finding`）在锚点校验阶段可能**异步拒绝**（校验要读资源图），调用方必须 `await`。
 - 运行状态、usage、settling、降级原因这些字段都写进任务快照/报告（含 goal 的 prove 理由与证据结局），`facts/findings` 的累计真值与内存窗口分开计数并标 `truncated`。
 - 索引写入用目录锁，锁内合并；`status` 的历史列表只列 owner 自己的任务。
 

@@ -382,8 +382,10 @@ export class ArtexEngine {
 
   addActivity(rt, input) {
     const activity = graphAddActivity(rt.task, input)
-    // 心跳查房的时钟：任何带 intentId 的动作都算"这条意图还活着"。
-    if (activity.intentId) {
+    // 心跳查房的时钟：只有真实子会话的活动才算"这条意图还活着"。
+    // 引擎自己发出的巡检/中断记录（worker: 'engine'）不能续命——否则
+    // "唤醒后仍静默就中断"永远不成立（N25）。
+    if (activity.intentId && activity.worker !== 'engine') {
       const intent = rt.task.intents.find(i => i.id === activity.intentId)
       if (intent) intent.lastActivityAt = activity.at
       rt.stalledNudges?.delete(activity.intentId)

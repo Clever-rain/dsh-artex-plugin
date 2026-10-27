@@ -161,20 +161,30 @@ export function normalizeSummaryText(text) {
 /** 事实写回去重的回看窗口（条）：只在近期范围内比对，长任务开销恒定。 */
 export const FACT_DEDUP_WINDOW = 500
 
-/**
- * 按规范化 summary 在最近窗口内查重，返回已存在的同义事实（不入库、不计数）。
- * 与 addIntents 的服务端去重是同一道防线：写回纪律靠提示词，兜底靠这里。
- */
-export function findDuplicateFact(task, summary, ignoreId = 0) {
+/** 最近窗口内同文（规范化 summary）的事实，不看结局；用于标注取代关系。 */
+export function findSameSummaryFact(task, summary, ignoreId = 0) {
   const key = normalizeSummaryText(summary)
   if (!key) return undefined
-  const list = task.facts
+  const list = task.facts || []
   const start = Math.max(0, list.length - FACT_DEDUP_WINDOW)
   for (let i = list.length - 1; i >= start; i -= 1) {
     const existing = list[i]
     if (existing.id !== ignoreId && normalizeSummaryText(existing.summary) === key) return existing
   }
   return undefined
+}
+
+/**
+ * 判重：同文且结局相同才算重复。
+ * 结局不同（audit 里"先判无、重测命中"）是新证据，必须允许入库，否则图上
+ * 会永久保留旧结论、prove_goal 也拿不到命中作证据（N26）。
+ * 任一侧 outcome 缺省时按重复处理：缺省不携带新结论。
+ */
+export function findDuplicateFact(task, summary, ignoreId = 0, outcome = undefined) {
+  const existing = findSameSummaryFact(task, summary, ignoreId)
+  if (!existing) return undefined
+  if (outcome != null && existing.outcome != null && String(outcome) !== String(existing.outcome)) return undefined
+  return existing
 }
 
 /**
@@ -301,6 +311,13 @@ export function setTodos(task, items) {
   return task.todos
 }
 
+/** 从正文里抽 "#12" 形式的引用：模型通常把依据写进正文，而不是 citations 参数（N29）。 */
+function extractCitations(text) {
+  const out = []
+  for (const match of String(text || '').matchAll(/#(\d{1,9})/g)) out.push(Number(match[1]))
+  return out
+}
+
 /** 规划者维护的全局认知：整体替换、按轮次版本化（与 todos 同为"综合"而非"追加"）。 */
 export function setBrief(task, text, citations = []) {
   const clean = String(text || '').trim()
@@ -309,7 +326,7 @@ export function setBrief(task, text, citations = []) {
     text: truncate(clean, 2000),
     round: task.round,
     updatedAt: now(),
-    citations: normalizeIds(citations),
+    citations: normalizeIds([...(Array.isArray(citations) ? citations : []), ...extractCitations(clean)]),
   }
   task.updatedAt = now()
   return task.brief
@@ -323,7 +340,7 @@ export function setAnalysis(task, text, citations = []) {
     text: truncate(clean, 2000),
     round: task.round,
     updatedAt: now(),
-    citations: normalizeIds(citations),
+    citations: normalizeIds([...(Array.isArray(citations) ? citations : []), ...extractCitations(clean)]),
   }
   task.analysisRuns = (task.analysisRuns || 0) + 1
   task.updatedAt = now()

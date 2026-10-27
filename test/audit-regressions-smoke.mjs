@@ -2,11 +2,11 @@
 
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  createTask, addIntents, claimIntent, recordFact, reportFinding, proveGoal, addHint,
+  createTask, addIntents, claimIntent, recordFact, reportFinding, proveGoal, addHint, setBrief,
   MAX_FACTS, MAX_FINDINGS, MAX_HINTS,
 } from '../model.js'
 import { addIntents as addIntentsOp, recordFacts, recordFinding, proveGoal as proveGoalOp, promoteIntent as promoteIntentOp } from '../graph-ops.js'
@@ -548,7 +548,8 @@ try {
   let nudged24 = 0
   let interrupted24 = 0
   const e24 = {
-    addActivity: () => ({}),
+    // 用真实 addActivity：它会续命静默时钟并清 stalledNudges，no-op 桩会把待验证的副作用抹掉
+    addActivity: engine.addActivity.bind(engine),
     nudge: () => { nudged24 += 1; return Promise.resolve() },
     interruptChild: () => { interrupted24 += 1 },
   }
@@ -566,6 +567,43 @@ try {
   checkStalledWorkers(e24, rt24)
   assert.equal(nudged24, 1, '已唤醒过的不再重复唤醒')
   assert.equal(interrupted24, 1, '唤醒后仍静默应强制中断')
+
+  // N26：同文不同结局是新证据，不能被去重吞掉；同文同结局仍然去重
+  const tFlip = makeTask('t-audit-32')
+  addIntents(tFlip, [{ summary: 'flip work' }])
+  claimIntent(tFlip, tFlip.intents[0].id, 'work#1')
+  const eFlip = n1EngineFor(tFlip)
+  const firstWrite = await recordFacts(eFlip, tFlip, [{ summary: '共享匿名可读', outcome: 'none', confidence: 'observed', evidence: 'smbclient 被拒' }], tFlip.intents[0].id)
+  const secondWrite = await recordFacts(eFlip, tFlip, [{ summary: '共享匿名可读', outcome: 'found', confidence: 'observed', evidence: 'smbclient 成功' }], tFlip.intents[0].id)
+  assert.equal(firstWrite.facts.length, 1)
+  assert.equal(secondWrite.facts.length, 1, '结局反转的观测必须入库')
+  assert.equal(secondWrite.duplicates.length, 0)
+  assert.equal(tFlip.facts[1].supersedes, tFlip.facts[0].id, '新证据应标注取代旧节点')
+  assert.equal(tFlip.facts[0].supersededBy, tFlip.facts[1].id)
+  const thirdWrite = await recordFacts(eFlip, tFlip, [{ summary: '共享匿名可读', outcome: 'found' }], tFlip.intents[0].id)
+  assert.equal(thirdWrite.facts.length, 0, '同文同结局仍应去重')
+  assert.equal(thirdWrite.duplicates.length, 1)
+
+  // N27：终态 release 之后的一次 save 不得把事实重复追加
+  const tRel = makeTask('t-audit-33')
+  for (let i = 1; i <= 3; i += 1) recordFact(tRel, { summary: `rel ${i}`, confidence: 'observed', outcome: 'found' })
+  const relStore = new TaskStore(root)
+  const relFile = join(root, '.artex', 'tasks', 't-audit-33', 'facts.jsonl')
+  const countLines = () => (existsSync(relFile) ? readFileSync(relFile, 'utf8').trim().split('\n').filter(Boolean).length : 0)
+  await relStore.save(tRel)
+  const beforeRelease = countLines()
+  relStore.release(tRel.id)
+  await relStore.save(tRel)
+  assert.equal(beforeRelease, 3)
+  assert.equal(countLines(), beforeRelease, 'release 后不得重复追加')
+
+  // N29：brief 正文里的 #id 也算引用，trim 不能把它淘汰
+  const tBrief = makeTask('t-audit-34')
+  const anchorFact = recordFact(tBrief, { summary: 'anchor fact', confidence: 'observed' })
+  setBrief(tBrief, `已确认 #${anchorFact.id} 是根因`)
+  assert.ok(tBrief.brief.citations.includes(anchorFact.id), '正文里的 #id 应进入 citations')
+  for (let i = 0; i < MAX_FACTS + 5; i += 1) recordFact(tBrief, { summary: `bulk ${i}`, confidence: 'observed' })
+  assert.ok(tBrief.facts.some(f => f.id === anchorFact.id), '被 brief 引用的旧事实不应被 trim 淘汰')
 
   console.log('OK audit-regressions')
 } finally {

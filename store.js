@@ -167,6 +167,8 @@ export class TaskStore {
     this.pending = new Map()
     this.written = new Map()
     this.activityBytes = new Map()
+    // 已终态回收的任务：快照还得能更新，但 JSONL 不再追加（written 已释放，重放会整批重写，N27）
+    this.released = new Set()
     this.onError = options.onError
     this.lastError = undefined
   }
@@ -243,6 +245,7 @@ export class TaskStore {
    * 进程崩溃最多丢元数据指针，不丢已确认的结论本身。
    */
   appendEvidence(task) {
+    if (this.released.has(task.id)) return Promise.resolve()
     const prev = this.paths.get(task.id) ?? Promise.resolve()
     const next = prev.then(async () => {
       const entry = this.entryFor(task.id)
@@ -263,7 +266,7 @@ export class TaskStore {
     const next = prev.then(async () => {
       await mkdir(dirname(path), { recursive: true })
       const entry = this.entryFor(task.id)
-      await this.appendNew(task, entry)
+      if (!this.released.has(task.id)) await this.appendNew(task, entry)
       await writeAtomic(path, payload)
     }).catch((error) => {
       this.lastError = error
@@ -309,6 +312,7 @@ export class TaskStore {
    * 磁盘快照与 JSONL 保留，之后仍可 load 复载（会重建这些条目）。
    */
   release(taskId) {
+    this.released.add(taskId)
     this.written.delete(taskId)
     this.pending.delete(taskId)
     this.paths.delete(taskId)
