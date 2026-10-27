@@ -9,6 +9,16 @@ function emptyStats() {
   return { intents: 0, facts: 0, findings: 0, hints: 0, resources: 0, activities: 0 }
 }
 
+/** 任务级工具/沙箱策略：任务参数的规范化形状（真实门禁在 spawn 的 toolFilter/cwd，提示词进 prompt）。 */
+export function normalizePolicy(policy = {}) {
+  const clean = value => (Array.isArray(value) ? [...new Set(value.map(v => String(v).trim()).filter(Boolean))] : [])
+  return {
+    allowedTools: clean(policy.allowedTools ?? policy.allowed_tools),
+    readOnly: policy.readOnly === true || policy.read_only === true,
+    allowedPaths: clean(policy.allowedPaths ?? policy.allowed_paths),
+  }
+}
+
 /** Create the in-memory shape of one task's exploration graph. */
 export function createTask(input) {
   const t = {
@@ -17,6 +27,7 @@ export function createTask(input) {
     description: input.description || '未命名任务',
     goal: input.goal,
     constraints: Array.isArray(input.constraints) ? input.constraints.filter(Boolean) : [],
+    policy: normalizePolicy(input.policy),
     ownerSession: input.ownerSession,
     cwd: input.cwd,
     outDir: input.outDir,
@@ -39,8 +50,9 @@ export function createTask(input) {
     hints: [],
     todos: [],
     activities: [],
+    conflicts: [],
     stats: emptyStats(),
-    usage: { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
+    usage: { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {}, by_intent: {} },
     report: undefined,
   }
   const goalTexts = Array.isArray(input.goals) && input.goals.length > 0 ? input.goals : [input.goal]
@@ -101,7 +113,8 @@ export function nodeKind(task, id) {
 /** Planner dispatch: batch of intents (max 4, like ARTEX add_intent). */
 export function addIntents(task, items, options = {}) {
   const out = []
-  const limit = Math.max(1, Math.min(4, options.max ?? 4))
+  // 默认单批 4 条（artex_add_intent 的护栏），artex_plan 可抬到 12。
+  const limit = Math.max(1, Number(options.max) || 4)
   for (const raw of items.slice(0, limit)) {
     const summary = String(raw?.summary ?? raw?.text ?? '').trim()
     if (!summary) continue
@@ -123,6 +136,8 @@ export function addIntents(task, items, options = {}) {
       priority: Number.isFinite(raw?.priority) ? raw.priority : 5,
       resourceIds: normalizeIds(raw?.resource_ids),
       parents: normalizeIds(raw?.parents),
+      // 显式串行依赖：全部依赖完成后才可被领取（草地：依赖以外部校验保证存在）。
+      dependsOn: normalizeIds(raw?.depends_on ?? raw?.dependsOn),
       createdAt: now(),
       startedAt: undefined,
       endedAt: undefined,
@@ -195,6 +210,22 @@ export function danglingParents(task, parents) {
   return (Array.isArray(parents) ? parents : []).filter((id) => {
     const kind = nodeKind(task, id)
     return kind !== 'fact' && kind !== 'finding'
+  })
+}
+
+/** 依赖是否全部完成：依赖只认 done（failed/stopped/exhausted 的依赖不算完成，规划者需要改路线）。 */
+export function intentDepsSatisfied(task, intent) {
+  const deps = Array.isArray(intent?.dependsOn) ? intent.dependsOn : []
+  if (deps.length === 0) return true
+  return deps.every(id => intentById(task, id)?.state === 'done')
+}
+
+/** 依赖是否已无可能完成（任一依赖落入终态死角）：供规划者识别死锁路线。 */
+export function intentDepsDead(task, intent) {
+  const deps = Array.isArray(intent?.dependsOn) ? intent.dependsOn : []
+  return deps.some((id) => {
+    const dep = intentById(task, id)
+    return !dep || ['failed', 'exhausted', 'blocked'].includes(dep.state)
   })
 }
 
@@ -277,6 +308,9 @@ export function reportFinding(task, input) {
     evidence: input.evidence ? String(input.evidence) : '',
     intentId: input.intentId ? Number(input.intentId) : null,
     resourceIds: normalizeIds(input.resourceIds),
+    // 生命周期：open → verified / rejected（artex_retest_finding 驱动）。
+    status: 'open',
+    retests: [],
     createdAt: now(),
   }
   task.findings.push(finding)
@@ -288,6 +322,62 @@ export function reportFinding(task, input) {
   trimCollection(task, 'findings', MAX_FINDINGS)
   task.updatedAt = now()
   return finding
+}
+
+/** finding 复测闭环：open → verified / rejected；rejected 保留但计为无效。 */
+export function retestFinding(task, id, result, note) {
+  const finding = task.findings.find(f => f.id === Number(id))
+  if (!finding) return { ok: false, error: `finding #${id} 不存在` }
+  const verdict = ['verified', 'rejected', 'needs_retest'].includes(result) ? result : undefined
+  if (!verdict) return { ok: false, error: `非法复测结论 "${result}"，允许：verified | rejected | needs_retest` }
+  finding.status = verdict
+  finding.retests.push({ result: verdict, note: note ? String(note) : '', at: now() })
+  task.updatedAt = now()
+  return { ok: true, finding }
+}
+
+/** 撤回一条事实：留档但不再可作证据；digest 里单独可见。 */
+export function retractFact(task, id, reason) {
+  const fact = task.facts.find(f => f.id === Number(id))
+  if (!fact) return { ok: false, error: `fact #${id} 不存在` }
+  if (fact.retracted) return { ok: false, error: `fact #${id} 已是撤回状态` }
+  fact.retracted = true
+  fact.retractedAt = now()
+  fact.retractedReason = reason ? String(reason) : ''
+  task.updatedAt = now()
+  return { ok: true, fact }
+}
+
+const MAX_CONFLICTS = 200
+
+/**
+ * 结构化冲突记录：两条事实/发现给出相反结论时，保留双方并在图上互为 contradicts。
+ * 由 worker（现场发现冲突）或 analyst（战略复审发现矛盾）显式落盘。
+ */
+export function recordConflict(task, input) {
+  const a = Number(input?.a)
+  const b = Number(input?.b)
+  const kinds = { a: nodeKind(task, a), b: nodeKind(task, b) }
+  if (!kinds.a || !kinds.b || kinds.a === 'hint' || kinds.b === 'hint' || a === b) {
+    return { ok: false, error: `冲突双方必须是本任务已存在的节点：#${a}(${kinds.a || '不存在'}) ↔ #${b}(${kinds.b || '不存在'})` }
+  }
+  task.conflicts = Array.isArray(task.conflicts) ? task.conflicts : []
+  if (task.conflicts.length >= MAX_CONFLICTS) task.conflicts.shift()
+  const conflict = {
+    id: nextNodeId(task),
+    a,
+    b,
+    kind: input.kind === 'supersedes' ? 'supersedes' : 'contradiction',
+    note: input.note ? String(input.note) : '',
+    createdAt: now(),
+  }
+  task.conflicts.push(conflict)
+  for (const [node, other] of [[nodeById(task, a), b], [nodeById(task, b), a]]) {
+    if (!node) continue
+    node.contradicts = [...new Set([...(Array.isArray(node.contradicts) ? node.contradicts : []), other])]
+  }
+  task.updatedAt = now()
+  return { ok: true, conflict }
 }
 
 export function addHint(task, text) {
@@ -369,11 +459,14 @@ export function proveGoal(task, goalId, evidenceId, reason, options = {}) {
   if (evidence.outcome === 'blueprint') {
     return { ok: false, error: 'blueprint 只是备选路径，不能作为目标达成证据' }
   }
+  if (evidence.retracted === true) {
+    return { ok: false, error: `节点 #${evidenceId} 已被撤回（retracted），不能再作目标达成证据` }
+  }
   if (evidence.outcome === 'none' && options.allowNegative !== true) {
     return { ok: false, error: 'outcome=none 是负结果；若目标本身是负向结论（如“无共享”），请显式传 allow_negative=true' }
   }
-  if (evidence.confidence === 'inferred') {
-    return { ok: false, error: 'confidence=inferred 的推断事实不能作为目标达成证据：请先在目标上验证，升级为 observed 事实或 finding 后再标记' }
+  if (evidence.confidence === 'inferred' && options.allowInferred !== true) {
+    return { ok: false, error: 'confidence=inferred 的推断事实默认不能作证据：请先派意图升级为 observed/finding；确需放行请显式传 allow_inferred=true' }
   }
   goal.status = 'met'
   goal.evidence = Number(evidenceId)

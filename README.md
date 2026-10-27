@@ -1,6 +1,6 @@
 # dsh-artex — 把 ARTEX 的 agent 编排搬进 DSH
 
-用 DSH 原生的 subagent 机制，把 ARTEX（`Autumn-27/ARTEX`）那套「双图 + 事件驱动」的 planner/worker 编排搬过来，做成一个 Host 插件。装上之后，模型会多出 17 个 `artex_*` 工具，能做四件事：
+用 DSH 原生的 subagent 机制，把 ARTEX（`Autumn-27/ARTEX`）那套「双图 + 事件驱动」的 planner/worker 编排搬过来，做成一个 Host 插件。装上之后，模型会多出 23 个 `artex_*` 工具，能做四件事：
 
 - **一个总目标一路跑到底**：规划者（planner）每轮派意图，多个执行者（worker）并发领取，图上一有变化就唤醒规划者，直到目标有证据支撑。
 - **结论沉淀成图**：中间结论写成可检索的事实、发现、资源，而不是散落在对话里。
@@ -66,7 +66,7 @@ DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：
 
 | 角色 | 行为 | 工具 |
 |---|---|---|
-| **所有者会话**（调用 `artex_run_task` 的那个 DSH 会话） | 下目标、给约束、在环操舵、看报告 | 全部 17 个 |
+| **所有者会话**（调用 `artex_run_task` 的那个 DSH 会话） | 下目标、给约束、在环操舵、看报告 | 全部 23 个 |
 | **planner**（每轮一个新子会话） | 读态势 → 判目标 → 派 0..4 条意图 / 更新串行链待办 | `artex_add_intent`、`artex_prove_goal`、`artex_set_todos` + 读工具 |
 | **worker**（每条意图一个新子会话） | 只做这一条 → 边发现边写回 → 一句话总结 | `artex_record_fact`、`artex_report_finding`、`artex_add_resource` + 读工具 |
 | 其它无关子会话 | 什么都不能做（控制和写操作会被身份校验拒掉） | 读工具需显式带 `task_id` |
@@ -89,20 +89,26 @@ DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：
 | `artex_run_task` | 前台跑完整编排，返回报告（阻塞） | 所有者 |
 | `artex_start_task` | 后台启动，立即返回 task_id | 所有者 |
 | `artex_task_status` | 状态快照 / 列出任务 | 任意 |
-| `artex_stop_task` | 中断全部子会话并停止 | 所有者 |
+| `artex_stop_task` | `mode=stop` 终止；`mode=pause` 暂停保留现场 | 所有者 |
+| `artex_resume_task` | 重挂 paused/stopped 任务续跑（必须重给 budget_ms） | 所有者 |
 | `artex_add_hint` | 注入战略提示，立刻唤醒规划者 | 所有者 |
 | `artex_graph_overview` | 态势快照（目标、意图、事实、发现、血缘） | 任意 |
 | `artex_node_detail` | 某个节点的完整内容与证据 | 任意 |
 | `artex_trace` | 列出 work / 关键字检索过程 / 取某几步原文 | 任意 |
-| `artex_add_intent` | 批量派意图（≤4；kind=pursue/enumerate，state=open/blueprint） | planner / 所有者 |
+| `artex_add_intent` | 批量派意图（≤4；kind=pursue/enumerate，state=open/blueprint，支持 depends_on） | planner / 所有者 |
+| `artex_plan` | 一轮结构化计划协议：一次提交 decision/todos/intents(≤12)/proofs | planner / 所有者 |
 | `artex_promote_intent` | 把 blueprint 提升为 open | planner / 所有者 |
 | `artex_set_brief` | 整体替换跨轮全局认知 brief | planner / 所有者 |
-| `artex_prove_goal` | 用 fact/finding 证明目标 | planner / 所有者 |
+| `artex_prove_goal` | 用 fact/finding 证明目标（inferred 默认拒，allow_inferred 放行） | planner / 所有者 |
 | `artex_set_todos` | 整体替换跨轮规划待办 | planner / 所有者 |
-| `artex_record_fact` | 写回结论（evidence + confidence + outcome） | worker / 所有者 |
-| `artex_report_finding` | 登记已验证成果 | worker / 所有者 |
+| `artex_record_fact` | 写回结论（evidence + confidence + outcome；found 必给 evidence） | worker / 所有者 |
+| `artex_report_finding` | 登记已验证成果（evidence 硬门必填） | worker / 所有者 |
 | `artex_add_resource` | 登记跨任务复用的资源或实体 | worker / planner / 所有者 |
 | `artex_set_analysis` | 提交独立分析（只读输入，不改 brief） | analyst / 所有者 |
+| `artex_retest_finding` | finding 复测闭环（open → verified/rejected/needs_retest） | verifier / planner / 所有者 |
+| `artex_record_conflict` | 两条给出相反结论的节点落成结构化冲突 | worker / analyst / planner / 所有者 |
+| `artex_retract_fact` | 撤回事实（留档但不可再作证明） | planner / 所有者 |
+| `artex_coverage_report` | 确定性覆盖矩阵（audit 收口前查缺口） | 任意（按读权限） |
 
 ---
 
@@ -126,7 +132,33 @@ max_workers: 3
 
 只想先看方案、不执行：给 `max_workers: 0`，只跑一轮规划，返回意图清单。
 
-**成本与时长**：一轮规划对应一个 planner 子会话，一条意图对应一个 worker 子会话。3 轮 × 2 条意图的任务，大约 8 次模型调用。`max_rounds`、`budget_ms`、`worker_timeout_ms` 都是硬上限，`artex_stop_task` 可以随时止损。
+**成本与时长**：一轮规划对应一个 planner 子会话，一条意图对应一个 worker 子会话。3 轮 × 2 条意图的任务，大约 8 次模型调用。`max_rounds`、`budget_ms`、`max_tokens`、`worker_timeout_ms` 都是硬上限，`artex_stop_task` 可以随时止损。
+
+## 4.0.1 P0 能力：暂停/恢复、token 预算、证据硬门、任务级沙箱
+
+- **暂停/恢复**：`artex_stop_task(mode="pause")` 把任务以 `paused` 状态落盘（facts / findings / 意图 / brief / usage 全部保留；跑中意图回炉 open）。`artex_resume_task(task_id, budget_ms)` 重新挂载续跑——**必须显式给新预算**（旧 deadline 不继承），已完成任务不可恢复。跨进程重启也一样能从任务目录恢复。
+- **Token 预算**：`max_tokens`（input+output 合计）由 usage 事件实时累计；超限时先向全部子会话发"收尾证明"指令、宽限期内排干，再以 `timeout · token 预算耗尽（actual/max）` 收口。报告按 **角色 / 意图 / 工具调用计数** 三个维度给成本分解。
+- **证据硬门**：服务端强约束而不是提示词纪律——
+  - `artex_report_finding` 必须给 `evidence`；
+  - `outcome=found` 的 fact 必须给 `evidence`；
+  - `prove_goal` 默认只接受 observed 事实 / finding，`confidence=inferred` 需显式 `allow_inferred=true`，`outcome=none` 需显式 `allow_negative=true`。
+- **任务级沙箱策略**（start/run 参数落成 spawn 边界，不只是提示词）：
+  - `read_only: true` → 子会话的已知写/执行类宿主工具（edit/write/pwsh/terminal/workflow 等）全部经 toolFilter 收掉；
+  - `allowed_tools: [...]` → 基础工具白名单，名单之外的同名工具同样收掉；
+  - `allowed_paths: [...]` → 路径白名单，作为纪律约束注入所有子会话 prompt。
+
+## 4.0.2 P1 能力：覆盖闭环、生命周期、结构化计划、独立验证者
+
+- **覆盖矩阵 + 收口门禁（audit）**：`coverageOf()` 按 goal 关键字确定性统计相关 fact/finding，`gap=true` 的目标在 audit 终态时随报告落盘（`report.coverage`），让"覆盖不透明"变成一行可核对的数据；planner 可用 `artex_coverage_report` 随时自查。
+- **finding 生命周期**：`open → verified / rejected / needs_retest`，由 `artex_retest_finding` 驱动。报告按状态分组（verified/open/rejected/needs_retest），不再只有"found/not found"两种视角。
+- **fact 生命周期**：`supersedes / contradicts / retracted`。`artex_record_conflict` 把两条相互矛盾的节点落成图上结构化对象（而不是只剩 planner 嘴上说说）；`artex_retract_fact` 撤回被证伪的旧结论（留档但不能再作 prove 证据）。
+- **意图显式依赖**：`depends_on: [意图id...]`。调度器只领依赖全部 done 的意图；依赖落在 failed/exhausted/blocked 的路线会在视图里标 `blocked_by_deps`，planner 负责改路线而不是让它悄悄饿死。
+- **结构化计划协议**：`artex_plan` 一次提交 `{ decision, todos, intents[≤12], proofs }`，服务端按 todos → intents → proofs 固定顺序执行；单段失败只记该段，不吞后续段，比一轮里散打 4 个工具更稳也更好审。
+- **独立 verifier**（`enable_verifier: true` 开启）：每落一条 finding 就按串行链派一个 verifier 子会话复核，工具面只有"只读 + retest + record_fact"，**不能派意图、不能改 brief**——验证和规划从结构上分离，防止角色膨胀。开启会让每 finding 多花一次模型调用，默认关。
+
+## 4.0.3 P2：暂不实现
+
+UI client 插件、报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；UI/导出/分发看后续真有消费方再排。
 
 **配置**（写在 `cordis.patch.yml` 的 config 里，装好之后也可以再改）：
 
@@ -252,7 +284,7 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 | `store.js` | 资源图、任务快照、全局索引 |
 | `prompts.js` | planner / worker / analyst 提示词 |
 | `report.js` | 最终报告渲染 |
-| `tools.js` | 17 个模型工具的组合入口 |
+| `tools.js` | 23 个模型工具的组合入口 |
 | `tools/*.js` | 按域分组：control / read / planner / worker / analysis |
 | `tools-shared.js` | 工具共享层：schema、artifact、presenter、会话与角色校验、run 参数 |
 
@@ -263,7 +295,7 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 - **CI**：`.github/workflows/test.yml`，push 和 PR 上跑 `npm test`（Node 22）。
 - **许可证**：MIT。
 - **版本约束**：`engines.dsh >= 0.1.6-alpha.2`。
-- **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，17 个工具都有中文标题、调用 kind 和完成/失败状态。
+- **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，23 个工具都有中文标题、调用 kind 和完成/失败状态。
 - **打包**：`package.json` 的 `files` 覆盖全部运行模块、配置、图标、locale 和 LICENSE。
 
 ## 4.5 安全与可靠性
@@ -305,7 +337,7 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 ## 6. 测试
 
 ```powershell
-node test/graph-smoke.mjs          # 图内核、视图、17 个工具 schema、presenter
+node test/graph-smoke.mjs          # 图内核、视图、23 个工具 schema、presenter
 node test/engine-smoke.mjs         # 完整闭环、usage、status/report、stop 守卫
 node test/modes-smoke.mjs          # objective/audit、突破停兄弟、证明轮、analyst
 node test/persistence-smoke.mjs    # 分片、JSONL 回填、合并写、索引

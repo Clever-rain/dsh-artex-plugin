@@ -56,11 +56,21 @@ export function snapshot(engine, task, live) {
       facts: task.stats.facts,
       facts_kept: task.facts.length,
       facts_truncated: task.stats.facts > task.facts.length || undefined,
-      findings: task.findings.slice(-50).map(f => ({ id: f.id, title: f.title, severity: f.severity, intent_id: f.intentId })),
+      findings: task.findings.slice(-50).map(f => ({ id: f.id, title: f.title, severity: f.severity, status: f.status || 'open', intent_id: f.intentId })),
       findings_total: task.stats.findings,
       findings_kept: task.findings.length,
+      findings_by_status: {
+        open: task.findings.filter(f => (f.status || 'open') === 'open').length,
+        verified: task.findings.filter(f => f.status === 'verified').length,
+        rejected: task.findings.filter(f => f.status === 'rejected').length,
+        needs_retest: task.findings.filter(f => f.status === 'needs_retest').length,
+      },
+      conflicts: Array.isArray(task.conflicts) ? task.conflicts.length : 0,
+      coverage: task.mode === 'audit' && task.report?.coverage
+        ? { covered: task.report.coverage.covered, total: task.report.coverage.total, gaps: task.report.coverage.gaps }
+        : undefined,
       resources: task.stats.resources,
-      usage: task.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {} },
+      usage: task.usage || { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {}, by_intent: {} },
       hints: task.hints.map(h => h.text),
       todos: task.todos,
       elapsed_ms: endsAt - task.createdAt,

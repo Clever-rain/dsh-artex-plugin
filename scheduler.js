@@ -2,7 +2,7 @@
  * 调度器：主循环、规划轮、派发 worker、突破停止、收尾与证明轮。
  */
 
-import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView, degradedView } from './graph.js'
+import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView, degradedView, coverageOf, intentDepsSatisfied } from './graph.js'
 import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt, stallNudgePrompt } from './prompts.js'
 import { oneLine, sleep, classifyError, retryBackoffMs, isRetryWorthless, normalizeStopReason } from './util.js'
 
@@ -36,7 +36,7 @@ export async function runLoop(engine, rt) {
               break
             }
           }
-          engine.finish(rt, 'timeout', '任务级预算耗尽')
+          engine.finish(rt, rt.finishedStatus || 'timeout', rt.finishDetail || '任务级预算耗尽')
           break
         }
         if (allGoalsMet(t)) {
@@ -130,6 +130,13 @@ export function finish(engine, rt, status, detail) {
       findings: t.findings.length,
       resources: t.stats.resources,
     }
+    // audit 收口硬指标：确定性覆盖矩阵随终态一并存档（暂停不贴，paused 还要续跑）。
+    if (t.mode === 'audit' && status !== 'paused') {
+      t.report.coverage = coverageOf(t)
+      if (t.report.coverage.gaps.length > 0) {
+        t.report.coverage_gap_summary = `覆盖缺口 goal ${t.report.coverage.gaps.map(id => `#${id}`).join(' ')}：${t.report.coverage.gaps.length}/${t.report.coverage.total} 条目标没有任何相关证据`
+      }
+    }
     if (rt.deadlineTimer) {
       clearTimeout(rt.deadlineTimer)
       rt.deadlineTimer = undefined
@@ -181,15 +188,16 @@ export async function completeGracefully(engine, rt, detail) {
     engine.finish(rt, 'completed', detail)
   }
 
-export function beginSettling(engine, rt) {
+export function beginSettling(engine, rt, options = {}) {
     if (rt.finished || rt.settling) return
     rt.settling = true
+    if (!rt.finishDetail && options.reason) rt.finishDetail = options.reason
     for (const [childId, role] of engine.roles) {
       if (role.taskId !== rt.task.id) continue
-      engine.addActivity(rt, { intentId: role.intentId, worker: 'engine', kind: 'system', summary: '任务预算耗尽，向子会话发送收尾指令' })
+      engine.addActivity(rt, { intentId: role.intentId, worker: 'engine', kind: 'system', summary: `${options.reason || '任务预算耗尽'}，向子会话发送收尾指令` })
       void engine.nudge(rt, childId, settlePrompt(role.role, role.kind))
     }
-    engine.pushEvent(rt, { kind: 'budget', summary: '任务级预算耗尽' })
+    engine.pushEvent(rt, { kind: 'budget', summary: options.reason || '任务级预算耗尽' })
   }
 
 export async function drain(engine, rt, graceMs) {
@@ -197,9 +205,14 @@ export async function drain(engine, rt, graceMs) {
     if (running.length > 0) {
       await Promise.race([Promise.allSettled(running), sleep(graceMs > 0 ? graceMs : 0)])
     }
-    if (rt.running.size === 0) return
+    if (rt.running.size === 0) {
+      // verifier 串行链给一次收敛机会（终态快照里结论要完整）。
+      if (rt.verifierQueue) await Promise.race([rt.verifierQueue, sleep(Math.min(5000, Math.max(1000, graceMs)))])
+      return
+    }
     engine.interruptChildren(rt)
     await Promise.race([Promise.allSettled([...rt.running.values()]), sleep(15000)])
+    if (rt.verifierQueue) await Promise.race([rt.verifierQueue, sleep(5000)])
   }
 
   /* --------------------------------------------------------------- planner */
@@ -322,8 +335,10 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
    */
 
 export function selectNextIntent(task) {
+  // 显式依赖门禁：depends_on 里的意图全部 done 才可领取；依赖失败的方向不会被调度，
+  // 由 planner 在下一轮决定改路线（意图视图里标 blocked_by_deps）。
   return task.intents
-    .filter(i => i.state === 'open')
+    .filter(i => i.state === 'open' && intentDepsSatisfied(task, i))
     .sort((a, b) => (b.priority ?? 5) - (a.priority ?? 5) || a.id - b.id)[0]
 }
 

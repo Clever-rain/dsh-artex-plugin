@@ -30,7 +30,8 @@ export async function runChild(engine, rt, spec) {
     let activation
     try {
       if (spec.cwd) await mkdir(spec.cwd, { recursive: true }).catch(() => undefined)
-      const deny = spec.deny ?? engine.denyFor(spec.role)
+      // 角色 deny ∪ 任务级策略（read_only/allowed_tools）deny：spawn 落地真实边界。
+      const deny = spec.deny ?? engine.denyForTask(rt.task, spec.role)
       const request = {
         prompt: [{ type: 'text', text: spec.prompt }],
         parent,

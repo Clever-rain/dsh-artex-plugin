@@ -2,7 +2,7 @@
  * control 工具组。
  */
 
-import { artifact, callerOf, describe, strings, isOwner, resolve, requireOwner, requireRead, pickLimits, RUN_PARAMETERS } from '../tools-shared.js'
+import { artifact, callerOf, describe, integer, strings, isOwner, resolve, requireOwner, requireRead, pickLimits, liveRuntime, RUN_PARAMETERS } from '../tools-shared.js'
 
 export function controlTools({ engine, config }) {
   const engineNote = config.isolateWorkdir
@@ -31,6 +31,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           viewMode: args.view_mode,
           analyst: args.analyst,
           limits: pickLimits(args),
+          policy: { allowedTools: args.allowed_tools, readOnly: args.read_only, allowedPaths: args.allowed_paths },
           signal: exec.signal,
         })
         const stop = () => { void engine.stopTask(rt.task.id, '调用方中断') }
@@ -60,6 +61,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           viewMode: args.view_mode,
           analyst: args.analyst,
           limits: pickLimits(args),
+          policy: { allowedTools: args.allowed_tools, readOnly: args.read_only, allowedPaths: args.allowed_paths },
           signal: exec.signal,
         })
         return `ARTEX 任务已在后台启动：${rt.task.id}（${rt.task.mode} 模式 / 视野 ${rt.task.viewMode || 'planner'}）
@@ -124,12 +126,13 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
     }),
     artifact({
       name: 'artex_stop_task',
-      description: '停止一个正在运行的 ARTEX 任务：中断所有在跑 worker 与 planner，任务状态记为 stopped。省略 task_id 时停止本会话启动的活动任务。',
+      description: '停止一个正在运行的 ARTEX 任务。mode=stop（默认）= 终止：状态记 stopped；mode=pause = 暂停保留现场（事实/发现/意图/brief 落盘，状态 paused），之后用 artex_resume_task 重挂续跑。省略 task_id 时作用于本会话启动的活动任务。',
       parameters: {
         type: 'object',
         properties: {
           task_id: describe('可选：任务 id'),
           reason: describe('停止原因（记录到任务快照）'),
+          mode: { type: 'string', enum: ['stop', 'pause'], description: 'stop=终止（默认）；pause=暂停，所有现场保留可查，需后续 resume' },
         },
         additionalProperties: false,
       },
@@ -143,9 +146,43 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
         if (!taskId) throw new Error('找不到要停止的任务：请显式传 task_id')
         const task = await engine.resolveTask(taskId)
         requireOwner(agent, task)
+        if (args.mode === 'pause') {
+          const ok = await engine.pauseTask(task.id, args.reason || '主 agent 暂停')
+          if (!ok) throw new Error(`任务 ${task.id} 不在运行中`)
+          return `已请求暂停 ${task.id}；现场按 paused 落盘，artex_resume_task 可重挂续跑（需重新给预算）。`
+        }
         const ok = await engine.stopTask(task.id, args.reason || '主 agent 停止')
         if (!ok) throw new Error(`任务 ${task.id} 不在运行中`)
         return `已请求停止 ${task.id}；在跑的子会话被中断，状态将在下一拍落盘。`
+      },
+    }),
+    artifact({
+      name: 'artex_resume_task',
+      description: '恢复一个 paused/stopped/timeout/max_rounds 的 ARTEX 任务：从任务目录重新挂载现场（facts/findings/意图/brief/usage 全部保留，跑中意图回炉重领）。**必须显式给新预算**（budget_ms），避免旧任务无界续跑。已完成的任务不可恢复。',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', required: true, description: '要恢复的任务 id' },
+          budget_ms: { type: 'integer', required: true, description: '本次恢复窗口的时间预算（毫秒，必填，>0）' },
+          max_rounds: integer('可选：覆盖调度轮数上限（其它 limits 通过名字透传，名字与 start 同名）'),
+          max_workers: integer('可选：覆盖 worker 并发数'),
+          max_tokens: integer('可选：覆盖 token 预算'),
+        },
+        required: ['task_id', 'budget_ms'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role } = callerOf(engine, exec)
+        if (role) throw new Error('ARTEX 子会话不能恢复任务（只允许所有者会话）')
+        const limits = pickLimits(args)
+        const rt = await engine.resumeTask({
+          agent,
+          taskId: args.task_id,
+          budgetMs: args.budget_ms,
+          limits,
+          signal: exec.signal,
+        })
+        return `任务 ${rt.task.id} 已重挂续跑：状态 ${rt.task.status}，预算窗口 ${Math.round(args.budget_ms / 1000)}s，round=${rt.task.round}，facts=${rt.task.stats.facts}，findings=${rt.task.stats.findings}。`
       },
     }),
     artifact({

@@ -8,6 +8,7 @@ import { readTools } from './tools/read.js'
 import { plannerTools } from './tools/planner.js'
 import { workerTools } from './tools/worker.js'
 import { analysisTools } from './tools/analysis.js'
+import { verifyTools } from './tools/verify.js'
 
 export function createTools({ engine, config }) {
   return [
@@ -16,5 +17,6 @@ export function createTools({ engine, config }) {
     ...plannerTools({ engine, config }),
     ...workerTools({ engine, config }),
     ...analysisTools({ engine, config }),
+    ...verifyTools({ engine, config }),
   ]
 }

@@ -21,13 +21,15 @@ import {
 import { interruptChildren as interruptChildrenImpl, interruptChild as interruptChildImpl, runChild as runChildImpl, awaitChild as awaitChildImpl, outcome as outcomeImpl, abortOnly as abortOnlyImpl, abortOrTimeout as abortOrTimeoutImpl, nudge as nudgeImpl } from './runner.js'
 import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl, checkStalledWorkers as checkStalledWorkersImpl } from './scheduler.js'
 import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
+import { queueVerifier as queueVerifierImpl } from './verifier.js'
 import { recordUsage as recordUsageImpl } from './usage.js'
-import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl } from './graph-ops.js'
+import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl, retestFinding as retestFindingImpl, recordConflict as recordConflictImpl, retractFact as retractFactImpl } from './graph-ops.js'
 import { snapshot as snapshotImpl, status as statusImpl, report as reportImpl } from './reporting.js'
 import { handleSessionEvent as handleSessionEventImpl } from './session-indexer.js'
 import { sleep } from './util.js'
 import { normalizeConfig } from './config.js'
-import { TOOL_NAMES, denyForRole } from './policy.js'
+import { TOOL_NAMES, denyForRole, policyDenyForTask } from './policy.js'
+import { finishIntent } from './graph.js'
 
 export { DEFAULTS } from './config.js'
 
@@ -62,6 +64,11 @@ export class ArtexEngine {
 
   denyFor(role) {
     return denyForRole(role, this.toolNames)
+  }
+
+  /** 角色 deny ∪ 任务级沙箱策略（read_only/allowed_tools）的 deny：spawn 时只认工具名。 */
+  denyForTask(task, role) {
+    return policyDenyForTask(task?.policy || {}, role, this.toolNames)
   }
 
   get subagents() {
@@ -150,7 +157,43 @@ export class ArtexEngine {
 
   /* --------------------------------------------------------------- lifecycle */
 
-  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, signal }) {
+  /** 供 startTask / resumeTask 复建空 runtime。 */
+  makeRuntime(task, agent) {
+    return {
+      task,
+      ownerAgent: agent,
+      abort: new AbortController(),
+      events: [],
+      waiters: [],
+      running: new Map(),
+      children: new Map(),
+      stalls: 0,
+      settling: false,
+      completing: false,
+      finalProofDone: false,
+      siblingStops: new Set(),
+      viewMode: task.viewMode || this.config.viewMode || 'hybrid',
+      analystRuns: 0,
+      lastAnalystAt: 0,
+      lastAnalystFactCount: 0,
+      lastAnalystRound: 0,
+      stalledNudges: new Map(),
+      workerSeq: 0,
+      viewFailures: 0,
+      lastViewError: undefined,
+      verifierQueue: undefined,
+      finished: false,
+      startedAt: Date.now(),
+      done: undefined,
+      doneResolve: undefined,
+      loop: undefined,
+      deadlineTimer: undefined,
+      finishedStatus: undefined,
+      finishDetail: undefined,
+    }
+  }
+
+  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, policy = {}, signal }) {
     if (this.disposed) throw new Error('ARTEX 插件已卸载')
     if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
     if (!String(goal || '').trim()) throw new Error('goal 不能为空')
@@ -177,6 +220,7 @@ export class ArtexEngine {
       goal: String(goal).trim(),
       goals,
       constraints,
+      policy,
       mode: effectiveMode,
       viewMode: effectiveView,
       ownerSession: agent.id,
@@ -193,40 +237,11 @@ export class ArtexEngine {
         settleGraceMs: Math.max(0, Number(merged.settleGraceMs) || 0),
         breakthroughGraceMs: Math.max(0, Number(merged.breakthroughGraceMs) || 0),
         budgetMs: Math.max(0, Number(merged.budgetMs) || 0),
+        maxTokens: Math.max(0, Number(merged.maxTokens) || 0),
       },
     })
     task.provider = this.providerName
-    const rt = {
-      task,
-      ownerAgent: agent,
-      abort: new AbortController(),
-      events: [],
-      waiters: [],
-      running: new Map(),
-      children: new Map(),
-      stalls: 0,
-      settling: false,
-      completing: false,
-      finalProofDone: false,
-      siblingStops: new Set(),
-      viewMode: effectiveView,
-      analystRuns: 0,
-      lastAnalystAt: 0,
-      lastAnalystFactCount: 0,
-      lastAnalystRound: 0,
-      stalledNudges: new Map(),
-      workerSeq: 0,
-      viewFailures: 0,
-      lastViewError: undefined,
-      finished: false,
-      startedAt: Date.now(),
-      done: undefined,
-      doneResolve: undefined,
-      loop: undefined,
-      deadlineTimer: undefined,
-      finishedStatus: undefined,
-      finishDetail: undefined,
-    }
+    const rt = this.makeRuntime(task, agent)
     rt.done = new Promise((resolve) => { rt.doneResolve = resolve })
     this.tasks.set(id, rt)
     this.evictOld()
@@ -270,6 +285,76 @@ export class ArtexEngine {
     return true
   }
 
+  /** 暂停保留现场：facts/runState 落盘为 paused，之后可用 artex_resume_task 重挂（需重给预算）。 */
+  async pauseTask(taskId, reason = '用户暂停') {
+    const rt = this.liveTask(taskId)
+    if (!rt || rt.finished) return false
+    rt.finishedStatus = 'paused'
+    rt.finishDetail = reason
+    this.interruptChildren(rt)
+    rt.abort.abort(reason)
+    return true
+  }
+
+  /**
+   * 恢复任务：从 task.json + JSONL 重新挂载现场续跑。
+   * - 跑中意图回炉 open（中断的 work 不丢事实，只是重新领取）；
+   * - 必须重给预算（新窗口，不继承旧 deadline）；可顺带覆盖规划参数；
+   * - 已完成任务不可恢复；只有所有者能恢复。
+   */
+  async resumeTask({ agent, taskId, budgetMs, limits = {}, signal }) {
+    if (this.disposed) throw new Error('ARTEX 插件已卸载')
+    if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
+    const id = String(taskId)
+    if (!isValidTaskId(id)) throw new Error(`非法 task_id: ${id}`)
+    const live = this.tasks.get(id)
+    if (live && !live.finished) throw new Error(`任务 ${id} 正在运行中，不能重复挂载`)
+    const task = live?.task ?? await this.resolveTask(id)
+    if (task.status === 'completed') throw new Error('任务已完成，不可恢复')
+    if (String(task.ownerSession) !== String(agent.id)) throw new Error(`只有任务所有者能恢复 ${id}`)
+    const budget = Math.max(0, Number(budgetMs) || 0)
+    if (budget <= 0) throw new Error('恢复任务必须显式给预算（budget_ms > 0），避免旧任务无界续跑')
+    this.providerName = this.resolveProvider()
+    // 现场复位：时钟/终态域归零，证据、brief、意图、usage 全部保留。
+    task.status = 'created'
+    task.endedAt = undefined
+    task.finishDetail = undefined
+    task.report = undefined
+    task.limits = {
+      ...task.limits,
+      ...Object.fromEntries(Object.entries(limits).filter(([, v]) => v != null)),
+      budgetMs: budget,
+    }
+    for (const intent of task.intents) {
+      if (intent.state === 'running') {
+        finishIntent(task, intent.id, { state: 'open', output: intent.output, reason: 'resumed', writes: intent.writes })
+        intent.endedAt = undefined
+        intent.lastActivityAt = undefined
+      }
+    }
+    task.updatedAt = Date.now()
+    const stores = this.storeFor(task.cwd)
+    const rt = this.makeRuntime(task, agent)
+    rt.done = new Promise((resolve) => { rt.doneResolve = resolve })
+    this.tasks.set(id, rt)
+    this.evictOld()
+    const prevError = stores.tasks.lastError
+    await stores.tasks.save(task)
+    if (stores.tasks.lastError && stores.tasks.lastError !== prevError) {
+      this.tasks.delete(id)
+      throw new Error(`ARTEX 任务 ${id} 恢复落盘失败：${stores.tasks.lastError?.message || stores.tasks.lastError}`)
+    }
+    await this.index.register(task).catch((error) => this.logger.warn?.(`[artex] task index register failed: ${error?.message || error}`))
+    rt.loop = this.runLoop(rt).catch((error) => {
+      this.logger.warn?.(`[artex] task ${id} loop failed: ${error?.message || error}`)
+      if (!rt.finished) this.finish(rt, 'failed', String(error?.message || error))
+    })
+    rt.deadlineTimer = setTimeout(() => { void this.beginSettling(rt, { reason: '任务级预算耗尽' }) }, budget)
+    rt.deadlineTimer.unref?.()
+    void signal
+    return rt
+  }
+
   async dispose() {
     this.disposed = true
     for (const rt of this.tasks.values()) {
@@ -306,8 +391,8 @@ export class ArtexEngine {
     return completeGracefullyImpl(this, rt, detail)
   }
 
-  beginSettling(rt) {
-    return beginSettlingImpl(this, rt)
+  beginSettling(rt, options = {}) {
+    return beginSettlingImpl(this, rt, options)
   }
 
   async drain(rt, graceMs) {
@@ -330,6 +415,22 @@ export class ArtexEngine {
 
   checkStalledWorkers(rt) {
     return checkStalledWorkersImpl(this, rt)
+  }
+
+  /** finding 落库后按串行链派 verifier 复核（config.enableVerifier 开启时）。 */
+  queueVerifier(rt, finding) {
+    return queueVerifierImpl(this, rt, finding)
+  }
+
+  /** token 预算硬门：usage 每次累计都检查；超限先收尾证明（settling→finish stopped）。 */
+  checkTokenBudget(rt) {
+    const max = Number(rt?.task?.limits?.maxTokens) || 0
+    if (max <= 0 || !rt || rt.finished || rt.settling || rt.completing) return false
+    const usage = rt.task.usage || { input_tokens: 0, output_tokens: 0 }
+    const total = (usage.input_tokens || 0) + (usage.output_tokens || 0)
+    if (total < max) return false
+    this.beginSettling(rt, { reason: `token 预算耗尽（${total}/${max}）` })
+    return true
   }
 
   async runWorker(rt, intent, workerName) {
@@ -454,6 +555,18 @@ export class ArtexEngine {
     return recordFindingImpl(this, task, input)
   }
 
+  retestFinding(task, input, options = {}) {
+    return retestFindingImpl(this, task, input, options)
+  }
+
+  recordConflict(task, input) {
+    return recordConflictImpl(this, task, input)
+  }
+
+  retractFact(task, input) {
+    return retractFactImpl(this, task, input)
+  }
+
   async addResources(task, items, role) {
     return addResourcesImpl(this, task, items, role)
   }
@@ -465,7 +578,8 @@ export class ArtexEngine {
     return handleSessionEventImpl(this, session, event)
   }
   recordUsage(rt, role, usage) {
-    return recordUsageImpl(this, rt, role, usage)
+    recordUsageImpl(this, rt, role, usage)
+    this.checkTokenBudget(rt)
   }
 
   cleanupRoles(rt) {

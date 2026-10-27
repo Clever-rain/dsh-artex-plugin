@@ -32,6 +32,7 @@ export function plannerTools({ engine, config }) {
                 priority: integer('优先级 0-10，默认 5'),
                 parents: { type: 'array', items: { type: 'integer' }, description: '派生自哪些 fact/finding 节点 id' },
                 resource_ids: { type: 'array', items: { type: 'integer' }, description: '锚定的资源 id' },
+                depends_on: { type: 'array', items: { type: 'integer' }, description: '显式串行依赖：只在前置意图全部 done 后才可被领取，失败的前置要靠你改路线。只能引用此前已存在的意图 id。' },
               },
               required: ['summary'],
               additionalProperties: false,
@@ -75,6 +76,7 @@ export function plannerTools({ engine, config }) {
           evidence_id: { type: 'integer', required: true, description: '作为证据的 fact/finding 节点 id' },
           reason: describe('一句话说明为什么这条证据足以证明目标达成'),
           allow_negative: { type: 'boolean', description: '仅当目标本身是负向结论（如“无共享/未监听”）时设为 true，允许 outcome=none 的事实作为证据；默认拒绝负结果。' },
+          allow_inferred: { type: 'boolean', description: '应急口袋：允许 confidence=inferred 的推断事实作证据。默认拒绝；只有明确接受"这次是推断"时才用，质量门应在其它层把关。' },
         },
         required: ['goal_id', 'evidence_id'],
         additionalProperties: false,
@@ -83,7 +85,7 @@ export function plannerTools({ engine, config }) {
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
         requireRole(agent, role, task, ['planner'])
         liveRuntime(engine, task)
-        const result = engine.proveGoal(task, args.goal_id, args.evidence_id, args.reason, args.allow_negative === true, { notify: role?.role !== 'planner' })
+        const result = engine.proveGoal(task, args.goal_id, args.evidence_id, args.reason, args.allow_negative === true, { notify: role?.role !== 'planner', allowInferred: args.allow_inferred === true })
         if (!result.ok) throw new Error(result.error)
         const remaining = task.goals.filter(g => g.status !== 'met')
         return `目标 #${args.goal_id} 已标记达成（证据 ${result.kind} #${args.evidence_id}）。`
@@ -151,6 +153,120 @@ status: pending | in_progress | completed。`,
         return brief
           ? `全局认知已更新（第 ${brief.round} 轮，${brief.text.length} 字符，引用 ${brief.citations.length} 个节点）`
           : '更新失败：text 为空'
+      },
+    }),
+    artifact({
+      name: 'artex_plan',
+      description: `规划者专用：**一轮的结构化计划协议**——把本轮所有动作一次提交，服务端按固定顺序逐段执行并把回执一起返回，比散打多个工具更稳，也更利于审计溯源。
+建议内容：decision（本轮一句话决定，会写入过程库）→ todos（可整量替换）→ intents（一次最多 12 条，支持 depends_on 显式串链）→ proofs（可证目标一次证完，同样证据硬门）。
+**单段失败不中断后续段**（回执里逐段标注 ok/error）——适合中途有抖动也要保住主线的轮次。
+证明一条后任务如果满足 allGoalsMet 会提前完成：proofs 之后的那段 return 可能看不到，但写回已落库。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          decision: describe('本轮决策一句话，写入过程库供审计'),
+          todos: {
+            type: 'array',
+            description: '整体替换的跨轮待办（见 artex_set_todos）',
+            items: {
+              type: 'object',
+              properties: {
+                content: { type: 'string', required: true },
+                status: { type: 'string', required: true, enum: ['pending', 'in_progress', 'completed'] },
+              },
+              required: ['content', 'status'],
+              additionalProperties: false,
+            },
+          },
+          intents: {
+            type: 'array',
+            description: '本轮要下发的意图（一次最多 12 条；字段同 artex_add_intent，额外支持 depends_on）',
+            items: { type: 'object' },
+            maxItems: 12,
+          },
+          proofs: {
+            type: 'array',
+            description: '要证明的目标（字段同 artex_prove_goal）',
+            items: {
+              type: 'object',
+              properties: {
+                goal_id: { type: 'integer', required: true },
+                evidence_id: { type: 'integer', required: true },
+                reason: { type: 'string' },
+                allow_negative: { type: 'boolean' },
+                allow_inferred: { type: 'boolean' },
+              },
+              required: ['goal_id', 'evidence_id'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRole(agent, role, task, ['planner'])
+        liveRuntime(engine, task)
+
+        const lines = []
+
+        // 1. decision：审计句式，写进过程库供事后 trace。
+        if (args.decision && String(args.decision).trim()) {
+          engine.addActivity(engine.liveTask(task.id), {
+            intentId: null,
+            worker: role?.role || 'owner',
+            kind: 'decision',
+            summary: String(args.decision),
+          })
+          lines.push(`决定：${String(args.decision).trim()}`)
+        }
+
+        // 2. todos：整体替换。
+        if (Array.isArray(args.todos)) {
+          const todos = engine.setTodos(task, args.todos)
+          lines.push(`待办 → ${todos.length} 条`)
+        }
+
+        // 3. intents：批量下发（最多 12 条）。
+        if (Array.isArray(args.intents) && args.intents.length > 0) {
+          const capped = args.intents.slice(0, 12)
+          try {
+            const results = await engine.addIntents(task, capped, { notify: role?.role !== 'planner', max: 12 })
+            const created = results.filter(r => r.id > 0)
+            const duplicates = results.filter(r => r.duplicate)
+            const dropped = Math.max(0, args.intents.length - capped.length)
+            lines.push(`意图 → 新建 ${created.length} 条（${created.map(r => `#${r.id}`).join(' ')}）`
+              + (duplicates.length > 0 ? ` 跳重 ${duplicates.length} 条` : '')
+              + (dropped > 0 ? ` 超限裁掉 ${dropped} 条` : ''))
+          } catch (error) {
+            lines.push(`意图 → 段失败：${error?.message || error}`)
+          }
+        }
+
+        // 4. proofs：逐条给证；单条失败继续下一条，同时统计 met 数。
+        if (Array.isArray(args.proofs) && args.proofs.length > 0) {
+          for (const proof of args.proofs) {
+            try {
+              const result = engine.proveGoal(
+                task, proof.goal_id, proof.evidence_id, proof.reason,
+                proof.allow_negative === true,
+                { notify: false, allowInferred: proof.allow_inferred === true },
+              )
+              if (!result.ok) throw new Error(result.error)
+              lines.push(`prove #${proof.goal_id} → ok（证据 ${result.kind}#${proof.evidence_id}${result.allMet ? '，全部 met，将完成' : ''}）`)
+              if (result.allMet) break
+            } catch (error) {
+              lines.push(`prove #${proof.goal_id} → fail：${error?.message || error}`)
+            }
+          }
+        }
+
+        if (lines.length === 0) {
+          return 'plan 为空：给 decision / todos / intents / proofs 至少一段'
+        }
+        return `plan 已落库（任务 #${task.id}，round ${task.round}）：\n- ${lines.join('\n- ')}`
       },
     }),
     artifact({
