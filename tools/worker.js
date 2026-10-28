@@ -4,8 +4,9 @@
 
 import { artifact, describe, integer, resolve, requireRole, liveRuntime } from '../tools-shared.js'
 
-/** worker 只能写回自己领到的意图；所有者可显式指定。 */
+/** worker 只能写回自己领到的意图；verifier 不挂意图（它的 finding.intentId 可能已 done）；所有者可显式指定。 */
 function resolveIntentId(role, args) {
+  if (role?.role === 'verifier') return null
   if (role?.role === 'worker') {
     if (args.intent_id != null && Number(args.intent_id) !== Number(role.intentId)) {
       throw new Error(`worker 只能写回自己领到的意图 #${role.intentId}，不能写 #${args.intent_id}`)
@@ -58,7 +59,8 @@ task 所有者与 worker 可调用。`,
       },
       async execute(args, exec) {
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
-        requireRole(agent, role, task, ['worker'])
+        // verifier 只写复核过程里得出的增量观察（prompt 限定 inferred）；其它角色该用哪组工具看 policy。
+        requireRole(agent, role, task, ['worker', 'verifier'])
         liveRuntime(engine, task)
         const intentId = resolveIntentId(role, args)
         const entries = Array.isArray(args.facts) && args.facts.length > 0
