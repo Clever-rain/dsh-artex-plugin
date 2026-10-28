@@ -963,6 +963,74 @@ try {
     assert.equal(labelsB.length, 0, '关闭时不应触发')
   }
 
+  // N42：verifier 能 record_fact（服务端门禁对齐 policy），且写回不挂意图（finding.intentId 可能已 done）
+  {
+    const task42 = makeTask('t-audit-51')
+    task42.status = 'running'
+    const seen = []
+    const e42 = {
+      roleOf: (id) => (id === 'verifier-sess' ? { role: 'verifier', taskId: task42.id, intentId: 99 } : undefined),
+      resolveTask: async () => task42,
+      liveTask: () => ({ task: task42, finished: false }),
+      recordFacts: async (_task, entries) => { seen.push(...entries); return { facts: entries.map((e, i) => ({ id: i + 1, confidence: e.confidence ?? 'observed' })), duplicates: [] } },
+    }
+    const factTool42 = createTools({ engine: e42, config: DEFAULTS }).find(t => t.name === 'artex_record_fact')
+    const r42 = await factTool42.execute({
+      summary: '复核路径上看到的线索', confidence: 'inferred', outcome: 'inconclusive',
+    }, { agent: { id: 'verifier-sess' } })
+    assert.match(r42.text, /已写回 1 条事实/)
+    assert.equal(seen[0].intentId, null, 'verifier 写回不应挂意图')
+    // verifier 显式传 intent_id 也一样不挂意图（防止把写回绑到已 done 的意图导致拒收）
+    const r42b = await factTool42.execute({ summary: 'y', intent_id: 7 }, { agent: { id: 'verifier-sess' } })
+    assert.match(r42b.text, /已写回 1 条事实/)
+    assert.equal(seen[1].intentId, null, 'verifier 显式传 intent_id 也应被忽略')
+  }
+
+  // N43：冲突节点只允许 fact/finding（goal/intent/hint 不能挂冲突）
+  {
+    const { recordConflict } = await import('../model.js')
+    const task43 = makeTask('t-audit-52')
+    const fa = recordFact(task43, { summary: 'A', outcome: 'found', evidence: 'x' })
+    addHint(task43, 'a hint')
+    assert.equal(recordConflict(task43, { a: task43.goals[0].id, b: fa.id }).ok, false, 'goal 不能进冲突')
+    assert.equal(recordConflict(task43, { a: task43.hints[0].id, b: fa.id }).ok, false, 'hint 不能进冲突')
+    const fb = recordFact(task43, { summary: 'B', outcome: 'found', evidence: 'y' })
+    assert.equal(recordConflict(task43, { a: fa.id, b: fb.id }).ok, true)
+  }
+
+  // N44：真·pause 端到端——运行中 pauseTask，终态 paused 并进磁盘快照
+  {
+    const agent44 = { id: 'owner-n44', session: { header: { cwd: root } } }
+    let n44seq = 0
+    const subagents44 = {
+      list: () => ['spawn'],
+      getProvider: () => ({ capabilities: { agentOptions: true } }),
+      async startActivation(_spec) {
+        const childId = `n44-child-${++n44seq}`
+        const result = new Promise((resolve) => {
+          setTimeout(() => resolve({ output: [{ type: 'text', text: 'late' }], stopReason: 'completed' }), 300)
+        })
+        return { childId, result, dispose: async () => undefined }
+      },
+      async sendMessage() {},
+      interrupt() {},
+    }
+    const e44 = new ArtexEngine({
+      ctx: { subagents: subagents44, get: () => undefined },
+      config: { ...DEFAULTS, indexPath: join(root, 'index44.json'), debounceMs: 10, heartbeatMs: 50, maxRounds: 30, maxWorkers: 1, budgetMs: 30000 },
+      logger: { warn: () => {} },
+    })
+    const rt44 = await e44.startTask({ agent: agent44, goal: 'pause 全链路', description: 'n44', goals: ['目标Y'] })
+    await new Promise(r => setTimeout(r, 120)) // 让 planner/第一轮起来
+    assert.equal(rt44.task.status, 'running')
+    assert.equal(await e44.pauseTask(rt44.task.id, '测试暂停'), true)
+    await rt44.done
+    assert.equal(rt44.task.status, 'paused', '终态应为 paused')
+    const persisted = await e44.loadTask(rt44.task.id)
+    assert.equal(persisted.status, 'paused', '磁盘快照也应是 paused')
+    assert.match(persisted.finishDetail || '', /测试暂停/)
+  }
+
   console.log('OK audit-regressions')
 } finally {
   // 引擎收尾仍是 fire-and-forget 落盘：rm 与后台 flush 赛跑时给几次重试。

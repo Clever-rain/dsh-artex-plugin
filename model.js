@@ -358,8 +358,9 @@ export function recordConflict(task, input) {
   const a = Number(input?.a)
   const b = Number(input?.b)
   const kinds = { a: nodeKind(task, a), b: nodeKind(task, b) }
-  if (!kinds.a || !kinds.b || kinds.a === 'hint' || kinds.b === 'hint' || a === b) {
-    return { ok: false, error: `冲突双方必须是本任务已存在的节点：#${a}(${kinds.a || '不存在'}) ↔ #${b}(${kinds.b || '不存在'})` }
+  const evid = new Set(['fact', 'finding'])
+  if (!evid.has(kinds.a) || !evid.has(kinds.b) || a === b) {
+    return { ok: false, error: `冲突双方必须是本任务里已存在的 fact/finding：#${a}(${kinds.a || '不存在'}) ↔ #${b}(${kinds.b || '不存在'})` }
   }
   task.conflicts = Array.isArray(task.conflicts) ? task.conflicts : []
   if (task.conflicts.length >= MAX_CONFLICTS) task.conflicts.shift()
