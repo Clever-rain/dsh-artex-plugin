@@ -80,12 +80,17 @@ export function formatReport(task) {
     : '- （无）'
   const brief = task.brief?.text?.trim()
   const analysis = task.analysis?.text?.trim()
+  // 撤回/被取代的事实仍留档：报告里点名，免得"事实 N 条"看上去全是有效证据。
+  const retractedCount = task.facts.filter(f => f.retracted === true).length
+  const supersededCount = task.facts.filter(f => f.supersededBy).length
+  const retractedNote = retractedCount > 0 ? `，其中已撤回 ${retractedCount}` : ''
+  const supersededNote = supersededCount > 0 ? `、已被取代 ${supersededCount}` : ''
   return `# ARTEX 任务 ${task.id} 结束：${task.status}（${task.mode || 'objective'} 模式）
 
 - 目标：${task.goal}
 - 描述：${task.description}
 - 用时：${elapsed}s · 规划轮次：${task.round} · 意图状态：${JSON.stringify(stateCount)}
-- 事实 ${task.stats.facts} 条（内存保留 ${task.facts.length}） · 发现 ${task.stats.findings} 个${findingStatusNote} · 资源 ${task.stats.resources} 个 · 过程步骤 ${task.stats.activities} 条${usageLine}${usageBlock}${coverageBlock}${conflictLines}
+- 事实 ${task.stats.facts} 条（内存保留 ${task.facts.length}${retractedNote}${supersededNote}） · 发现 ${task.stats.findings} 个${findingStatusNote} · 资源 ${task.stats.resources} 个 · 过程步骤 ${task.stats.activities} 条${usageLine}${usageBlock}${coverageBlock}${conflictLines}
 
 ## 全局认知（planner brief）
 ${brief ? '```markdown\n' + brief + '\n```' : '（未建立）'}

@@ -342,14 +342,15 @@ export function retractFact(engine, task, input) {
     const rt = engine.runtimeForTask(task)
     const result = graphRetractFact(rt.task, input.fact_id ?? input.factId, input.reason)
     if (!result.ok) throw new Error(result.error)
+    const reopened = Array.isArray(result.reopened) ? result.reopened : []
     engine.addActivity(rt, {
       intentId: result.fact.intentId ?? null,
       worker: input.worker || 'planner',
       kind: 'retract',
-      summary: `撤回 fact #${result.fact.id}${input.reason ? `：${oneLine(input.reason, 120)}` : ''}`,
+      summary: `撤回 fact #${result.fact.id}${reopened.length > 0 ? `，目标 #${reopened.join(' #')} 回退 open` : ''}${input.reason ? `：${oneLine(input.reason, 120)}` : ''}`,
       detail: input.reason || '',
     })
-    engine.pushEvent(rt, { kind: 'fact', summary: `fact #${result.fact.id} 已撤回` })
+    engine.pushEvent(rt, { kind: 'fact', summary: `fact #${result.fact.id} 已撤回${reopened.length > 0 ? `，目标 #${reopened.join(' #')} 需重新证明` : ''}` })
     void engine.persistEvidence?.(rt)
     void engine.persist(rt)
     return result.fact

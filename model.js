@@ -176,6 +176,12 @@ export function normalizeSummaryText(text) {
 /** 事实写回去重的回看窗口（条）：只在近期范围内比对，长任务开销恒定。 */
 export const FACT_DEDUP_WINDOW = 500
 
+/**
+ * brief/analysis 引用上限：保护集无上限时，事实保留量会被顶到 2×MAX_FACTS（N30）。
+ * 200 条足够表达覆盖地图/路径树，超出按最近写入为准。
+ */
+export const MAX_CITATIONS = 200
+
 /** 最近窗口内同文（规范化 summary）的事实，不看结局；用于标注取代关系。 */
 export function findSameSummaryFact(task, summary, ignoreId = 0) {
   const key = normalizeSummaryText(summary)
@@ -261,8 +267,10 @@ function trimCollection(task, key, max) {
   if (!Array.isArray(list) || list.length <= max) return
   const protectedIds = new Set(task.goals.map(g => g.evidence).filter(Boolean))
   // brief/analysis 的 citations 与目标证据同权：否则 trim 后 brief 里的 fact#id 会悬空。
-  for (const id of task.brief?.citations || []) protectedIds.add(id)
-  for (const id of task.analysis?.citations || []) protectedIds.add(id)
+  // 但只认最近 MAX_CITATIONS 条——保护集本身不能无界（N30），旧快照里可能存着上千条。
+  const recentCitations = (list) => (Array.isArray(list) ? list.slice(-MAX_CITATIONS) : [])
+  for (const id of recentCitations(task.brief?.citations)) protectedIds.add(id)
+  for (const id of recentCitations(task.analysis?.citations)) protectedIds.add(id)
   const keep = []
   for (let i = 0; i < list.length; i++) {
     if (i >= list.length - max || protectedIds.has(list[i].id)) keep.push(list[i])
@@ -344,8 +352,20 @@ export function retractFact(task, id, reason) {
   fact.retracted = true
   fact.retractedAt = now()
   fact.retractedReason = reason ? String(reason) : ''
+  // 已经用这条事实证明过的目标必须回退：否则任务可以凭一条被撤回的证据判完成（N33）。
+  const reopened = []
+  for (const goal of task.goals) {
+    if (Number(goal.evidence) !== fact.id) continue
+    goal.status = 'open'
+    goal.retractedEvidence = fact.id
+    goal.evidence = undefined
+    goal.evidenceOutcome = undefined
+    goal.reason = 'evidence_retracted'
+    reopened.push(goal.id)
+  }
+  if (reopened.length > 0) fact.reopenedGoals = reopened
   task.updatedAt = now()
-  return { ok: true, fact }
+  return { ok: true, fact, reopened }
 }
 
 const MAX_CONFLICTS = 200
@@ -413,11 +433,13 @@ function extractCitations(text) {
 export function setBrief(task, text, citations = []) {
   const clean = String(text || '').trim()
   if (!clean) return undefined
+  const body = truncate(clean, 2000)
   task.brief = {
-    text: truncate(clean, 2000),
+    text: body,
     round: task.round,
     updatedAt: now(),
-    citations: normalizeIds([...(Array.isArray(citations) ? citations : []), ...extractCitations(clean)]),
+    // 引用从落库正文里抽：超长正文被截断，抽截断之外的 id 只会让保护集虚增。
+    citations: normalizeIds([...(Array.isArray(citations) ? citations : []), ...extractCitations(body)]).slice(-MAX_CITATIONS),
   }
   task.updatedAt = now()
   return task.brief
@@ -427,11 +449,12 @@ export function setBrief(task, text, citations = []) {
 export function setAnalysis(task, text, citations = []) {
   const clean = String(text || '').trim()
   if (!clean) return undefined
+  const analysisBody = truncate(clean, 2000)
   task.analysis = {
-    text: truncate(clean, 2000),
+    text: analysisBody,
     round: task.round,
     updatedAt: now(),
-    citations: normalizeIds([...(Array.isArray(citations) ? citations : []), ...extractCitations(clean)]),
+    citations: normalizeIds([...(Array.isArray(citations) ? citations : []), ...extractCitations(analysisBody)]).slice(-MAX_CITATIONS),
   }
   task.analysisRuns = (task.analysisRuns || 0) + 1
   task.updatedAt = now()

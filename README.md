@@ -258,7 +258,7 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 
 - **分片持久化**：`task.json` 只存元数据和图状态，facts、findings、activities 分别落在 `facts.jsonl`、`findings.jsonl`、`activity.jsonl`。JSONL 行数超过内存上限两倍时压实，`task.json` 不回写全量集合。
 - **合并写**：运行中的高频改动走 `saveDebounceMs`（默认 500 毫秒）合并落盘；收官、停止、插件卸载时强制 flush。
-- **集合上限**：facts 2000、findings 500、hints 200。淘汰时保留 `goals[].evidence` 指向的节点，回读时同样保留。
+- **集合上限**：facts 2000、findings 500、hints 200；淘汰时保留 `goals[].evidence` 指向的节点，回读时同样保留。brief/analysis 的 citations 最多保留 200 条，所以事实内存保留量的上界是 `2000 + 200`（引用本身也被截到 200，防止保护集无界）。
 - **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd` 和 owner，最多 500 条。换个工作区也能按 id 查到历史任务。
 - **读权限**：默认只有任务所有者和它的子会话能读；跨会话读取要打开 `allowCrossTaskRead: true`。
 - **敏感数据**：`.artex/` 里可能有证据原文，不要提交到公开仓库。任务 id 经过白名单校验，不能拿来路径穿越。
@@ -314,7 +314,9 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 - **预算夹逼**：子会话墙钟恒等于 `min(timeoutMs, 任务剩余预算)`，planner、worker、analyst 一视同仁；任务结束回收持久化层内存状态，启动落盘失败不留孤儿 runtime。
 - worker 命名单调递增跨轮不重名；`activity.jsonl` 单卷超 64MB 轮转为 `activity.1.jsonl`；任务终态回收内存后不再追加 JSONL（避免已落盘 id 集被清空后整批重写）。
 - 写工具（`artex_record_fact` / `artex_add_intent` / `artex_report_finding`）在锚点校验阶段可能**异步拒绝**（校验要读资源图），调用方必须 `await`。
-- 运行状态、usage、settling、降级原因这些字段都写进任务快照/报告（含 goal 的 prove 理由与证据结局），`facts/findings` 的累计真值与内存窗口分开计数并标 `truncated`。
+- **撤回会连带回退目标**：`artex_retract_fact` 之后，凡是拿这条 fact 作证据的 goal 一律回退 `open`、清空 evidence，并在报告里标 `evidence_retracted`；节点本身留档。
+- **恢复会重置轮次额度**：`artex_resume_task` 把 `round` 归零（累加 `resumes`）并解除终态写保护，恢复后产生的事实/发现照常追加 JSONL。
+- 运行状态、usage、settling、降级原因这些字段都写进任务快照/报告（含 goal 的 prove 理由与证据结局），`facts/findings` 的累计真值与内存窗口分开计数并标 `truncated`；被取代/被撤回的事实会在 planner 视图、worker 视图与 digest 里标注。
 - 索引写入用目录锁，锁内合并；`status` 的历史列表只列 owner 自己的任务。
 
 ---

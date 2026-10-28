@@ -311,9 +311,15 @@ export class TaskStore {
    * 任务终态后回收该任务的内存写入状态（promise 链 / 已写 id 集 / 字节计数），
    * 磁盘快照与 JSONL 保留，之后仍可 load 复载（会重建这些条目）。
    */
+  /** 任务被 resume：解除终态短路，之后的证据重新追加 JSONL（N32）。 */
+  reopen(taskId) {
+    this.released.delete(taskId)
+  }
+
   release(taskId) {
     this.released.add(taskId)
-    this.written.delete(taskId)
+    // 保留 written（已落盘 id 集）：它是有界的（≤ MAX_FACTS+MAX_FINDINGS），
+    // 且 reopen 之后 appendNew 靠它做幂等；删掉它会让恢复后的第一次 save 整批重写。
     this.pending.delete(taskId)
     this.paths.delete(taskId)
     this.paths.delete(`${taskId}:activity`)

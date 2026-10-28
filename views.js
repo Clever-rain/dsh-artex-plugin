@@ -96,6 +96,7 @@ export function digestOf(task) {
       truncated: task.stats.facts > task.facts.length || undefined,
       by_outcome: byOutcome,
       retracted: task.facts.filter(f => f.retracted === true).length || undefined,
+      superseded: task.facts.filter(f => f.supersededBy).length || undefined,
     },
     findings: task.stats.findings,
     findings_kept: task.findings.length,
@@ -203,6 +204,10 @@ export function plannerView(task, options = {}) {
         confidence: f.confidence,
         outcome: f.outcome,
         intent_id: f.intentId,
+        // 同文不同结局会并存：不标出来，规划者看到的是两条互相矛盾、没有先后的证据（N31）。
+        superseded_by: f.supersededBy || undefined,
+        supersedes: f.supersedes || undefined,
+        retracted: f.retracted === true || undefined,
       })),
     },
     findings_total: task.stats.findings,
@@ -229,7 +234,10 @@ export function workerView(task, intent, options = {}) {
     goals: task.goals.map(g => `${g.id}.[${g.status}] ${truncate(g.text, 80)}`),
     facts_total: task.stats.facts,
     findings_total: task.stats.findings,
-    facts_recent: task.facts.slice(-factsLimit).reverse().map(f => `#${f.id} [${f.confidence}${f.outcome ? `/${f.outcome}` : ''}] ${truncate(f.summary, 80)}`),
+    facts_recent: task.facts.slice(-factsLimit).reverse().map((f) => {
+      const marks = [f.supersededBy ? `已被 #${f.supersededBy} 取代` : '', f.retracted ? '已撤回' : ''].filter(Boolean).join('，')
+      return `#${f.id} [${f.confidence}${f.outcome ? `/${f.outcome}` : ''}] ${truncate(f.summary, 80)}${marks ? `（${marks}）` : ''}`
+    }),
     findings: task.findings.slice(-8).map(f => `#${f.id} ${truncate(f.title, 60)}`),
   }
   if (intent.pathParent) {

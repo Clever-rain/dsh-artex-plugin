@@ -332,8 +332,13 @@ export class ArtexEngine {
         intent.lastActivityAt = undefined
       }
     }
+    // 轮次额度随恢复重置：因 max_rounds 结束的任务若不重置，恢复后第一轮就空转（N34）。
+    task.resumes = (Number(task.resumes) || 0) + 1
+    task.round = 0
     task.updatedAt = Date.now()
     const stores = this.storeFor(task.cwd)
+    // 解除终态短路：否则恢复后产生的 fact/finding 永远不进 JSONL（N32）。
+    stores.tasks.reopen(task.id)
     const rt = this.makeRuntime(task, agent)
     rt.done = new Promise((resolve) => { rt.doneResolve = resolve })
     this.tasks.set(id, rt)

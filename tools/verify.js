@@ -81,7 +81,9 @@ export function verifyTools({ engine, config }) {
         requireRole(agent, role, task, ['planner'])
         liveRuntime(engine, task)
         const fact = engine.retractFact(task, { fact_id: args.fact_id, reason: args.reason, worker: role?.role || 'owner' })
+        const reopened = Array.isArray(fact.reopenedGoals) ? fact.reopenedGoals : []
         return `fact #${fact.id} 已撤回${args.reason ? `：${args.reason}` : ''}。该节点不能再作 prove_goal 证据。`
+          + (reopened.length > 0 ? `\n受影响目标已回退 open，需用其它证据重新证明：${reopened.map(id => `goal#${id}`).join(' ')}` : '')
       },
     }),
     artifact({

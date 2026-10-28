@@ -7,13 +7,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   createTask, addIntents, claimIntent, recordFact, reportFinding, proveGoal, addHint, setBrief,
-  MAX_FACTS, MAX_FINDINGS, MAX_HINTS,
+  retractFact, MAX_FACTS, MAX_FINDINGS, MAX_HINTS, MAX_CITATIONS,
 } from '../model.js'
 import { addIntents as addIntentsOp, recordFacts, recordFinding, proveGoal as proveGoalOp, promoteIntent as promoteIntentOp } from '../graph-ops.js'
 import { ResourceStore, TaskStore, TaskIndex, isValidTaskId, MAX_ACTIVITY_BYTES } from '../store.js'
 import { ArtexEngine, DEFAULTS } from '../engine.js'
 import { normalizeConfig } from '../config.js'
 import { snapshot } from '../reporting.js'
+import { plannerView, digestOf } from '../views.js'
 import { selectNextIntent, plannerRound, dispatchWorkers, runWorker, finishWorker, checkStalledWorkers } from '../scheduler.js'
 import { plannerPrompt } from '../prompts.js'
 import { createTools } from '../tools.js'
@@ -1030,6 +1031,56 @@ try {
     assert.equal(persisted.status, 'paused', '磁盘快照也应是 paused')
     assert.match(persisted.finishDetail || '', /测试暂停/)
   }
+
+  // N32：release 之后必须 reopen 才能继续追加；reopen 后重复 save 不得整批重写
+  const t35 = makeTask('t-audit-35')
+  recordFact(t35, { summary: 'before release', confidence: 'observed', outcome: 'found', evidence: 'echo a' })
+  const s35 = new TaskStore(root)
+  const f35 = join(root, '.artex', 'tasks', 't-audit-35', 'facts.jsonl')
+  const n35 = () => (existsSync(f35) ? readFileSync(f35, 'utf8').trim().split('\n').filter(Boolean).length : 0)
+  await s35.save(t35)
+  s35.release(t35.id)
+  recordFact(t35, { summary: 'while released', confidence: 'observed', outcome: 'found', evidence: 'echo b' })
+  await s35.appendEvidence(t35)
+  assert.equal(n35(), 1, 'release 期间不得追加')
+  s35.reopen(t35.id)
+  await s35.save(t35)
+  assert.equal(n35(), 2, 'reopen 后只补追加新事实，不得整批重写')
+  await s35.save(t35)
+  assert.equal(n35(), 2, 'reopen 后重复 save 必须幂等')
+  const loaded35 = await s35.load(t35.id)
+  assert.equal(loaded35.facts.length, 2, '恢复后的事实要能被 load 回来')
+
+  // N33：撤回事实必须回退以它为证据的目标
+  const t36 = makeTask('t-audit-36')
+  const f36 = recordFact(t36, { summary: 'wrong conclusion', confidence: 'observed', outcome: 'found', evidence: 'echo x' })
+  const g36 = t36.goals[0]
+  assert.equal(proveGoal(t36, g36.id, f36.id, 'prove').ok, true)
+  assert.equal(g36.status, 'met')
+  const r36 = retractFact(t36, f36.id, '误判')
+  assert.equal(r36.ok, true)
+  assert.equal(g36.status, 'open', '撤回后目标必须回退')
+  assert.equal(g36.evidence, undefined)
+  assert.deepEqual(f36.reopenedGoals, [g36.id])
+  assert.equal(t36.goals.some(g => g.status === 'met'), false)
+
+  // N30：citations 有上限，事实保留量有界
+  const t37 = makeTask('t-audit-37')
+  setBrief(t37, Array.from({ length: MAX_CITATIONS + 50 }, (_, i) => `#${i + 1}`).join(' '))
+  assert.equal(t37.brief.citations.length, MAX_CITATIONS)
+  for (let i = 0; i < MAX_FACTS + 300; i += 1) recordFact(t37, { summary: `cap ${i}`, confidence: 'observed' })
+  assert.ok(t37.facts.length <= MAX_FACTS + MAX_CITATIONS, `facts=${t37.facts.length} 超出有界上界`)
+
+  // N31：取代关系必须出现在规划者视图里
+  const t38 = makeTask('t-audit-38')
+  addIntents(t38, [{ summary: 'render work' }])
+  claimIntent(t38, t38.intents[0].id, 'work#1')
+  const e38 = n1EngineFor(t38)
+  const old38 = await recordFacts(e38, t38, [{ summary: 'same text', outcome: 'none', evidence: 'denied' }], t38.intents[0].id)
+  const new38 = await recordFacts(e38, t38, [{ summary: 'same text', outcome: 'found', evidence: 'ok' }], t38.intents[0].id)
+  const v38 = plannerView(t38, { factsLimit: 10, digest: digestOf(t38), delta: {}, staleBrief: false })
+  assert.equal(v38.facts.recent.find(r => r.id === old38.facts[0].id).superseded_by, new38.facts[0].id)
+  assert.equal(v38.facts.recent.find(r => r.id === new38.facts[0].id).supersedes, old38.facts[0].id)
 
   console.log('OK audit-regressions')
 } finally {
