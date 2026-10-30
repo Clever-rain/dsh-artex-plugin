@@ -61,22 +61,24 @@ export function apply(ctx, config = {}) {
   )))
 
   // 人类命令 /artex on|off|status：命令行进会话日志（command/run 含参数），即切换的可见标记。
-  ctx.effect(() => {
-    const commands = ctx.get?.('commands')
-    if (!commands || typeof commands.register !== 'function') return undefined
-    return commands.register(createArtexCommand({ engine, flags }))
+  // 可选服务必须用 ctx.inject 等它就位——apply 时 ctx.get 可能拿不到（服务未起），
+  // 静默缺路由/缺命令的故障已在真实重启中发生过一次。
+  ctx.inject(['commands'], (commandsCtx) => {
+    const commands = commandsCtx.commands
+    if (!commands || typeof commands.register !== 'function') return
+    commandsCtx.effect(() => commands.register(createArtexCommand({ engine, flags })))
   })
 
   // 浏览器半边的数据通道：/api/artex（开关 chip + 会话行徽章轮询 state、点按 setEnabled）。
-  ctx.effect(() => {
-    const webServer = ctx.get?.('webServer')
-    if (!webServer || typeof webServer.register !== 'function') return undefined
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = webCtx.webServer
+    if (!webServer || typeof webServer.register !== 'function') return
     const dispatch = createArtexHttpDispatch({ viewApi, flags })
-    return webServer.register({
+    webCtx.effect(() => webServer.register({
       kind: 'exact',
       path: '/api/artex',
       handler: (req, res) => void handleArtexRequest(req, res, dispatch),
-    })
+    }))
   })
 
   // 工具是全局注册的；角色边界由 execute 内的会话身份校验 + 子会话 toolFilter 双重保证。

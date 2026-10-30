@@ -184,26 +184,32 @@ window.__ModuleLoader__.load({
           gap: '4px',
           height: '24px',
           padding: '0 8px',
-          border: '1px solid ' + (enabled ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l2)'),
+          // 错误态必须一眼可辨（红色描边 + ↻）：静默失败曾是真实投诉（路由没注册时点击像装死）。
+          border: '1px solid ' + (state.error
+            ? 'var(--dsw-alias-state-error-primary)'
+            : (enabled ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l2)')),
           borderRadius: '999px',
-          background: enabled ? 'var(--dsw-alias-bg-layer-1)' : 'var(--dsw-alias-bg-layer-2)',
-          color: enabled ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-tertiary)',
+          background: 'var(--dsw-alias-bg-layer-1)',
+          color: state.error
+            ? 'var(--dsw-alias-state-error-primary)'
+            : (enabled ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-tertiary)'),
           fontSize: '12px',
           lineHeight: '22px',
           cursor: 'pointer',
           whiteSpace: 'nowrap',
-          opacity: state.error ? 0.6 : 1,
         },
       },
-        h('span', { 'aria-hidden': true, style: { fontSize: '12px', lineHeight: '22px' } }, '🧭'),
+        h('span', { 'aria-hidden': true, style: { fontSize: '12px', lineHeight: '22px' } }, state.error ? '↻' : '🧭'),
         h('span', null, tr('chip.label')),
-        h('span', {
-          style: {
-            fontSize: '11px',
-            fontVariantNumeric: 'tabular-nums',
-            color: enabled ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-caption)',
-          },
-        }, enabled ? tr('chip.on') : tr('chip.off')),
+        state.error
+          ? null
+          : h('span', {
+              style: {
+                fontSize: '11px',
+                fontVariantNumeric: 'tabular-nums',
+                color: enabled ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-caption)',
+              },
+            }, enabled ? tr('chip.on') : tr('chip.off')),
         liveCount > 0
           ? h('span', {
               style: {

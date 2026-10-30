@@ -1198,6 +1198,16 @@ try {
     assert.equal((await dispatch49({ op: 'hack', sessionId: 'sess-x' })).ok, false)
   }
 
+  // N50：可选服务（commands/webServer）必须走 ctx.inject 等就位——apply 时 ctx.get
+  // 是启动顺序竞态（真实事故：重启后路由/命令静默缺席，chip 点击装死）。
+  {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    assert.match(source, /ctx\.inject\(\['commands'\]/, 'commands 必须经 ctx.inject 注册')
+    assert.match(source, /ctx\.inject\(\['webServer'\]/, 'webServer 必须经 ctx.inject 注册')
+    assert.equal(source.includes("ctx.get?.('webServer')"), false, '禁止 apply 时 ctx.get webServer（启动竞态）')
+    assert.equal(source.includes("ctx.get?.('commands')"), false, '禁止 apply 时 ctx.get commands（启动竞态）')
+  }
+
   console.log('OK audit-regressions')
 } finally {
   // 引擎收尾仍是 fire-and-forget 落盘：rm 与后台 flush 赛跑时给几次重试。
