@@ -19,6 +19,10 @@ import { selectNextIntent, plannerRound, dispatchWorkers, runWorker, finishWorke
 import { plannerPrompt } from '../prompts.js'
 import { createTools } from '../tools.js'
 import { normalizeStopReason } from '../util.js'
+import { artexGateReason, createSessionFlags } from '../flags.js'
+import { createArtexCommand } from '../command.js'
+import { createArtexHttpDispatch } from '../http-api.js'
+import { artifact } from '../tools-shared.js'
 
 /** 通用引擎 stub：只含 graph-ops/finishWorker 真正触达的方法。 */
 const n1EngineFor = (task) => ({
@@ -1081,6 +1085,118 @@ try {
   const v38 = plannerView(t38, { factsLimit: 10, digest: digestOf(t38), delta: {}, staleBrief: false })
   assert.equal(v38.facts.recent.find(r => r.id === old38.facts[0].id).superseded_by, new38.facts[0].id)
   assert.equal(v38.facts.recent.find(r => r.id === new38.facts[0].id).supersedes, old38.facts[0].id)
+
+  // N45：会话开关存储——默认开、显式关持久化、重开文件仍是关、重新开后移除记录、坏文件容错
+  {
+    const flagsPath = join(root, 'flags-n45.json')
+    const f45 = createSessionFlags({ filePath: flagsPath })
+    assert.equal(f45.isEnabled('s-1'), true, '缺省应为启用')
+    f45.set('s-1', false)
+    assert.equal(f45.isEnabled('s-1'), false)
+    f45.flush()
+    const f45b = createSessionFlags({ filePath: flagsPath })
+    assert.equal(f45b.isEnabled('s-1'), false, '重启后仍应为停用')
+    assert.equal(f45b.isEnabled('s-2'), true, '别的会话不受影响')
+    f45b.set('s-1', true)
+    f45b.flush()
+    const f45c = createSessionFlags({ filePath: flagsPath })
+    assert.equal(f45c.isEnabled('s-1'), true, '重新启用后记录应移除')
+    writeFileSync(flagsPath, '{broken json', 'utf8')
+    const f45d = createSessionFlags({ filePath: flagsPath })
+    assert.equal(f45d.isEnabled('s-9'), true, '损坏文件容错为默认全开')
+  }
+
+  // N46：tools.guard 判定——只拦 artex_*，只在显式关闭时拦
+  {
+    assert.equal(artexGateReason('artex_run_task', true), undefined)
+    assert.equal(artexGateReason('pwsh', false), undefined, '非 artex 工具不受门禁影响')
+    const reason = artexGateReason('artex_run_task', false)
+    assert.match(reason, /\/artex on/, '拒绝原因应指出重新启用的方式')
+    assert.equal(artexGateReason('artex_task_status', undefined), undefined, '缺省按启用处理')
+  }
+
+  // N47：/artex 命令——status/on/off/未知参数；状态统计只数本会话
+  {
+    const flags47 = createSessionFlags({ filePath: join(root, 'flags-n47.json') })
+    const engine47 = {
+      tasks: new Map([
+        ['t-1', { task: { ownerSession: 'sess-a', status: 'running' }, finished: false }],
+        ['t-2', { task: { ownerSession: 'sess-a', status: 'completed' }, finished: true }],
+        ['t-3', { task: { ownerSession: 'sess-b', status: 'running' }, finished: false }],
+      ]),
+    }
+    const command47 = createArtexCommand({ engine: engine47, flags: flags47 })
+    const call = (raw, agent = { id: 'sess-a' }) => command47.handler({ agent, rawInput: raw })
+    const st = await call('')
+    assert.equal(st.kind, 'success')
+    assert.match(st.text, /已启用/)
+    assert.match(st.text, /running ×1/, '只统计本会话 sess-a 的运行任务')
+    assert.match(st.text, /completed ×1/)
+    const off = await call(' off ')
+    assert.equal(off.kind, 'success')
+    assert.equal(flags47.isEnabled('sess-a'), false)
+    assert.match(off.text, /不受影响/, 'off 文案应说明运行中任务不受影响')
+    const st2 = await call('status')
+    assert.match(st2.text, /已停用/)
+    const on = await call('ON')
+    assert.equal(on.kind, 'success')
+    assert.equal(flags47.isEnabled('sess-a'), true)
+    const bad = await call('explode')
+    assert.equal(bad.kind, 'error')
+    assert.match(bad.text, /未知参数/)
+    const noAgent = await command47.handler({ agent: {}, rawInput: 'off' })
+    assert.equal(noAgent.kind, 'error', '缺会话 id 必须报错而不是写到空键')
+  }
+
+  // N48：presenter 卡片——全部 artex_* 标题带 🧭 前缀；23 个工具都有中文标签（不回退裸名）
+  {
+    const names = createTools({ engine: { roleOf: () => undefined }, config: DEFAULTS }).map(t => t.name)
+    assert.equal(names.length, 23)
+    for (const name of names) {
+      const def = artifact({ name, description: 'x', parameters: { type: 'object' }, execute: async () => '' })
+      const view = def.presentCall({ goal: 'g' })
+      assert.match(view.title, /^🧭 /, `${name} 的卡片应有 🧭 前缀`)
+      assert.ok(!view.title.includes(name), `${name} 应映射到中文标签而不是裸名`)
+    }
+    const done = artifact({ name: 'artex_stop_task', description: 'x', parameters: { type: 'object' }, execute: async () => '' })
+    assert.match(done.presentResult({ task_id: 't-1' }, { isError: false }).title, /^🧭 .*完成/)
+    assert.match(done.presentResult({ task_id: 't-1' }, { isError: true }).title, /失败/)
+  }
+
+  // N49：/api/artex 派发——state 返回轻量任务摘要、setEnabled 校验与落盘、错误路径
+  {
+    const flags49 = createSessionFlags({ filePath: join(root, 'flags-n49.json') })
+    const viewApi49 = {
+      async listTasks({ sessionId }) {
+        if (sessionId === 'sess-x') {
+          return [
+            { task: { id: 'tm-1', description: '审计任务', status: 'running', createdAt: 171 }, live: true, settling: false },
+            { task: { id: 'tm-2', goal: '旧任务', status: 'completed', createdAt: 100 }, live: false },
+          ]
+        }
+        return []
+      },
+    }
+    const dispatch49 = createArtexHttpDispatch({ viewApi: viewApi49, flags: flags49 })
+    const state = await dispatch49({ op: 'state', sessionId: 'sess-x' })
+    assert.equal(state.ok, true)
+    assert.equal(state.enabled, true)
+    assert.equal(state.tasks.length, 2)
+    assert.deepEqual(
+      Object.keys(state.tasks[0]).sort(),
+      ['createdAt', 'description', 'id', 'live', 'settling', 'status'],
+      '摘要只含轮询友好的轻量字段',
+    )
+    assert.equal(state.tasks[1].description, '旧任务', 'description 缺失时回退 goal')
+    assert.equal((await dispatch49({ op: 'state' })).ok, false, '缺 sessionId 应报错')
+    assert.equal((await dispatch49({ op: 'setEnabled', sessionId: 'sess-x', enabled: 'no' })).ok, false, 'enabled 必须 boolean')
+    const off = await dispatch49({ op: 'setEnabled', sessionId: 'sess-x', enabled: false })
+    assert.deepEqual(off, { ok: true, enabled: false })
+    flags49.flush()
+    assert.equal(createSessionFlags({ filePath: join(root, 'flags-n49.json') }).isEnabled('sess-x'), false, 'chip 的切换与 /artex 命令共用同一份持久状态')
+    assert.equal((await dispatch49({ op: 'state', sessionId: 'sess-x' })).enabled, false)
+    assert.equal((await dispatch49({ op: 'hack', sessionId: 'sess-x' })).ok, false)
+  }
 
   console.log('OK audit-regressions')
 } finally {

@@ -158,7 +158,17 @@ max_workers: 3
 
 ## 4.0.3 P2：暂不实现
 
-UI client 插件、报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；UI/导出/分发看后续真有消费方再排。
+报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；导出/分发看后续真有消费方再排。（UI client 已由 §4.0.4 的开关 chip / 会话行徽章与 @local/dsh-artex-view 会话视图落地。）
+
+## 4.0.4 会话级开关与调用标识
+
+「这个会话用没用 ARTEX」从隐式变显式，分三层：
+
+- **开关**：会话里输入 `/artex on | off | status`（人类命令，不进模型上下文；`command/run` 连参数落在会话日志里，命令行本身就是切换的可见标记），或点输入框左侧的 **🧭 ARTEX chip**（client 半边，与命令共用同一份状态）。off 之后本会话发起的 `artex_*` 调用一律被 `tools.guard` 拦截并提示如何重开；**运行中的任务不受影响**（它们的写回来自子会话，子会话有自己的会话 id，默认开）。状态持久化在 profile 级 `~/.dsh/artex-session-flags.json`（默认开，装了插件即可用，向后兼容；文件损坏容错为全开）。
+- **标识**：23 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
+- **数据通道**：`/api/artex`（POST，只收本机回环来源）——`state {sessionId, cwd?}` 返回 `{enabled, tasks: 轻量摘要[]}`，`setEnabled {sessionId, enabled}` 切换开关；插件自己的 client 半边与任何本地消费方都可用。
+
+硬摘 schema（`tools.restrict` 按会话隐藏 23 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
 
 **配置**（写在 `cordis.patch.yml` 的 config 里，装好之后也可以再改）：
 
@@ -261,6 +271,12 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 - **集合上限**：facts 2000、findings 500、hints 200；淘汰时保留 `goals[].evidence` 指向的节点，回读时同样保留。brief/analysis 的 citations 最多保留 200 条，所以事实内存保留量的上界是 `2000 + 200`（引用本身也被截到 200，防止保护集无界）。
 - **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd` 和 owner，最多 500 条。换个工作区也能按 id 查到历史任务。
 - **读权限**：默认只有任务所有者和它的子会话能读；跨会话读取要打开 `allowCrossTaskRead: true`。
+- **只读 Host Service `artex`**：`view-api.js` 对外暴露 `ctx.provide('artex', api)`，供
+  `@local/dsh-artex-view` 一类视图插件读取：`listTasks({ sessionId, limit })` 返回该会话
+  拥有的任务（live + 磁盘索引，磁盘任务只读 `task.json` 元数据）；`taskSnapshot({ taskId,
+  sessionId })` 返回 `{ task, resources, resources_total, live, settling }`，磁盘任务复用
+  `engine.loadTask()` 合并 JSONL。方法只读、不落盘、不改引擎状态，鉴权口径与
+  `tools/read.js` 一致。视图插件再用 HTTP 路由把裁剪后的图/覆盖载荷推给浏览器。
 - **敏感数据**：`.artex/` 里可能有证据原文，不要提交到公开仓库。任务 id 经过白名单校验，不能拿来路径穿越。
 
 ## 4.4 架构分层
@@ -282,6 +298,7 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 | `model.js` | 领域模型：goal / intent / fact / finding / brief / analysis |
 | `views.js` | 角色视图与查询：overview / plannerView / workerView / digest / delta / trace |
 | `store.js` | 资源图、任务快照、全局索引 |
+| `view-api.js` | 只读 Host Service `artex`：任务列表 / 任务快照（供视图插件） |
 | `prompts.js` | planner / worker / analyst 提示词 |
 | `report.js` | 最终报告渲染 |
 | `tools.js` | 23 个模型工具的组合入口 |

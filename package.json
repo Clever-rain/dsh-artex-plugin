@@ -10,11 +10,13 @@
   },
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "client.js",
     "engine.js",
     "graph-ops.js",
     "reporting.js",
@@ -23,12 +25,17 @@
     "runner.js",
     "scheduler.js",
     "analyst.js",
+    "verifier.js",
     "usage.js",
     "util.js",
     "graph.js",
     "model.js",
     "views.js",
     "store.js",
+    "view-api.js",
+    "flags.js",
+    "command.js",
+    "http-api.js",
     "prompts.js",
     "tools.js",
     "tools-shared.js",
@@ -42,12 +49,21 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs && node test/audit-regressions-smoke.mjs",
+    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs && node test/audit-regressions-smoke.mjs && node test/view-api-smoke.mjs",
     "bench": "node test/prompt-size.mjs"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   }
 }

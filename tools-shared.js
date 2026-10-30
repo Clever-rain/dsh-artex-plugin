@@ -58,6 +58,7 @@ const TOOL_LABELS = {
   artex_start_task: 'ARTEX 后台任务',
   artex_task_status: 'ARTEX 状态',
   artex_stop_task: 'ARTEX 停止',
+  artex_resume_task: 'ARTEX 恢复任务',
   artex_add_hint: 'ARTEX 提示',
   artex_graph_overview: 'ARTEX 态势',
   artex_node_detail: 'ARTEX 节点',
@@ -66,12 +67,20 @@ const TOOL_LABELS = {
   artex_promote_intent: 'ARTEX 提升意图',
   artex_set_brief: 'ARTEX brief',
   artex_prove_goal: 'ARTEX 证明目标',
+  artex_plan: 'ARTEX 计划',
   artex_set_todos: 'ARTEX 待办',
   artex_record_fact: 'ARTEX 事实',
   artex_report_finding: 'ARTEX 发现',
   artex_add_resource: 'ARTEX 资源',
   artex_set_analysis: 'ARTEX 分析',
+  artex_retest_finding: 'ARTEX 复测',
+  artex_record_conflict: 'ARTEX 冲突',
+  artex_retract_fact: 'ARTEX 撤回事实',
+  artex_coverage_report: 'ARTEX 覆盖',
 }
+
+/** 时间线上一眼可辨：所有 artex_* 卡片统一带 🧭 前缀。 */
+const labelFor = (name) => `🧭 ${TOOL_LABELS[name] || name}`
 
 const TOOL_KINDS = {
   artex_run_task: 'execute',
@@ -111,7 +120,7 @@ export function artifact({ name, description, parameters, execute, concurrent = 
       return { text: String(text ?? '') }
     },
     presentCall(args = {}) {
-      const label = TOOL_LABELS[name] || name
+      const label = labelFor(name)
       const detail = callDetail(args)
       return {
         card: 'generic',
@@ -120,7 +129,7 @@ export function artifact({ name, description, parameters, execute, concurrent = 
       }
     },
     presentResult(args = {}, result) {
-      const label = TOOL_LABELS[name] || name
+      const label = labelFor(name)
       const detail = callDetail(args)
       const state = result?.isError ? '失败' : '完成'
       return {

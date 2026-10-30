@@ -124,6 +124,23 @@ export class ResourceStore {
       .map(x => ({ id: x.id, type: x.type, name: x.name, attrs: x.attrs }))
   }
 
+  /**
+   * 只读：与本任务相关的资源（按资源库自身的归属信息过滤）。
+   * 归属规则：tasks 含 taskId || updatedBy === taskId || attrsByTask[taskId]。
+   * 任务里 facts/findings/intents 的 resourceIds 引用补充由调用方（view-api）做。
+   * 会先 await load()，返回原始 items 项（不裁剪字段）。
+   */
+  async itemsForTask(taskId) {
+    await this.load()
+    const id = String(taskId)
+    return this.items.filter((item) => {
+      if (!item || typeof item !== 'object') return false
+      if (Array.isArray(item.tasks) && item.tasks.map(String).includes(id)) return true
+      if (item.updatedBy !== undefined && item.updatedBy !== null && String(item.updatedBy) === id) return true
+      return Boolean(item.attrsByTask && typeof item.attrsByTask === 'object' && Object.hasOwn(item.attrsByTask, id))
+    })
+  }
+
   save() {
     const payload = JSON.stringify({ counter: this.counter, items: this.items })
     this.saving = this.saving.then(async () => {
@@ -157,6 +174,39 @@ function keepWithEvidence(items, max, evidenceIds) {
     if (evidenceIds.has(item.id)) kept.set(item.id, item)
   }
   return [...kept.values()].sort((a, b) => a.id - b.id)
+}
+
+/** 任务列表页只需要的数组字段：缺省补空数组，避免视图侧到处判空。 */
+const META_ARRAYS = ['goals', 'intents', 'facts', 'findings', 'hints', 'todos', 'conflicts']
+
+/**
+ * 列表用的最小规范化：只保证视图形需要的字段存在（不读 JSONL、不重算计数）。
+ * 完整字段仍以任务快照为准，未知字段原样保留。
+ */
+function normalizeTaskMeta(raw, fallback = {}) {
+  const meta = { ...raw }
+  meta.id = String(raw.id || fallback.id || '')
+  for (const key of META_ARRAYS) {
+    if (!Array.isArray(meta[key])) meta[key] = []
+  }
+  const stats = meta.stats && typeof meta.stats === 'object' ? meta.stats : {}
+  meta.stats = {
+    intents: Number(stats.intents) || 0,
+    facts: Number(stats.facts) || 0,
+    findings: Number(stats.findings) || 0,
+    hints: Number(stats.hints) || 0,
+    resources: Number(stats.resources) || 0,
+    activities: Number(stats.activities) || 0,
+  }
+  if (typeof meta.status !== 'string' || !meta.status) meta.status = 'unknown'
+  if (typeof meta.mode !== 'string' || !meta.mode) meta.mode = 'objective'
+  if (typeof meta.description !== 'string' || !meta.description) meta.description = '未命名任务'
+  if (typeof meta.goal !== 'string') meta.goal = ''
+  meta.ownerSession = meta.ownerSession ?? fallback.ownerSession ?? null
+  meta.cwd = meta.cwd || fallback.cwd
+  meta.createdAt = Number(meta.createdAt) || Number(fallback.createdAt) || 0
+  meta.updatedAt = Number(meta.updatedAt) || meta.createdAt
+  return meta
 }
 
 export class TaskStore {
@@ -447,6 +497,25 @@ export class TaskStore {
       }
     }
     return raw
+  }
+
+  /**
+   * 只读任务元数据：仅解析 task.json，不加载 facts/findings/activity JSONL。
+   * 任务列表页用（避免为每个任务付 JSONL 读放大）；需要完整数据请用 load()。
+   * 任务不存在（ENOENT）返回 undefined。
+   */
+  async loadMeta(taskId) {
+    const id = String(taskId)
+    if (!isValidTaskId(id)) return undefined
+    let raw
+    try {
+      raw = JSON.parse(await readFile(this.pathOf(id), 'utf8'))
+    } catch (error) {
+      if (error?.code === 'ENOENT') return undefined
+      throw error
+    }
+    if (!raw || typeof raw !== 'object') throw new Error('task snapshot 损坏')
+    return normalizeTaskMeta(raw, { cwd: this.cwd, createdAt: 0 })
   }
 
   /** Task ids present on disk (newest first), for status queries after a restart. */
