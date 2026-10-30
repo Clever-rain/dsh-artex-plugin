@@ -217,6 +217,8 @@ export class TaskStore {
     this.pending = new Map()
     this.written = new Map()
     this.activityBytes = new Map()
+    /** task.json 元数据缓存：id → { mtimeMs, meta }（N37） */
+    this.metaCache = new Map()
     // 已终态回收的任务：快照还得能更新，但 JSONL 不再追加（written 已释放，重放会整批重写，N27）
     this.released = new Set()
     this.onError = options.onError
@@ -507,15 +509,26 @@ export class TaskStore {
   async loadMeta(taskId) {
     const id = String(taskId)
     if (!isValidTaskId(id)) return undefined
-    let raw
+    const path = this.pathOf(id)
+    // mtime 命中就不重新解析（N37）：轮询式列表对同一批任务会反复读同一个 task.json。
+    let stamp
     try {
-      raw = JSON.parse(await readFile(this.pathOf(id), 'utf8'))
+      stamp = (await stat(path)).mtimeMs
     } catch (error) {
       if (error?.code === 'ENOENT') return undefined
       throw error
     }
+    const cached = this.metaCache.get(id)
+    if (cached && cached.mtimeMs === stamp) return cached.meta
+    let raw = JSON.parse(await readFile(path, 'utf8'))
     if (!raw || typeof raw !== 'object') throw new Error('task snapshot 损坏')
-    return normalizeTaskMeta(raw, { cwd: this.cwd, createdAt: 0 })
+    const meta = normalizeTaskMeta(raw, { cwd: this.cwd, createdAt: 0 })
+    this.metaCache.set(id, { mtimeMs: stamp, meta })
+    if (this.metaCache.size > 512) {
+      const oldest = this.metaCache.keys().next().value
+      if (oldest !== undefined) this.metaCache.delete(oldest)
+    }
+    return meta
   }
 
   /** Task ids present on disk (newest first), for status queries after a restart. */

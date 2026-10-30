@@ -33,6 +33,9 @@ import { finishIntent } from './graph.js'
 
 export { DEFAULTS } from './config.js'
 
+/** 按 cwd 缓存的 workspace store 上限（N36）：超出后按 LRU 淘汰，避开有活任务/待写内容的条目。 */
+export const MAX_CACHED_STORES = 32
+
 
 /** 任务模式优先级：任务参数 > 插件配置 > objective。 */
 export function resolveTaskMode(taskMode, configMode) {
@@ -79,14 +82,32 @@ export class ArtexEngine {
 
   storeFor(cwd) {
     let entry = this.stores.get(cwd)
-    if (!entry) {
-      entry = {
-        tasks: new TaskStore(cwd, { onError: (error) => this.logger.warn?.(`[artex] snapshot save failed: ${error?.message || error}`) }),
-        resources: new ResourceStore(cwd),
-      }
+    if (entry) {
+      // LRU 触碰：命中后移到队尾，淘汰时从队首挑（N36）。
+      this.stores.delete(cwd)
       this.stores.set(cwd, entry)
+      return entry
     }
+    entry = {
+      tasks: new TaskStore(cwd, { onError: (error) => this.logger.warn?.(`[artex] snapshot save failed: ${error?.message || error}`) }),
+      resources: new ResourceStore(cwd),
+    }
+    this.stores.set(cwd, entry)
+    if (this.stores.size > MAX_CACHED_STORES) this.evictStore()
     return entry
+  }
+
+  /** 淘汰一个不再需要的 workspace store：跳过有活任务或有待写内容的，避免丢现场。 */
+  evictStore() {
+    const liveCwds = new Set()
+    for (const rt of this.tasks.values()) if (rt?.task?.cwd) liveCwds.add(rt.task.cwd)
+    for (const [key, candidate] of this.stores) {
+      if (liveCwds.has(key)) continue
+      if (candidate?.tasks?.pending && candidate.tasks.pending.size > 0) continue
+      this.stores.delete(key)
+      return true
+    }
+    return false
   }
 
   async cwdFor(agent, signal) {

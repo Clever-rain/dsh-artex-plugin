@@ -140,7 +140,18 @@ export function createViewApi(engine) {
         try {
           const store = engine.storeFor(root).tasks
           const ids = await store.ids()
-          const scanned = await Promise.all(ids.map(taskId => store.loadMeta(taskId).catch(() => undefined)))
+          // 先按索引署名过滤（N37）：索引已经写明属于别的会话的目录不必读 task.json；
+          // 只有"索引里没有/没有 ownerSession"的才回退到读快照判定。
+          const candidates = ids.filter((taskId) => {
+            const key = String(taskId)
+            if (seen.has(key) || !isValidTaskId(key)) return false
+            const entry = items[key]
+            if (entry && entry.ownerSession !== undefined && entry.ownerSession !== null) {
+              return sameSession(entry.ownerSession, sessionId)
+            }
+            return true
+          })
+          const scanned = await Promise.all(candidates.map(taskId => store.loadMeta(taskId).catch(() => undefined)))
           for (const meta of scanned) {
             if (!meta || !isValidTaskId(String(meta.id)) || seen.has(String(meta.id))) continue
             if (!sameSession(meta.ownerSession, sessionId)) continue

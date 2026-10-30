@@ -23,7 +23,13 @@ function cleanPath(value) {
   if (typeof value !== 'string') return ''
   const text = value.trim()
   if (text.length === 0 || text.length > 1000) return ''
-  if (/[\u0000\r\n]/.test(text)) return ''
+  // 控制字符直接按码位判定，避免正则里再嵌转义
+  for (const ch of text) {
+    const code = ch.charCodeAt(0)
+    if (code === 0 || code === 10 || code === 13) return ''
+  }
+  // 只接受绝对路径（盘符 / UNC / POSIX 根）：相对串与任意 token 不值得建 workspace store（N36）。
+  if (!/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(text)) return ''
   return text
 }
 

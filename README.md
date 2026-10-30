@@ -331,6 +331,9 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 - **预算夹逼**：子会话墙钟恒等于 `min(timeoutMs, 任务剩余预算)`，planner、worker、analyst 一视同仁；任务结束回收持久化层内存状态，启动落盘失败不留孤儿 runtime。
 - worker 命名单调递增跨轮不重名；`activity.jsonl` 单卷超 64MB 轮转为 `activity.1.jsonl`；任务终态回收内存后不再追加 JSONL（避免已落盘 id 集被清空后整批重写）。
 - 写工具（`artex_record_fact` / `artex_add_intent` / `artex_report_finding`）在锚点校验阶段可能**异步拒绝**（校验要读资源图），调用方必须 `await`。
+- **`/api/artex` 来源校验**：回环地址只是必要条件——Host 必须是 `localhost`/`127.0.0.1`/`[::1]`（挡 DNS rebinding），Origin 缺省、`app:` 或与 Host 同源（含回环别名与端口漂移）才放行；跨站页面拿不到响应也发不出写请求。
+- **workspace store 有上限**：按 cwd 缓存的 store 最多 32 个（LRU），有活任务或有待写内容的条目不淘汰；HTTP 的 `cwd` 只接受绝对路径。
+- **列表不再按工作区总量读盘**：先按索引里的 `ownerSession` 过滤，只有索引缺失的才回退读 task.json；`loadMeta` 按 mtime 缓存。
 - **撤回会连带回退目标**：`artex_retract_fact` 之后，凡是拿这条 fact 作证据的 goal 一律回退 `open`、清空 evidence，并在报告里标 `evidence_retracted`；节点本身留档。
 - **恢复会重置轮次额度**：`artex_resume_task` 把 `round` 归零（累加 `resumes`）并解除终态写保护，恢复后产生的事实/发现照常追加 JSONL。
 - 运行状态、usage、settling、降级原因这些字段都写进任务快照/报告（含 goal 的 prove 理由与证据结局），`facts/findings` 的累计真值与内存窗口分开计数并标 `truncated`；被取代/被撤回的事实会在 planner 视图、worker 视图与 digest 里标注。

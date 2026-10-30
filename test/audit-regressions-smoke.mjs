@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -11,7 +11,8 @@ import {
 } from '../model.js'
 import { addIntents as addIntentsOp, recordFacts, recordFinding, proveGoal as proveGoalOp, promoteIntent as promoteIntentOp } from '../graph-ops.js'
 import { ResourceStore, TaskStore, TaskIndex, isValidTaskId, MAX_ACTIVITY_BYTES } from '../store.js'
-import { ArtexEngine, DEFAULTS } from '../engine.js'
+import { ArtexEngine, DEFAULTS, MAX_CACHED_STORES } from '../engine.js'
+import { apiOriginAllowed } from '../index.js'
 import { normalizeConfig } from '../config.js'
 import { snapshot } from '../reporting.js'
 import { plannerView, digestOf } from '../views.js'
@@ -1207,6 +1208,54 @@ try {
     assert.equal(source.includes("ctx.get?.('webServer')"), false, '禁止 apply 时 ctx.get webServer（启动竞态）')
     assert.equal(source.includes("ctx.get?.('commands')"), false, '禁止 apply 时 ctx.get commands（启动竞态）')
   }
+
+  // N35：来源校验——外站/rebinding 拒，桌面端形态与回环别名放行
+  const apiReq = (remote, host, origin) => ({ socket: { remoteAddress: remote }, headers: { host, origin } })
+  assert.equal(apiOriginAllowed(apiReq('127.0.0.1', '127.0.0.1:7788', 'https://evil.example')), false, '外站 Origin 必须拒')
+  assert.equal(apiOriginAllowed(apiReq('127.0.0.1', 'evil.example', 'https://evil.example')), false, 'rebinding Host 必须拒')
+  assert.equal(apiOriginAllowed(apiReq('10.0.0.5', '127.0.0.1:7788', '')), false, '非回环对端必须拒')
+  assert.equal(apiOriginAllowed(apiReq('127.0.0.1', '127.0.0.1:7788', undefined)), true, '桌面端无 Origin 放行')
+  assert.equal(apiOriginAllowed(apiReq('127.0.0.1', '127.0.0.1:7788', 'app://dsh')), true, 'app:// 放行')
+  assert.equal(apiOriginAllowed(apiReq('127.0.0.1', '127.0.0.1:7788', 'http://localhost:7788')), true, '回环别名放行')
+
+  // N36：workspace store 缓存有上限
+  const e39 = new ArtexEngine({
+    ctx: { get: () => undefined, subagents: { list: () => ['spawn'] } },
+    config: { ...DEFAULTS, indexPath: join(root, 'idx39.json') },
+    logger: { warn: () => {} },
+  })
+  for (let i = 0; i < MAX_CACHED_STORES + 20; i += 1) e39.storeFor(join(root, `ws-${i}`))
+  assert.ok(e39.stores.size <= MAX_CACHED_STORES, `stores=${e39.stores.size} 应 ≤ ${MAX_CACHED_STORES}`)
+
+  // N37：列表不再按工作区任务总数读 task.json（索引已署名的不读）
+  const ws37 = join(root, 'ws37')
+  const dir37 = join(ws37, '.artex', 'tasks')
+  mkdirSync(dir37, { recursive: true })
+  const items37 = {}
+  for (let i = 0; i < 40; i += 1) {
+    const id = `t-list-${String(i).padStart(2, '0')}`
+    mkdirSync(join(dir37, id), { recursive: true })
+    writeFileSync(join(dir37, id, 'task.json'), JSON.stringify({
+      id, goal: `g${i}`, ownerSession: i === 0 ? 'owner-37' : `other-${i}`, cwd: ws37,
+      status: 'completed', createdAt: 1000 + i, updatedAt: 1000 + i,
+      stats: { facts: 0, findings: 0, resources: 0, activities: 0 },
+    }))
+    items37[id] = { cwd: ws37, ownerSession: i === 0 ? 'owner-37' : `other-${i}`, updatedAt: 1000 + i }
+  }
+  writeFileSync(join(root, 'idx37.json'), JSON.stringify({ items: items37 }))
+  const e37 = new ArtexEngine({
+    ctx: { get: () => undefined, subagents: { list: () => ['spawn'] } },
+    config: { ...DEFAULTS, indexPath: join(root, 'idx37.json') },
+    logger: { warn: () => {} },
+  })
+  const { createViewApi } = await import('../view-api.js')
+  const store37 = e37.storeFor(ws37).tasks
+  let metaLoads = 0
+  const real37 = store37.loadMeta.bind(store37)
+  store37.loadMeta = async (id) => { metaLoads += 1; return real37(id) }
+  const rows37 = await createViewApi(e37).listTasks({ sessionId: 'owner-37', cwd: ws37, limit: 20 })
+  assert.equal(rows37.length, 1, '只应返回本会话的任务')
+  assert.ok(metaLoads <= 2, `一次列表读了 ${metaLoads} 个 task.json（应只读本会话的）`)
 
   console.log('OK audit-regressions')
 } finally {

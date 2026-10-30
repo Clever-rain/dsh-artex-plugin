@@ -162,17 +162,27 @@ function readApiBody(req) {
   })
 }
 
-/** 只接受本机回环来源；桌面端 Origin 常为 app:// 或缺失，一并放行。 */
-function apiOriginAllowed(req) {
+/**
+ * 来源校验（N35）：回环只是必要条件，不是通行证。
+ * 1) 对端必须是本机回环；
+ * 2) Host 必须是 localhost/127.0.0.1/[::1]——挡 DNS rebinding（攻击者域名解析到 127.0.0.1）；
+ * 3) Origin 缺失 / 'null' / app: 放行（桌面端形态），否则必须与 Host 同源。
+ */
+export function apiOriginAllowed(req) {
   const remote = req.socket?.remoteAddress ? String(req.socket.remoteAddress) : ''
-  if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1') return true
-  const host = typeof req.headers.host === 'string' ? req.headers.host : ''
+  const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+  if (!loopback) return false
+  const host = typeof req.headers?.host === 'string' ? req.headers.host : ''
   if (!/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host)) return false
-  const origin = req.headers.origin
+  const origin = req.headers?.origin
   if (origin === undefined || origin === '' || origin === 'null') return true
   if (typeof origin === 'string' && /^app:/i.test(origin)) return true
   try {
-    if (new URL(origin).host === host) return true
+    const parsed = new URL(origin)
+    // 同源，或"回环别名 + 端口漂移"（客户端可能从 localhost:PORT 加载却打到 127.0.0.1:PORT）。
+    if (parsed.host === host) return true
+    const loopbackHosts = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+    if (loopbackHosts.has(parsed.hostname) && loopbackHosts.has(String(host).replace(/:\d+$/, ''))) return true
   } catch {
     /* fall through */
   }
