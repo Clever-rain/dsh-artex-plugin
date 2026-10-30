@@ -10,11 +10,13 @@
   },
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "client.js",
     "engine.js",
     "graph-ops.js",
     "reporting.js",
@@ -23,6 +25,7 @@
     "runner.js",
     "scheduler.js",
     "analyst.js",
+    "verifier.js",
     "usage.js",
     "util.js",
     "graph.js",
@@ -30,6 +33,9 @@
     "views.js",
     "store.js",
     "view-api.js",
+    "flags.js",
+    "command.js",
+    "http-api.js",
     "prompts.js",
     "tools.js",
     "tools-shared.js",
@@ -49,6 +55,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   }
 }

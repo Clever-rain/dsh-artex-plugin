@@ -158,7 +158,17 @@ max_workers: 3
 
 ## 4.0.3 P2：暂不实现
 
-UI client 插件、报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；UI/导出/分发看后续真有消费方再排。
+报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；导出/分发看后续真有消费方再排。（UI client 已由 §4.0.4 的开关 chip / 会话行徽章与 @local/dsh-artex-view 会话视图落地。）
+
+## 4.0.4 会话级开关与调用标识
+
+「这个会话用没用 ARTEX」从隐式变显式，分三层：
+
+- **开关**：会话里输入 `/artex on | off | status`（人类命令，不进模型上下文；`command/run` 连参数落在会话日志里，命令行本身就是切换的可见标记），或点输入框左侧的 **🧭 ARTEX chip**（client 半边，与命令共用同一份状态）。off 之后本会话发起的 `artex_*` 调用一律被 `tools.guard` 拦截并提示如何重开；**运行中的任务不受影响**（它们的写回来自子会话，子会话有自己的会话 id，默认开）。状态持久化在 profile 级 `~/.dsh/artex-session-flags.json`（默认开，装了插件即可用，向后兼容；文件损坏容错为全开）。
+- **标识**：23 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
+- **数据通道**：`/api/artex`（POST，只收本机回环来源）——`state {sessionId, cwd?}` 返回 `{enabled, tasks: 轻量摘要[]}`，`setEnabled {sessionId, enabled}` 切换开关；插件自己的 client 半边与任何本地消费方都可用。
+
+硬摘 schema（`tools.restrict` 按会话隐藏 23 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
 
 **配置**（写在 `cordis.patch.yml` 的 config 里，装好之后也可以再改）：
 
