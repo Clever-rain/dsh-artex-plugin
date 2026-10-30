@@ -261,6 +261,12 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 - **集合上限**：facts 2000、findings 500、hints 200；淘汰时保留 `goals[].evidence` 指向的节点，回读时同样保留。brief/analysis 的 citations 最多保留 200 条，所以事实内存保留量的上界是 `2000 + 200`（引用本身也被截到 200，防止保护集无界）。
 - **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd` 和 owner，最多 500 条。换个工作区也能按 id 查到历史任务。
 - **读权限**：默认只有任务所有者和它的子会话能读；跨会话读取要打开 `allowCrossTaskRead: true`。
+- **只读 Host Service `artex`**：`view-api.js` 对外暴露 `ctx.provide('artex', api)`，供
+  `@local/dsh-artex-view` 一类视图插件读取：`listTasks({ sessionId, limit })` 返回该会话
+  拥有的任务（live + 磁盘索引，磁盘任务只读 `task.json` 元数据）；`taskSnapshot({ taskId,
+  sessionId })` 返回 `{ task, resources, resources_total, live, settling }`，磁盘任务复用
+  `engine.loadTask()` 合并 JSONL。方法只读、不落盘、不改引擎状态，鉴权口径与
+  `tools/read.js` 一致。视图插件再用 HTTP 路由把裁剪后的图/覆盖载荷推给浏览器。
 - **敏感数据**：`.artex/` 里可能有证据原文，不要提交到公开仓库。任务 id 经过白名单校验，不能拿来路径穿越。
 
 ## 4.4 架构分层
@@ -282,6 +288,7 @@ analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`�
 | `model.js` | 领域模型：goal / intent / fact / finding / brief / analysis |
 | `views.js` | 角色视图与查询：overview / plannerView / workerView / digest / delta / trace |
 | `store.js` | 资源图、任务快照、全局索引 |
+| `view-api.js` | 只读 Host Service `artex`：任务列表 / 任务快照（供视图插件） |
 | `prompts.js` | planner / worker / analyst 提示词 |
 | `report.js` | 最终报告渲染 |
 | `tools.js` | 23 个模型工具的组合入口 |

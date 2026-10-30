@@ -134,7 +134,7 @@ try {
   const runTool = tools.find(t => t.name === 'artex_run_task')
   assert.equal(typeof runTool.presentCall, 'function')
   assert.equal(typeof runTool.presentResult, 'function')
-  assert.deepEqual(runTool.presentCall({ goal: '测试目标' }), { card: 'generic', title: 'ARTEX 编排 · 测试目标', kind: 'execute' })
+  assert.deepEqual(runTool.presentCall({ goal: '测试目标' }), { card: 'generic', title: '🧭 ARTEX 编排 · 测试目标', kind: 'execute' })
   assert.match(runTool.presentResult({ goal: '测试目标' }, { isError: false, content: [] }).title, /ARTEX 编排完成/)
   assert.match(runTool.presentResult({}, { isError: true, content: [] }).title, /ARTEX 编排失败/)
 
