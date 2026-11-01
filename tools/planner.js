@@ -33,6 +33,8 @@ export function plannerTools({ engine, config }) {
                 parents: { type: 'array', items: { type: 'integer' }, description: '派生自哪些 fact/finding 节点 id' },
                 resource_ids: { type: 'array', items: { type: 'integer' }, description: '锚定的资源 id' },
                 depends_on: { type: 'array', items: { type: 'integer' }, description: '显式串行依赖：只在前置意图全部 done 后才可被领取，失败的前置要靠你改路线。只能引用此前已存在的意图 id。' },
+                depth: integer('深挖档 1-3（仅 objective 的 pursue 生效，audit 强制 1）：预算与超时按 depth 放宽，worker 按阶段落检查点 fact 后链式推进。主路径深挖用 2，别滥用到 3。'),
+                requires_approval: { type: 'boolean', description: 'true=高风险动作挂人工审批：owner 用 artex_resolve_approval 批准前该意图不会被领取。修改目标状态/横向移动/破坏性验证/触发告警的扫描都应挂上。' },
               },
               required: ['summary'],
               additionalProperties: false,
@@ -43,6 +45,8 @@ export function plannerTools({ engine, config }) {
           state: { type: 'string', enum: ['open', 'blueprint'], description: '[单条] open 或 blueprint' },
           path_parent: integer('[单条] 路径上级意图 id'),
           parents: { type: 'array', items: { type: 'integer' }, description: '[单条] 上游节点 id' },
+          depth: integer('[单条] 深挖档 1-3'),
+          requires_approval: { type: 'boolean', description: '[单条] 是否挂人工审批' },
         },
         additionalProperties: false,
       },
@@ -53,7 +57,7 @@ export function plannerTools({ engine, config }) {
         const items = Array.isArray(args.intents) && args.intents.length > 0
           ? args.intents
           : args.summary
-            ? [{ summary: args.summary, parents: args.parents, kind: args.kind, state: args.state, path_parent: args.path_parent, priority: args.priority }]
+            ? [{ summary: args.summary, parents: args.parents, kind: args.kind, state: args.state, path_parent: args.path_parent, priority: args.priority, depth: args.depth, requires_approval: args.requires_approval }]
             : []
         if (items.length === 0) throw new Error('intents 或 summary 至少给一个')
         const dropped = Math.max(0, items.length - 4)

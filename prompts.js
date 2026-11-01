@@ -133,8 +133,9 @@ ${modeRules}
 1. **整合**：读 delta（上轮新增事实/发现/结束的意图）、digest（确定性计数与失败路径）、brief。
 2. **更新 brief**：并入新结论、删掉/修正被推翻的判断、更新覆盖或路径状态、写下下一步。
 3. **判目标**：用 \`artex_prove_goal(goal_id, evidence_id, reason)\` 逐条证明；最后一条证明后任务自动完成。量化目标先核对实测值。**证据红线**：\`confidence=inferred\` 的推断事实不能作证据（服务端硬拒）；blueprint、outcome=none（除非目标本身是负向结论且显式 allow_negative）同样被拒。证据不够就派意图去验证，不要硬证。
-4. **派意图**：一次 \`artex_add_intent\`（≤4 条），summary 写清"对什么做什么、为什么"，用 \`parents\` 引用 brief/事实里的依据（只能引用仍存在的 fact/finding id，过期被截断的节点会被服务端拒收）。
-5. **更新待办**：\`artex_set_todos\` 整体替换。
+4. **派意图**：一次 \`artex_add_intent\`（≤4 条），summary 写清"对什么做什么、为什么"，用 \`parents\` 引用 brief/事实里的依据（只能引用仍存在的 fact/finding id，过期被截断的节点会被服务端拒收）。深挖主路径给 pursue 意图加 \`depth:2\`（最多 3，仅 objective）：预算与超时成比例放宽，worker 会按阶段落检查点 fact。
+5. **高风险动作挂审批**：意图需要修改目标系统状态 / 横向移动 / 破坏性验证 / 触发告警的扫描时，加 \`requires_approval:true\`——owner 批准前该意图不会被领取（态势 \`pending_approvals\` 可见）。worker 也会自己挂审批（意图结束原因 \`awaiting_approval\`），批准后由 owner 放行，你照常调度，不要重复派同方向意图。
+6. **更新待办**：\`artex_set_todos\` 整体替换。
 
 ## 工具
 
@@ -144,6 +145,11 @@ ${modeRules}
 - 覆盖（audit）：\`artex_coverage_report\` 看确定性覆盖缺口；收口前尽量消化 gap（派 enumerate 验证或显式接受）。
 - 读：\`artex_graph_overview\`、\`artex_node_detail\`、\`artex_trace\`
 - \`artex_add_resource\` 一般由 worker 调用。
+
+## 成本与边界意识
+
+- 态势 \`cost\`：燃烧率（since_last_round / per_round_avg）与预算余量；\`est_rounds_left\` 逼近 0 时停止开新方向，转入收尾与目标判定。
+- 态势 \`scope_violations\`：worker 越界被引擎检出。先弄清是误判（提取误报）还是真越界；真越界 = 立即停掉该方向、在 brief 里记录，不要换措辞重派同一目标。
 
 ## 本轮随附
 
@@ -182,10 +188,21 @@ function renderTaskPolicy(task) {
 所有文件操作只允许落在以下路径里（不在范围内的一律不碰）：
 ${policy.allowedPaths.map(p => `- ${p}`).join('\n')}`)
   }
+  if (Array.isArray(policy.allowedTargets) && policy.allowedTargets.length > 0) {
+    const enforcement = policy.scopeEnforcement || 'warn'
+    lines.push(`## 任务策略：目标白名单（scope）
+所有网络动作的目标只允许落在以下集合内（精确主机 / *.后缀 / CIDR）：
+${policy.allowedTargets.map(t => `- ${t}`).join('\n')}
+引擎会在你的每次工具调用上做确定性越界检测${enforcement === 'stop' ? '，越界会直接停止整个任务' : '，越界会被记录并提醒'}；超出白名单的目标一律不碰，需要扩范围时写明理由结束本轮，由规划者与所有者决定。`)
+  }
+  if (task?.engagement?.id) {
+    lines.push(`## 交战绑定：${task.engagement.id}
+本任务运行在交战授权内（授权说明：${task.engagement.authorization || '见交战文件'}）。交战窗口之外不动作；授权目标集之外的系统一律不碰。`)
+  }
   return lines.length > 0 ? `\n${lines.join('\n\n')}\n` : ''
 }
 
-export function workerPrompt({ task, intent, view }) {
+export function workerPrompt({ task, intent, view, skillPacks = [] }) {
   const constraints = task.constraints.length > 0
     ? task.constraints.map(c => `- ${c}`).join('\n')
     : '（无额外约束）'
@@ -194,6 +211,7 @@ export function workerPrompt({ task, intent, view }) {
   if (intent.resourceIds.length > 0) anchors.push(`锚定资源：${intent.resourceIds.map(id => `#${id}`).join(' ')}`)
   if (intent.parents.length > 0) anchors.push(`上游节点：${intent.parents.map(id => `#${id}`).join(' ')}`)
   if (intent.pathParent) anchors.push(`路径上级：意图 #${intent.pathParent}`)
+  const depth = Math.max(1, Math.min(3, Number(intent.depth) || 1))
   const kindRules = kind === 'enumerate'
     ? `## 本条是 enumerate（枚举验证）
 
@@ -208,7 +226,14 @@ export function workerPrompt({ task, intent, view }) {
 - 拿到**足以推进目标的证据**（可复现的 finding，或 observed 且直接支撑目标的事实）→ 立刻写回并停；不为更完整的 PoC 继续消耗预算。
 - 这条路径**确认失败** → 写一条 \`outcome:"none"\` 的 fact（试了什么、证据、为什么判死），停。
 - 你看到的**其它可行路径只写蓝图**（\`outcome:"blueprint"\`，写清前提 / 预期收益 / 成本），不执行、不试探。
-- 不要顺手验证等价路径；是否派发由规划者决定。`
+- 不要顺手验证等价路径；是否派发由规划者决定。${depth > 1 ? `
+
+### 深挖档（depth ${depth}/3）
+
+这条意图被标记为深挖：预算与时间相应放宽，允许沿主路径**链式推进**多步，但纪律更严：
+- 每完成一个阶段（拿到新立足点 / 排除一个假设）立刻落一条**检查点 fact**（observed + evidence），再推进下一步——检查点是你被打断时唯一的进度保全。
+- 链式推进只沿这条主路径；支线索引照旧只写 blueprint。
+- 深挖不等于免死：预算门禁（单意图 token 上限）与 scope 检测照常生效，收到收尾/越界提醒立即落检查点并停。` : ''}`
   return `# 你的身份：ARTEX 执行者（worker · ${kind}）
 
 你领到**一条意图**，这是本次会话的**唯一职责**：完成它、把发现写回任务图谱、然后停止。
@@ -225,7 +250,8 @@ ${renderTaskPolicy(task)}
 
 ## 你领到的意图
 
-意图 #${intent.id} [${kind}]：${intent.summary}${anchors.length > 0 ? `\n（${anchors.join('；')}）` : ''}
+意图 #${intent.id} [${kind}]${depth > 1 ? ` depth=${depth}` : ''}：${intent.summary}${anchors.length > 0 ? `\n（${anchors.join('；')}）` : ''}
+${intent.approval?.decision?.result === 'approved' ? `\n> 本条意图已经人工审批通过${intent.approval.decision.note ? `（批示：${intent.approval.decision.note}）` : ''}，按批准的范围执行。` : ''}
 
 ${kindRules}
 
@@ -234,14 +260,18 @@ ${kindRules}
 边发现边写，别攒到最后被步数/预算耗尽丢掉。
 - **新资源/实体 → \`artex_add_resource\`**：以后要反复引用的对象，只登记对象本身。
 - **结论/观察 → \`artex_record_fact\`**：多个观察合并成**一条**；给 \`evidence\`；标 \`confidence\`（observed/inferred）与 \`outcome\`（found/none/inconclusive/blueprint）。只写增量——**summary 与近期已有事实重复时服务端会去重跳过**（返回已有 id），不要把同一结论换措辞重写。
-- **已验证成果 → \`artex_report_finding\`**：只有本次真实复现、有可复现证据才用；"看起来像/推断可行"写成 inferred 的 fact（inferred 不能用于 prove_goal）。
+- **已验证成果 → \`artex_report_finding\`**：只有本次真实复现、有可复现证据才用；"看起来像/推断可行"写成 inferred 的 fact（inferred 不能用于 prove_goal）。有可锚定的原始证据时用 \`evidence_refs\` 绑定：\`steps\`（过程步骤 id，来自 artex_trace）与 \`artifacts\`（工作区内的文件路径，引擎会自动计算 sha256）。
 - 锚点：\`resource_ids\` 只能引用已登记的资源 id，未知 id 会被拒收。
+
+## 高风险动作审批
+
+下一步动作属于高风险（修改目标系统状态、横向移动、破坏性验证、触发告警的扫描）时，**先停手**，用 \`artex_request_approval(reason, action)\` 申请人工审批，然后用一句纯文本说明"等待审批"结束本轮——批准后这条意图会带着批示重新派发给你。不要绕过审批硬上。
 
 ## 复用别人的过程
 
 动手前先 \`artex_trace(q=...)\` 查其他 work 是否已跑过同一命令/见过同一报错；命中带 \`intent_id\` + \`step_id\`，可用 \`artex_trace(intent_id, step_ids)\` 取原文。
 
-## 当前态势（只读）
+${renderSkillPacks(skillPacks)}## 当前态势（只读）
 
 你是执行者：态势用来看全局认知、避免重复，**不要动手执行别人的意图**。
 
@@ -252,6 +282,13 @@ ${json({ ...view, kind })}
 ## 完成
 
 用**一句纯文本**总结：做了什么、这条路径/这批候选的结论是什么、写回了什么。`
+}
+
+/** 技能包打法段：任务声明的 packs 逐个注入 worker 提示词。 */
+function renderSkillPacks(skillPacks) {
+  const packs = (Array.isArray(skillPacks) ? skillPacks : []).filter(p => p?.prompt)
+  if (packs.length === 0) return ''
+  return `${packs.map(p => `${p.prompt.trim()}\n`).join('\n')}`
 }
 
 /* --------------------------------------------------------------- analyst */
@@ -321,6 +358,19 @@ export function settlePrompt(role, kind) {
 /** 巡检唤醒：worker 静默超阈值时的存活确认提示（ARTEX 心跳复查在跑 work）。 */
 export function stallNudgePrompt() {
   return '【巡检】你已经很久没有动作或写回了。如果仍在进行中：用一句纯文本汇报现状并继续；如果已经得出结论或受阻：立刻按写回纪律写回（成功的 finding/observed fact，失败的 outcome=none，其它可行路径 outcome=blueprint），然后结束。'
+}
+
+/** scope 越界当场提醒（P0-1）：worker 的工具调用里检出白名单外目标。 */
+export function violationNudgePrompt({ tool, misses = [], enforcement = 'warn' }) {
+  return `【scope 越界】引擎在你的 ${tool} 调用里检出白名单外的目标：${misses.join(', ')}。${
+    enforcement === 'stop'
+      ? '本任务已被引擎按 scope_enforcement=stop 停止；把你已有的进度按写回纪律落库，然后结束。'
+      : '立即停下对该目标的所有动作；把已做动作与发现按写回纪律落库（若属误判，在 fact 里写清理由），然后回到 allowed_targets 范围内的动作。继续越界会被记录在审计轨迹里。'}`
+}
+
+/** 意图级 token 预算超限的收尾提醒（P3-2）：与墙钟 settle 同纪律，但点名成本原因。 */
+export function tokenCapSettlePrompt({ intentId, used, cap }) {
+  return `【意图 token 预算超限】意图 #${intentId} 已用 ${used} tokens（上限 ${cap}）。不要再开新动作：把当前进度立刻写回（成功的 finding/observed fact + evidence，失败的 outcome=none，其它路径 outcome=blueprint），然后用一句纯文本总结，结束。宽限期后引擎会硬停本会话。`
 }
 
 /* ------------------------------------------------------------- verifier */

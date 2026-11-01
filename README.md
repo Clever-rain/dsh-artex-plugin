@@ -102,7 +102,9 @@ DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：
 | `artex_prove_goal` | 用 fact/finding 证明目标（inferred 默认拒，allow_inferred 放行） | planner / 所有者 |
 | `artex_set_todos` | 整体替换跨轮规划待办 | planner / 所有者 |
 | `artex_record_fact` | 写回结论（evidence + confidence + outcome；found 必给 evidence） | worker / 所有者 |
-| `artex_report_finding` | 登记已验证成果（evidence 硬门必填） | worker / 所有者 |
+| `artex_report_finding` | 登记已验证成果（evidence 硬门必填；evidence_refs 绑定步骤/工件 sha256） | worker / 所有者 |
+| `artex_request_approval` | 高风险动作申请人工审批（意图挂起等裁决） | worker / 所有者 |
+| `artex_resolve_approval` | 裁决待审批意图（approve 放行 / reject 终止） | 所有者 |
 | `artex_add_resource` | 登记跨任务复用的资源或实体 | worker / planner / 所有者 |
 | `artex_set_analysis` | 提交独立分析（只读输入，不改 brief） | analyst / 所有者 |
 | `artex_retest_finding` | finding 复测闭环（open → verified/rejected/needs_retest） | verifier / planner / 所有者 |
@@ -160,15 +162,42 @@ max_workers: 3
 
 报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；导出/分发看后续真有消费方再排。（UI client 已由 §4.0.4 的开关 chip / 会话行徽章与 @local/dsh-artex-view 会话视图落地。）
 
+## 4.0.5 Phantom 启发路线图：P0 防线 / P1 审计 / P2 能力 / P3 运营
+
+2026-11 参照 Phantom 事件教训落地的第二批路线图（详见《Phantom 对 dsh-artex 的设计启发》）。设计红线：**提示词约束是写给模型看的，防线必须落在引擎的确定性代码路径上**。
+
+### P0 防线（启动期机器校验，不经过模型）
+
+- **scope guard（`allowed_targets`）**：目标白名单支持四种写法——精确主机（`example.com`）、后缀（`*.corp.internal`，含根域）、IPv4、CIDR（`10.0.0.0/8`）。引擎在 worker 每次宿主工具调用事件上提取网络目标（URL 主机/IP/裸域名），越界按 `scope_enforcement` 处置：`warn`（默认，记录+提醒 worker+唤醒 planner）/ `stop`（停任务）/ `off`（只提示词约束）。越界事件持久化在 `task.violations` 并进报告。**边界**：DSH 不给插件抢占拦截能力，这里是"检测+提醒+停任务"，抢占靠 `allowed_tools` 白名单与 `read_only`。
+- **交战绑定（`engagement`）**：`.artex/engagements/<id>.json` 声明 `{ authorization, targets[], window{not_before,not_after} }`；启动期校验授权说明非空、时间窗有效、任务 `allowed_targets` 必须是交战目标集子集——**scope 不能比授权更宽**。未给 `allowed_targets` 时交战目标集即默认 scope。插件配置 `requireEngagement: true` 可强制所有任务必须绑定。
+- **目标审查（goal lint + `confirm`）**：goal/goals/constraints 经确定性词表审查（勒索/加密器/免杀载荷/破坏性动作/僵尸网络/显式未授权/数据变现；**不标**"渗透/漏洞/提权"等合法红队语言）。命中时必须把 `confirm` 精确设为 goal 原文，确认与命中词随任务留痕（`risk_confirm`）并进报告。
+- **证据脱敏（`redact_evidence`，默认开）**：写回边界的确定性打码——password/token/Authorization/cookie/AWS/GitHub/Slack key、PEM 私钥块等值替换为 `前缀…[已脱敏 N 字符]`，保留键与上下文，证据链仍可核对。任务可显式关闭。
+- **`.artex` 防裸奔（`gitIgnoreGuard`，默认开）**：启动时检测 cwd 是 git 仓库且 `.gitignore` 未覆盖 `.artex/` → 自动追加并留一条过程库记录。证据含目标与凭据片段，绝不能进提交。
+
+### P1 审计
+
+- **finding ↔ 原始证据绑定（`evidence_refs`）**：`artex_report_finding` 可附 `{ steps: [过程库步骤id], artifacts: [{path, note}] }`；服务端校验步骤真实存在（用 `artex_trace` 查 id）、工件必须位于任务工作区内并自动计算 sha256（>64MB 只记大小）。校验失败整体拒收。报告 finding 行直接渲染证据绑定。
+- **运行时审批门**：两类入口——planner 派意图时 `requires_approval: true`（owner 批准前不被领取）；worker 自查高风险动作（改目标状态/横向移动/破坏性验证/触发告警扫描）调 `artex_request_approval(reason, action)` 挂起并结束本轮。owner 用 `artex_resolve_approval(intent_id, approve|reject, note)` 裁决：批准 → 意图带批示重新派发（批示注入 worker 提示词）；拒绝 → 意图终止（`approval_rejected`）。全部裁决落过程库，`pending_approvals` 在状态查询/规划态势/报告里可见。
+
+### P2 能力
+
+- **worker 深挖档（意图 `depth: 1..3`）**：仅 objective 模式的 pursue 生效（audit 要逐项独立证据链，强制 1）。墙钟预算按 depth 成比例放宽；worker 提示词注入链式推进段——**每阶段落检查点 fact（observed+evidence）再推进**，支线照旧只写 blueprint。主路径深挖用 2，别滥用 3。
+- **技能包（`skill_packs`）**：任务级声明加载"打法+工具面"模块。内置 `recon` / `web-audit` / `report`；自定义放 `.artex/skills/<name>.json`（形状 `{ prompt, tools[] }`）。包 prompt 注入每个 worker；任务未显式给 `allowed_tools` 时并入包声明的工具白名单。**纪律**：技能包只封装打法与工具面，不内置任何攻击载荷——能力模块化 ≠ 弹药内置（Phantom 的 WormGPT-MCP 是反面教材）。
+
+### P3 运营
+
+- **campaign 聚合（`campaign`）**：任务归属战役 id（进全局索引）；`artex_task_status(campaign=...)` 跨任务聚合——任务列表（状态/目标达成/发现/成本/越界计数）+ totals；`list_campaigns: true` 列全部战役。
+- **成本门禁**：`max_tokens_per_intent`（参数或配置 `maxTokensPerIntent`）——单意图超 cap 先发收尾提醒（点明成本原因），宽限后硬停该 worker；每意图只触发一次。planner 每轮态势新增 `cost`：燃烧率（`since_last_round` / `per_round_avg`）、`remaining_tokens`、`est_rounds_left`——逼近 0 时 planner 被明确告知转收尾。
+
 ## 4.0.4 会话级开关与调用标识
 
 「这个会话用没用 ARTEX」从隐式变显式，分三层：
 
 - **开关**：会话里输入 `/artex on | off | status`（人类命令，不进模型上下文；`command/run` 连参数落在会话日志里，命令行本身就是切换的可见标记），或点输入框左侧的 **🧭 ARTEX chip**（client 半边，与命令共用同一份状态）。off 之后本会话发起的 `artex_*` 调用一律被 `tools.guard` 拦截并提示如何重开；**运行中的任务不受影响**（它们的写回来自子会话，子会话有自己的会话 id，默认开）。状态持久化在 profile 级 `~/.dsh/artex-session-flags.json`（默认开，装了插件即可用，向后兼容；文件损坏容错为全开）。
-- **标识**：23 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
+- **标识**：25 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
 - **数据通道**：`/api/artex`（POST，只收本机回环来源）——`state {sessionId, cwd?}` 返回 `{enabled, tasks: 轻量摘要[]}`，`setEnabled {sessionId, enabled}` 切换开关；插件自己的 client 半边与任何本地消费方都可用。
 
-硬摘 schema（`tools.restrict` 按会话隐藏 23 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
+硬摘 schema（`tools.restrict` 按会话隐藏 25 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
 
 **配置**（写在 `cordis.patch.yml` 的 config 里，装好之后也可以再改）：
 
@@ -191,6 +220,11 @@ max_workers: 3
 | `settleGraceMs` | 90000 | 收尾宽限 |
 | `budgetMs` | 0 | 任务总预算（0 表示不限） |
 | `isolateWorkdir` | false | worker 是否在 `.artex/tasks/<id>/i<n>` 独立 cwd 里工作 |
+| `scopeEnforcement` | `warn` | scope 越界默认处置：`warn` / `stop` / `off` |
+| `redactEvidence` | true | 证据写回默认脱敏（口令/token/私钥打码） |
+| `gitIgnoreGuard` | true | 启动时自动把 `.artex/` 补进 git 仓库的 `.gitignore` |
+| `maxTokensPerIntent` | 0 | 意图级 token 预算（0=不限，超限先收尾再硬停） |
+| `requireEngagement` | false | 是否强制任务必须绑定交战 |
 
 ---
 

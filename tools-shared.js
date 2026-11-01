@@ -77,6 +77,8 @@ const TOOL_LABELS = {
   artex_record_conflict: 'ARTEX 冲突',
   artex_retract_fact: 'ARTEX 撤回事实',
   artex_coverage_report: 'ARTEX 覆盖',
+  artex_request_approval: 'ARTEX 请求审批',
+  artex_resolve_approval: 'ARTEX 审批裁决',
 }
 
 /** 时间线上一眼可辨：所有 artex_* 卡片统一带 🧭 前缀。 */
@@ -91,6 +93,8 @@ const TOOL_KINDS = {
   artex_graph_overview: 'read',
   artex_node_detail: 'read',
   artex_trace: 'read',
+  artex_request_approval: 'execute',
+  artex_resolve_approval: 'execute',
 }
 
 const clip = (value, max = 48) => {
@@ -229,6 +233,14 @@ export const RUN_PARAMETERS = {
   budget_ms: integer('任务级墙钟预算（毫秒，默认 0 = 不限）。耗尽后先让 worker 收尾再停。'),
   max_tokens: integer('任务级 token 预算（input+output 合计，默认 0 = 不限）。超限先走收尾证明轮，再按 stopped 收口并保留现场。'),
   allowed_tools: strings('可选：子会话允许使用的基础工具白名单（非 artex_*；精确名）。给了它，其它已知写/执行类宿主工具会被 toolFilter 收掉。pentest 场景推荐显式给出允许命令行工具。'),
+  allowed_targets: strings('可选：目标白名单（scope）：精确主机、*.后缀域名、IPv4、CIDR。给了它，引擎会在 worker 每次宿主工具调用上做确定性越界检测（提取 URL 主机/IP/域名比对），worker 提示词也会收到 scope 纪律。'),
+  scope_enforcement: { type: 'string', enum: ['warn', 'stop', 'off'], description: 'scope 越界处置：warn=记录+提醒 worker+唤醒 planner（默认）；stop=立即停止任务；off=只保留提示词约束。' },
+  engagement: describe('可选：交战 id，对应 .artex/engagements/<id>.json（authorization/targets/window）。启动时校验时间窗与授权说明；未给 allowed_targets 时交战目标集即默认 scope；声明的 allowed_targets 必须是交战目标集子集。'),
+  confirm: describe('目标审查确认：goal/goals/constraints 命中高风险词（勒索/免杀/破坏性动作等）时必须把本参数精确设为 goal 原文，否则启动被拒；确认与命中词会随任务留痕。'),
+  redact_evidence: { type: 'boolean', description: '证据脱敏开关（默认继承插件配置=开）：写回的事实/发现中的口令、token、私钥等敏感值会被自动打码；false=本任务关闭。' },
+  max_tokens_per_intent: integer('可选：意图级 token 预算（默认 0=不限）：单意图超出后引擎先发收尾提醒，宽限后硬停该 worker，意图按 exhausted 收尾。'),
+  skill_packs: strings('可选：技能包列表（内置：recon / web-audit / report；自定义：.artex/skills/<name>.json，形状 {prompt, tools[]}）。打法提示注入 worker；未给 allowed_tools 时并入包声明的工具白名单。'),
+  campaign: describe('可选：战役 id——跨任务聚合视图（artex_task_status 传 campaign 可汇总同战役全部任务的目标/发现/成本）。'),
   read_only: { type: 'boolean', description: '可选：只读模式——子会话被收掉一切已知写/执行类宿主工具（edit/write/pwsh/terminal/workflow 等），只能靠读工具与 artex 写回工作。' },
   allowed_paths: strings('可选：子会话允许操作的路径白名单；当前以提示词强约束注入（DSH 不给插件 OS 级路径沙箱），与 isolateWorkdir 叠加。'),
   worker_timeout_ms: integer('单个 worker 的墙钟预算（毫秒，默认 1200000 = 20 分钟）。'),

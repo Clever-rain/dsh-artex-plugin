@@ -101,6 +101,26 @@ task 所有者与 worker 可调用。`,
           detail: describe('详细说明：是什么、影响、复现步骤'),
           severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info', 'unknown'], description: '严重度/重要性（默认 unknown）' },
           evidence: { type: 'string', required: true, description: '可复现证据（必填，服务端硬门）：命令/请求 + 关键输出，或复现步骤。没复现的请走 artex_record_fact(confidence=inferred)' },
+          evidence_refs: {
+            type: 'object',
+            description: '可选：原始证据结构化绑定——steps=过程库步骤 id（来自 artex_trace），artifacts=工作区内工件文件（引擎自动算 sha256）。校验失败（步骤不存在/工件缺失/越出工作区）整体拒收。',
+            properties: {
+              steps: { type: 'array', items: { type: 'integer' }, description: '本任务过程库步骤 id 列表' },
+              artifacts: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    path: { type: 'string', required: true, description: '工件路径（必须位于任务工作区内）' },
+                    note: describe('可选：该工件说明'),
+                  },
+                  required: ['path'],
+                  additionalProperties: false,
+                },
+              },
+            },
+            additionalProperties: false,
+          },
           resource_ids: { type: 'array', items: { type: 'integer' }, description: '关联资源 id' },
         },
         required: ['title'],
@@ -116,10 +136,39 @@ task 所有者与 worker 可调用。`,
           detail: args.detail,
           severity: args.severity,
           evidence: args.evidence,
+          evidence_refs: args.evidence_refs,
           resourceIds: args.resource_ids,
           intentId: resolveIntentId(role, args),
         })
-        return `已登记发现 #${finding.id}：${finding.title}（severity=${finding.severity}）。规划者已被唤醒。`
+        const refs = finding.evidenceRefs
+          ? `（证据绑定：${finding.evidenceRefs.steps?.length ? `steps ${finding.evidenceRefs.steps.map(id => `#${id}`).join(' ')}` : ''}${finding.evidenceRefs.artifacts?.length ? `${finding.evidenceRefs.steps?.length ? '；' : ''}${finding.evidenceRefs.artifacts.length} 个工件已哈希` : ''}）`
+          : ''
+        return `已登记发现 #${finding.id}：${finding.title}（severity=${finding.severity}）${refs}。规划者已被唤醒。`
+      },
+    }),
+    artifact({
+      name: 'artex_request_approval',
+      description: `执行者申请人工审批（P1-2 审批门）：下一步动作属于高风险（修改目标系统状态 / 横向移动 / 破坏性验证 / 触发告警的扫描）时，**先停手**调用本工具挂起当前意图，然后用一句纯文本说明"等待审批"结束本轮。
+owner 用 artex_resolve_approval 裁决：批准后这条意图带批示重新派发；拒绝则意图终止。挂起期间规划者不会重复派发同方向意图。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          intent_id: integer('来源意图 id；worker 省略时自动挂到自己领到的意图'),
+          reason: { type: 'string', required: true, description: '为什么需要人工审批（风险点、影响面）' },
+          action: { type: 'string', required: true, description: '被批准后准备执行的具体动作（写清命令/操作与目标）' },
+        },
+        required: ['reason', 'action'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRole(agent, role, task, ['worker'])
+        liveRuntime(engine, task)
+        const intentId = resolveIntentId(role, args)
+        if (!intentId) throw new Error('无法确定要挂起的意图（worker 会话应自动归属当前意图）')
+        engine.requestApproval(task, intentId, { reason: args.reason, action: args.action, by: 'worker' })
+        return `意图 #${intentId} 已挂起等待人工审批。\n请立即用一句纯文本说明"已申请审批：${String(args.action).slice(0, 60)}"并结束本轮——批准后本意图会带着批示重新派发。`
       },
     }),
     artifact({

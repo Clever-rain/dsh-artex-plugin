@@ -3,8 +3,9 @@
  */
 
 import { oneLine } from './util.js'
-import { intentById, danglingParents, findDuplicateFact, findSameSummaryFact } from './model.js'
+import { intentById, danglingParents, findDuplicateFact, findSameSummaryFact, requestApproval as graphRequestApproval, resolveApproval as graphResolveApproval } from './model.js'
 import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding, retestFinding as graphRetestFinding, recordConflict as graphRecordConflict, retractFact as graphRetractFact } from './graph.js'
+import { bindArtifacts, bindSteps } from './evidence.js'
 
 function requireRunningIntent(task, intentId) {
   if (intentId == null) return null
@@ -175,6 +176,40 @@ export function roleForIntent(engine, taskId, intentId) {
     return undefined
   }
 
+/* ---------------------------------------------------------------- approval */
+
+/** worker/planner 请求人工审批：意图挂起（pending），owner 裁决前不会被领取。 */
+export function requestApproval(engine, task, intentId, request = {}) {
+    const rt = engine.runtimeForTask(task)
+    const intent = graphRequestApproval(rt.task, intentId, request)
+    engine.addActivity(rt, {
+      intentId: intent.id,
+      worker: request.by || 'worker',
+      kind: 'approval',
+      summary: `意图 #${intent.id} 请求人工审批：${oneLine(request.reason || request.action || '', 120)}`,
+      detail: `动作：${request.action || '-'}\n理由：${request.reason || '-'}`,
+    })
+    engine.pushEvent(rt, { kind: 'approval', summary: `意图 #${intent.id} 等待人工审批` })
+    void engine.persist(rt)
+    return intent
+  }
+
+/** owner 裁决审批：approve 恢复派发；reject 终止意图。 */
+export function resolveApproval(engine, task, intentId, decision, note = '') {
+    const rt = engine.runtimeForTask(task)
+    const { intent, decision: result } = graphResolveApproval(rt.task, intentId, decision, note)
+    engine.addActivity(rt, {
+      intentId: intent.id,
+      worker: 'human',
+      kind: 'approval',
+      summary: `意图 #${intent.id} 审批${result === 'approved' ? '通过' : '被拒'}${note ? `：${oneLine(note, 120)}` : ''}`,
+      detail: note || '',
+    })
+    engine.pushEvent(rt, { kind: 'approval', summary: `意图 #${intent.id} 审批${result === 'approved' ? '通过' : '被拒'}` })
+    void engine.persist(rt)
+    return { intent, decision: result }
+  }
+
 export async function recordFacts(engine, task, entries, intentId) {
     const rt = engine.runtimeForTask(task)
     const targetId = intentId ?? entries[0]?.intentId ?? entries[0]?.intent_id ?? null
@@ -251,7 +286,21 @@ export async function recordFinding(engine, task, input) {
     if (!String(input.evidence ?? '').trim()) {
       throw new Error('report_finding 必须给 evidence：发现是已验证成果，需要可复现凭据（命令/回包/复现步骤）。没复现的请记为 inferred fact。')
     }
-    const finding = graphReportFinding(rt.task, { ...input, intentId: targetId })
+    // 原始证据绑定：步骤锚点 + 工件哈希（P1-1）。校验失败整体拒绝，finding 不入库。
+    let evidenceRefs
+    const refs = input.evidence_refs ?? input.evidenceRefs
+    if (refs && typeof refs === 'object') {
+      const steps = bindSteps(rt.task, refs.steps)
+      const artifacts = refs.artifacts !== undefined
+        ? await bindArtifacts(rt.task.cwd, refs.artifacts)
+        : undefined
+      evidenceRefs = {
+        ...(steps.length > 0 ? { steps } : {}),
+        ...(artifacts && artifacts.length > 0 ? { artifacts } : {}),
+      }
+      if (!evidenceRefs.steps && !evidenceRefs.artifacts) evidenceRefs = undefined
+    }
+    const finding = graphReportFinding(rt.task, { ...input, intentId: targetId, evidenceRefs })
     const role = engine.roleForIntent(task.id, finding.intentId)
     if (role) role.writes.findings += 1
     engine.addActivity(rt, {

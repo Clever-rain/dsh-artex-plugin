@@ -32,6 +32,13 @@ export function snapshot(engine, task, live) {
       goal: task.goal,
       rounds: task.round,
       limits: task.limits,
+      campaign: task.campaign || undefined,
+      engagement: task.engagement ? { id: task.engagement.id, window: task.engagement.window } : undefined,
+      scope: task.policy?.allowedTargets?.length > 0
+        ? { allowed_targets: task.policy.allowedTargets, enforcement: task.policy.scopeEnforcement || engine.config.scopeEnforcement || 'warn', violations: Array.isArray(task.violations) ? task.violations.length : 0 }
+        : undefined,
+      pending_approvals: task.intents.filter(i => i.approval?.pending === true).map(i => ({ id: i.id, summary: i.summary, request: i.approval?.request })),
+      risk_confirm: task.riskConfirm || undefined,
       brief: task.brief?.text || undefined,
       brief_round: task.brief?.round ?? undefined,
       analysis: task.analysis?.text || undefined,
@@ -95,4 +102,62 @@ export async function status(engine, taskId, options = {}) {
 
 export function report(engine, task) {
     return formatReport(task)
+  }
+
+/* ---------------------------------------------------------------- campaign */
+
+/**
+ * P3-1 战役聚合视图：跨任务汇总目标达成 / 发现 / 成本。
+ * 索引里的每个任务读 loadMeta（轻量，不加载全量事实），活任务直接读内存。
+ */
+export async function campaignStatus(engine, campaign) {
+    const name = String(campaign ?? '').trim()
+    if (!name) throw new Error('campaign 不能为空')
+    const items = await engine.index.byCampaign(name)
+    const rows = []
+    for (const item of items) {
+      try {
+        const live = engine.liveTask(item.id)
+        const task = live ? live.task : await engine.storeFor(item.cwd).tasks.loadMeta(item.id)
+        if (!task) continue
+        const goals = Array.isArray(task.goals) ? task.goals : []
+        const findings = Array.isArray(task.findings) ? task.findings : []
+        rows.push({
+          id: task.id,
+          description: task.description,
+          status: task.status,
+          mode: task.mode || 'objective',
+          live: Boolean(live && !live.finished),
+          rounds: task.round ?? 0,
+          goals_met: goals.filter(g => g.status === 'met').length,
+          goals_total: goals.length,
+          facts: task.stats?.facts ?? 0,
+          findings_total: findings.length,
+          findings_open: findings.filter(f => (f.status || 'open') === 'open').length,
+          findings_verified: findings.filter(f => f.status === 'verified').length,
+          tokens: (task.usage?.input_tokens || 0) + (task.usage?.output_tokens || 0),
+          violations: Array.isArray(task.violations) ? task.violations.length : 0,
+          engagement: task.engagement?.id || undefined,
+        })
+      } catch {
+        // 单个任务读取失败不拖垮聚合视图。
+      }
+    }
+    const totals = rows.reduce((acc, row) => ({
+      tasks: acc.tasks + 1,
+      running: acc.running + (row.live ? 1 : 0),
+      goals_met: acc.goals_met + row.goals_met,
+      goals_total: acc.goals_total + row.goals_total,
+      facts: acc.facts + row.facts,
+      findings_total: acc.findings_total + row.findings_total,
+      findings_verified: acc.findings_verified + row.findings_verified,
+      tokens: acc.tokens + row.tokens,
+      violations: acc.violations + row.violations,
+    }), { tasks: 0, running: 0, goals_met: 0, goals_total: 0, facts: 0, findings_total: 0, findings_verified: 0, tokens: 0, violations: 0 })
+    return { campaign: name, tasks: rows, totals }
+  }
+
+/** 索引当前知悉的全部战役名。 */
+export async function campaignList(engine) {
+    return engine.index.campaigns()
   }

@@ -579,7 +579,12 @@ export class TaskIndex {
         disk = raw?.items && typeof raw.items === 'object' ? raw.items : {}
       } catch { /* 首次写入 */ }
       this.items = { ...disk, ...this.items }
-      this.items[task.id] = { cwd: task.cwd, ownerSession: task.ownerSession, updatedAt: now() }
+      this.items[task.id] = {
+        cwd: task.cwd,
+        ownerSession: task.ownerSession,
+        campaign: task.campaign || undefined,
+        updatedAt: now(),
+      }
       const ids = Object.keys(this.items)
       if (ids.length > 500) {
         for (const id of ids.sort((a, b) => (this.items[a].updatedAt || 0) - (this.items[b].updatedAt || 0)).slice(0, ids.length - 500)) {
@@ -622,6 +627,22 @@ export class TaskIndex {
     if (!isValidTaskId(id)) return undefined
     await this.load()
     return this.items[id]?.cwd
+  }
+
+  /** 按战役聚合索引项：campaign → [{id, cwd, ownerSession, updatedAt}]。 */
+  async byCampaign(campaign) {
+    const name = String(campaign ?? '').trim()
+    if (!name) return []
+    await this.load()
+    return Object.entries(this.items)
+      .filter(([, meta]) => meta?.campaign === name)
+      .map(([id, meta]) => ({ id, ...meta }))
+  }
+
+  /** 全部战役名（索引当前知悉的）。 */
+  async campaigns() {
+    await this.load()
+    return [...new Set(Object.values(this.items).map(m => m?.campaign).filter(Boolean))]
   }
 
   async ownerOf(taskId) {

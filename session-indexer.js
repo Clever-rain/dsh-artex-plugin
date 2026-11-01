@@ -1,8 +1,11 @@
 /**
  * 子会话事件索引：tool/call、tool/result、assistant/message → 过程库与 usage。
+ * 同时承担 P0-1 引擎级 scope 越界检测：worker 的宿主工具调用里提取网络目标，
+ * 越 allowed_targets 即触发引擎处置（与提示词约束互补，不依赖模型自觉）。
  */
 
 import { oneLine, textOf } from './util.js'
+import { scopeCheck } from './guard.js'
 
 export function handleSessionEvent(engine, session, event) {
     try {
@@ -37,6 +40,14 @@ export function handleSessionEvent(engine, session, event) {
         const name = String(data.name || '')
         if (name.startsWith('artex_')) return // 写回已单独记录，不重复索引
         role.pending.set(data.callId, { name, arguments: data.arguments })
+        // P0-1 引擎级 scope 检测：提取调用里的网络目标（URL 主机/IP/域名），
+        // 命中 allowed_targets 之外即处置。检测在调用事件上发生（执行前一刻），
+        // 但 DSH 不给插件抢占拦截能力，处置 = 记录/提醒/停任务。
+        const policy = rt.task.policy || {}
+        if (policy.allowedTargets?.length > 0 && engine.scopeEnforcement(rt.task) !== 'off') {
+          const verdict = scopeCheck(policy.allowedTargets, `${name} ${String(data.arguments ?? '')}`)
+          if (verdict.ok === false) engine.flagScopeViolation(rt, role, name, verdict)
+        }
         return
       }
 

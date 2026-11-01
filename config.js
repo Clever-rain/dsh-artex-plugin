@@ -58,11 +58,22 @@ export const DEFAULTS = {
   allowCrossTaskRead: false,
   /** 全局任务索引路径；undefined = ~/.dsh/artex-index.json。 */
   indexPath: undefined,
+  /** scope 越界默认处置：warn=记录并提醒 worker；stop=停止任务；off=只提示词约束。 */
+  scopeEnforcement: 'warn',
+  /** 证据写回默认脱敏（口令/token/私钥等值打码，任务可用 redact_evidence:false 关闭）。 */
+  redactEvidence: true,
+  /** 任务启动时检测 .artex 是否被 git 追踪并自动补 .gitignore。 */
+  gitIgnoreGuard: true,
+  /** 意图级 token 预算（0=不限）：单意图超出后先收尾再硬停。 */
+  maxTokensPerIntent: 0,
+  /** 是否要求任务必须绑定 engagement（false=可选绑定）。 */
+  requireEngagement: false,
 }
 
 const ENUMS = {
   mode: ['objective', 'audit'],
   viewMode: ['planner', 'hybrid', 'analyst'],
+  scopeEnforcement: ['warn', 'stop', 'off'],
 }
 
 /**

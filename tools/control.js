@@ -4,6 +4,21 @@
 
 import { artifact, callerOf, describe, integer, strings, isOwner, resolve, requireOwner, requireRead, pickLimits, liveRuntime, RUN_PARAMETERS } from '../tools-shared.js'
 
+/** run/start 共用：把参数收拢成 startTask 的 policy 形状（防线字段一并透传）。 */
+function policyFromArgs(args) {
+  return {
+    allowedTools: args.allowed_tools,
+    readOnly: args.read_only,
+    allowedPaths: args.allowed_paths,
+    allowedTargets: args.allowed_targets,
+    scopeEnforcement: args.scope_enforcement,
+    engagement: args.engagement,
+    redactEvidence: args.redact_evidence,
+    maxTokensPerIntent: args.max_tokens_per_intent,
+    skillPacks: args.skill_packs,
+  }
+}
+
 export function controlTools({ engine, config }) {
   const engineNote = config.isolateWorkdir
     ? '子会话在任务目录下的独立工作目录里工作'
@@ -31,7 +46,9 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           viewMode: args.view_mode,
           analyst: args.analyst,
           limits: pickLimits(args),
-          policy: { allowedTools: args.allowed_tools, readOnly: args.read_only, allowedPaths: args.allowed_paths },
+          policy: policyFromArgs(args),
+          confirm: args.confirm,
+          campaign: args.campaign,
           signal: exec.signal,
         })
         const stop = () => { void engine.stopTask(rt.task.id, '调用方中断') }
@@ -61,13 +78,20 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           viewMode: args.view_mode,
           analyst: args.analyst,
           limits: pickLimits(args),
-          policy: { allowedTools: args.allowed_tools, readOnly: args.read_only, allowedPaths: args.allowed_paths },
+          policy: policyFromArgs(args),
+          confirm: args.confirm,
+          campaign: args.campaign,
           signal: exec.signal,
         })
+        const scopeLine = rt.task.policy.allowedTargets.length > 0
+          ? `\nscope：${rt.task.policy.allowedTargets.join(', ')}（越界处置：${engine.scopeEnforcement(rt.task)}）`
+          : ''
+        const engagementLine = rt.task.engagement ? `\n交战绑定：${rt.task.engagement.id}` : ''
+        const campaignLine = rt.task.campaign ? `\n战役：${rt.task.campaign}` : ''
         return `ARTEX 任务已在后台启动：${rt.task.id}（${rt.task.mode} 模式 / 视野 ${rt.task.viewMode || 'planner'}）
 目标：${rt.task.goal}
 验收目标：${rt.task.goals.map(g => `\n  - [goal#${g.id}] ${g.text}`).join('')}
-并发 worker：${rt.task.limits.maxWorkers} · 轮次上限：${rt.task.limits.maxRounds}${rt.task.limits.budgetMs ? ` · 预算：${Math.round(rt.task.limits.budgetMs / 1000)}s` : ''}
+并发 worker：${rt.task.limits.maxWorkers} · 轮次上限：${rt.task.limits.maxRounds}${rt.task.limits.budgetMs ? ` · 预算：${Math.round(rt.task.limits.budgetMs / 1000)}s` : ''}${scopeLine}${engagementLine}${campaignLine}
 快照目录：${rt.task.outDir}
 
 下一步：artex_task_status(task_id="${rt.task.id}") 查看进度；artex_add_hint 注入提示；artex_stop_task 停止。`
@@ -75,15 +99,31 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
     }),
     artifact({
       name: 'artex_task_status',
-      description: '查看 ARTEX 任务状态：状态/轮次/目标达成情况/意图计数/事实与发现/待办/上限。不传 task_id 时列出本会话内存里的所有任务（以及当前工作区磁盘上的历史任务 id）。',
+      description: '查看 ARTEX 任务状态：状态/轮次/目标达成情况/意图计数/事实与发现/待办/上限。不传 task_id 时列出本会话内存里的所有任务（以及当前工作区磁盘上的历史任务 id）。传 campaign 时给出该战役的跨任务聚合视图（目标达成/发现/成本/越界计数）；list_campaigns=true 列出索引知悉的全部战役。',
       parameters: {
         type: 'object',
-        properties: { task_id: describe('可选：任务 id；省略则列出任务') },
+        properties: {
+          task_id: describe('可选：任务 id；省略则列出任务'),
+          campaign: describe('可选：战役 id——聚合该战役下全部任务（P3-1）'),
+          list_campaigns: { type: 'boolean', description: '可选：true=列出索引知悉的全部战役名' },
+        },
         additionalProperties: false,
       },
       concurrent: true,
       async execute(args, exec) {
         const { agent, role } = callerOf(engine, exec)
+        if (args.list_campaigns === true) {
+          const names = await engine.campaignList()
+          return names.length > 0 ? `索引知悉的战役：\n${names.map(n => `- ${n}`).join('\n')}` : '索引里还没有任何战役。'
+        }
+        if (args.campaign) {
+          const view = await engine.campaignStatus(String(args.campaign))
+          const lines = view.tasks.map(t => `- ${t.id} [${t.status}${t.live ? '/live' : ''}] goals ${t.goals_met}/${t.goals_total} · facts ${t.facts} · findings ${t.findings_total}（verified ${t.findings_verified}）· tokens ${t.tokens}${t.violations > 0 ? ` · ⚠越界 ${t.violations}` : ''} · ${t.description}`)
+          return `## 战役 ${view.campaign}（${view.totals.tasks} 个任务，${view.totals.running} 个在跑）
+目标达成：${view.totals.goals_met}/${view.totals.goals_total} · 事实 ${view.totals.facts} · 发现 ${view.totals.findings_total}（verified ${view.totals.findings_verified}）· tokens ${view.totals.tokens} · 越界 ${view.totals.violations}
+
+${lines.length > 0 ? lines.join('\n') : '（索引里没有该战役的任务）'}`
+        }
         if (args.task_id) {
           const task = await engine.resolveTask(String(args.task_id))
           requireRead(agent, role, task, config)
@@ -208,6 +248,30 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
         const added = engine.addHint(task, texts.map(String))
         void role
         return `已注入 ${added.length} 条提示：${added.map(h => `#${h.id}`).join(' ')}。规划者已被唤醒。`
+      },
+    }),
+    artifact({
+      name: 'artex_resolve_approval',
+      description: `裁决一个待审批意图（P1-2 审批门，owner-only）：worker/planner 把高风险动作挂起后（意图 approval.pending，状态查询的 pending_approvals 可见），approve=放行（意图恢复派发，批示会随提示词传给 worker）；reject=终止该意图。所有裁决都会落过程库审计轨迹。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          intent_id: { type: 'integer', required: true, description: '待审批的意图 id' },
+          decision: { type: 'string', enum: ['approve', 'reject'], required: true, description: 'approve=批准放行；reject=拒绝并终止意图' },
+          note: describe('可选：批示（批准时会随提示词传给重新派发的 worker；拒绝时作为终止理由）'),
+        },
+        required: ['intent_id', 'decision'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, task } = await resolve(engine, exec, args.task_id)
+        requireOwner(agent, task)
+        liveRuntime(engine, task)
+        const { intent, decision } = engine.resolveApproval(task, args.intent_id, args.decision, args.note || '')
+        return decision === 'approved'
+          ? `意图 #${intent.id} 已批准放行：${intent.summary}\n调度器将在下一拍重新派发；批示已随提示词下发。`
+          : `意图 #${intent.id} 已被拒绝并终止（state=stopped, reason=approval_rejected）：${intent.summary}`
       },
     }),
   ]

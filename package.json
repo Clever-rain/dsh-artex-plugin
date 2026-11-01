@@ -36,6 +36,10 @@
     "flags.js",
     "command.js",
     "http-api.js",
+    "guard.js",
+    "engagement.js",
+    "evidence.js",
+    "skills.js",
     "prompts.js",
     "tools.js",
     "tools-shared.js",
@@ -49,7 +53,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs && node test/audit-regressions-smoke.mjs && node test/view-api-smoke.mjs",
+    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs && node test/audit-regressions-smoke.mjs && node test/view-api-smoke.mjs && node test/roadmap-smoke.mjs",
     "bench": "node test/prompt-size.mjs"
   },
   "dsh": {

@@ -2,7 +2,7 @@
  * 调度器：主循环、规划轮、派发 worker、突破停止、收尾与证明轮。
  */
 
-import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView, degradedView, coverageOf, intentDepsSatisfied } from './graph.js'
+import { allGoalsMet, claimIntent, finishIntent, digestOf, deltaOf, plannerView, workerView, degradedView, coverageOf, intentDepsSatisfied, intentAwaitingApproval } from './graph.js'
 import { plannerPrompt, workerPrompt, settlePrompt, siblingStopPrompt, stallNudgePrompt } from './prompts.js'
 import { oneLine, sleep, classifyError, retryBackoffMs, isRetryWorthless, normalizeStopReason } from './util.js'
 
@@ -226,6 +226,8 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
     t.lastPlannerRoundAt = Date.now()
     const staleBrief = Boolean(t.brief) && (round - t.brief.round) > 1
     await engine.maybeRunAnalyst(rt, triggers)
+    // 成本水位：燃烧率与预算余量进态势，planner 据此收敛或坚持（P3-2）。
+    const cost = typeof engine.costView === 'function' ? engine.costView(rt) : undefined
     // 态势构建与子会话重试分离：投影构建失败走降级通道，不再炸掉整个任务。
     let view
     try {
@@ -234,6 +236,7 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
         digest: digestOf(t),
         delta: deltaOf(t, since),
         staleBrief,
+        cost,
       })
       rt.viewFailures = 0
       rt.lastViewError = undefined
@@ -337,8 +340,9 @@ export async function plannerRound(engine, rt, triggers, options = {}) {
 export function selectNextIntent(task) {
   // 显式依赖门禁：depends_on 里的意图全部 done 才可领取；依赖失败的方向不会被调度，
   // 由 planner 在下一轮决定改路线（意图视图里标 blocked_by_deps）。
+  // 审批门禁：owner 批准前（approval.pending）意图不可领取（P1-2 运行时审批门）。
   return task.intents
-    .filter(i => i.state === 'open' && intentDepsSatisfied(task, i))
+    .filter(i => i.state === 'open' && intentDepsSatisfied(task, i) && !intentAwaitingApproval(i))
     .sort((a, b) => (b.priority ?? 5) - (a.priority ?? 5) || a.id - b.id)[0]
 }
 
@@ -369,7 +373,10 @@ export function dispatchWorkers(engine, rt) {
 
 export async function runWorker(engine, rt, intent, workerName) {
     const t = rt.task
-    const prompt = workerPrompt({ task: t, intent, view: workerView(t, intent, { factsLimit: 5 }) })
+    const skillPacks = Array.isArray(rt.skillPacks) ? rt.skillPacks : []
+    const prompt = workerPrompt({ task: t, intent, view: workerView(t, intent, { factsLimit: 5 }), skillPacks })
+    // 深挖档：depth>1 的 pursue 意图获得成比例的墙钟预算（P2-1，链式推进更吃时间）。
+    const depthFactor = Math.max(1, Math.min(3, Number(intent.depth) || 1))
     let outcome
     try {
       outcome = await engine.runChild(rt, {
@@ -377,9 +384,9 @@ export async function runWorker(engine, rt, intent, workerName) {
         key: `intent-${intent.id}`,
         intentId: intent.id,
         kind: intent.kind,
-        label: `ARTEX worker · intent #${intent.id}`,
+        label: `ARTEX worker · intent #${intent.id}${depthFactor > 1 ? ` · depth ${depthFactor}` : ''}`,
         prompt,
-        timeoutMs: clampToBudget(engine, rt, t.limits.workerTimeoutMs),
+        timeoutMs: clampToBudget(engine, rt, t.limits.workerTimeoutMs * depthFactor),
         cwd: engine.config.isolateWorkdir ? `${t.outDir}/i${intent.id}` : undefined,
       })
     } catch (error) {
@@ -425,6 +432,10 @@ export function finishWorker(engine, rt, intent, outcome) {
     if (outcome.error) {
       state = 'blocked'
       reason = outcome.error
+    } else if (intentAwaitingApproval(intent)) {
+      // 审批挂起：worker 主动结束本轮等待 owner 裁决；意图回 open 但不可领取（selectNextIntent 门禁）。
+      state = 'open'
+      reason = 'awaiting_approval'
     } else if (rt.siblingStops?.has(intent.id)) {
       state = 'stopped'
       reason = t.mode === 'audit' ? 'goal_met' : 'sibling_breakthrough'
@@ -457,11 +468,17 @@ export function finishWorker(engine, rt, intent, outcome) {
       reason = 'enumerated'
     }
     finishIntent(t, intent.id, { state, output: outcome.text, reason, writes })
+    if (state === 'open' && reason === 'awaiting_approval') {
+      // finishIntent 统一打了 endedAt；审批挂起不是终态，抹掉避免被 delta 当"已结束"。
+      intent.endedAt = undefined
+      intent.startedAt = undefined
+      intent.worker = undefined
+    }
     engine.addActivity(rt, {
       intentId: intent.id,
-      worker: intent.worker,
+      worker: intent.worker || 'worker',
       kind: 'result',
-      summary: `意图 #${intent.id} 结束：${state}`,
+      summary: `意图 #${intent.id} 结束：${state}${reason === 'awaiting_approval' ? '（等待人工审批）' : ''}`,
       detail: outcome.text || outcome.error || '',
       isError: state === 'blocked',
     })

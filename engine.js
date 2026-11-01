@@ -16,16 +16,20 @@
 import { randomUUID } from 'node:crypto'
 import {
   TaskStore, ResourceStore, TaskIndex, isValidTaskId,
-  createTask, addActivity as graphAddActivity,
+  createTask, addActivity as graphAddActivity, addViolation as graphAddViolation,
 } from './graph.js'
 import { interruptChildren as interruptChildrenImpl, interruptChild as interruptChildImpl, runChild as runChildImpl, awaitChild as awaitChildImpl, outcome as outcomeImpl, abortOnly as abortOnlyImpl, abortOrTimeout as abortOrTimeoutImpl, nudge as nudgeImpl } from './runner.js'
 import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as completeGracefullyImpl, beginSettling as beginSettlingImpl, drain as drainImpl, plannerRound as plannerRoundImpl, dispatchWorkers as dispatchWorkersImpl, runWorker as runWorkerImpl, finishWorker as finishWorkerImpl, pushEvent as pushEventImpl, wake as wakeImpl, waitEvent as waitEventImpl, sleepOrAbort as sleepOrAbortImpl, checkStalledWorkers as checkStalledWorkersImpl } from './scheduler.js'
 import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
 import { queueVerifier as queueVerifierImpl } from './verifier.js'
 import { recordUsage as recordUsageImpl } from './usage.js'
-import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl, retestFinding as retestFindingImpl, recordConflict as recordConflictImpl, retractFact as retractFactImpl } from './graph-ops.js'
-import { snapshot as snapshotImpl, status as statusImpl, report as reportImpl } from './reporting.js'
+import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl, retestFinding as retestFindingImpl, recordConflict as recordConflictImpl, retractFact as retractFactImpl, requestApproval as requestApprovalImpl, resolveApproval as resolveApprovalImpl } from './graph-ops.js'
+import { snapshot as snapshotImpl, status as statusImpl, report as reportImpl, campaignStatus as campaignStatusImpl, campaignList as campaignListImpl } from './reporting.js'
 import { handleSessionEvent as handleSessionEventImpl } from './session-indexer.js'
+import { lintGoalTexts } from './guard.js'
+import { loadEngagement, validateEngagement, ensureArtexGitignored } from './engagement.js'
+import { loadSkillPacks } from './skills.js'
+import { violationNudgePrompt, tokenCapSettlePrompt } from './prompts.js'
 import { sleep } from './util.js'
 import { normalizeConfig } from './config.js'
 import { TOOL_NAMES, denyForRole, policyDenyForTask } from './policy.js'
@@ -203,6 +207,12 @@ export class ArtexEngine {
       viewFailures: 0,
       lastViewError: undefined,
       verifierQueue: undefined,
+      // 技能包（startTask 时装载，worker 提示词与工具面来源）。
+      skillPacks: [],
+      // 成本水位（燃烧率口径：上一轮规划时的累计 token）。
+      costMark: undefined,
+      // 已触发意图级 token 门禁的意图（避免重复收尾）。
+      tokenCapNudged: new Set(),
       finished: false,
       startedAt: Date.now(),
       done: undefined,
@@ -214,11 +224,25 @@ export class ArtexEngine {
     }
   }
 
-  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, policy = {}, signal }) {
+  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, policy = {}, confirm, campaign, signal }) {
     if (this.disposed) throw new Error('ARTEX 插件已卸载')
     if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
     if (!String(goal || '').trim()) throw new Error('goal 不能为空')
     this.providerName = this.resolveProvider()
+    // P0-2 目标审查（确定性词表，不经过模型）：命中犯罪意图信号时必须显式确认。
+    const lintTexts = [goal, ...(Array.isArray(goals) ? goals : []), ...(Array.isArray(constraints) ? constraints : [])]
+    const riskHits = lintGoalTexts(lintTexts)
+    let riskConfirm
+    if (riskHits.length > 0) {
+      if (String(confirm ?? '').trim() !== String(goal).trim()) {
+        throw new Error(`目标审查命中高风险信号：${[...new Set(riskHits.map(h => h.label))].join('、')}。\n` +
+          '若确属授权场景（如防御研究/靶场演练/报告复现），请把 confirm 参数精确设为 goal 原文再提交；该确认与命中词会随任务留痕。')
+      }
+      riskConfirm = {
+        hits: [...new Map(riskHits.map(h => [h.category, { category: h.category, label: h.label }])).values()],
+        confirmedAt: Date.now(),
+      }
+    }
     // 开关优先级：任务级 analyst / 插件级 enableHybrid 任一关闭 → planner；
     // 否则按任务 view_mode > 插件 viewMode > hybrid 生效。
     const requestedView = ['planner', 'hybrid', 'analyst'].includes(viewMode)
@@ -228,6 +252,33 @@ export class ArtexEngine {
       ? 'planner'
       : (['planner', 'hybrid', 'analyst'].includes(requestedView) ? requestedView : 'hybrid')
     const cwd = await this.cwdFor(agent, signal)
+    // P0-1 交战绑定：授权一等公民化——授权说明/目标集/时间窗在启动期机器校验。
+    const policyInput = { ...(policy || {}) }
+    const wantsEngagement = String(policyInput.engagement ?? '').trim()
+    let engagementMeta
+    if (this.config.requireEngagement === true && !wantsEngagement) {
+      throw new Error('插件配置要求绑定交战（requireEngagement=true）：请提供 engagement 参数，对应 .artex/engagements/<id>.json')
+    }
+    if (wantsEngagement) {
+      const engagement = await loadEngagement(cwd, wantsEngagement)
+      const declaredTargets = (Array.isArray(policyInput.allowedTargets ?? policyInput.allowed_targets)
+        ? (policyInput.allowedTargets ?? policyInput.allowed_targets)
+        : []).map(v => String(v).trim()).filter(Boolean)
+      const problems = validateEngagement(engagement, { allowedTargets: declaredTargets })
+      if (problems.length > 0) {
+        throw new Error(`交战 ${wantsEngagement} 校验未通过：\n- ${problems.join('\n- ')}`)
+      }
+      if (declaredTargets.length === 0) {
+        // 交战目标集即默认 scope：授权边界自动成为任务边界。
+        policyInput.allowedTargets = [...(engagement.targets || [])]
+      }
+      engagementMeta = {
+        id: engagement.id,
+        authorization: String(engagement.authorization).slice(0, 300),
+        targets: Array.isArray(engagement.targets) ? engagement.targets : [],
+        window: engagement.window && typeof engagement.window === 'object' ? engagement.window : {},
+      }
+    }
     const stores = this.storeFor(cwd)
     const id = `t${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
     const effectiveMode = resolveTaskMode(mode, this.config.mode)
@@ -241,11 +292,14 @@ export class ArtexEngine {
       goal: String(goal).trim(),
       goals,
       constraints,
-      policy,
+      policy: policyInput,
       mode: effectiveMode,
       viewMode: effectiveView,
       ownerSession: agent.id,
       cwd,
+      campaign,
+      engagement: engagementMeta,
+      riskConfirm,
       outDir: stores.tasks.taskDir(id),
       limits: {
         maxWorkers: Math.max(0, Number(merged.maxWorkers) || 0),
@@ -277,6 +331,7 @@ export class ArtexEngine {
       throw new Error(`ARTEX 任务 ${id} 初始化落盘失败：${error?.message || error}`)
     }
     await this.index.register(task).catch((error) => this.logger.warn?.(`[artex] task index register failed: ${error?.message || error}`))
+    await this.prepareRuntimeGuards(rt, { fresh: true })
     rt.loop = this.runLoop(rt).catch((error) => {
       this.logger.warn?.(`[artex] task ${id} loop failed: ${error?.message || error}`)
       if (!rt.finished) this.finish(rt, 'failed', String(error?.message || error))
@@ -371,6 +426,7 @@ export class ArtexEngine {
       throw new Error(`ARTEX 任务 ${id} 恢复落盘失败：${stores.tasks.lastError?.message || stores.tasks.lastError}`)
     }
     await this.index.register(task).catch((error) => this.logger.warn?.(`[artex] task index register failed: ${error?.message || error}`))
+    await this.prepareRuntimeGuards(rt, { fresh: false })
     rt.loop = this.runLoop(rt).catch((error) => {
       this.logger.warn?.(`[artex] task ${id} loop failed: ${error?.message || error}`)
       if (!rt.finished) this.finish(rt, 'failed', String(error?.message || error))
@@ -379,6 +435,37 @@ export class ArtexEngine {
     rt.deadlineTimer.unref?.()
     void signal
     return rt
+  }
+
+  /**
+   * 启动/恢复共用的新 runtime 防线装配：
+   * P0-3 .artex git 防裸奔（仅首次启动）；P2-2 技能包装载与工具面并入。
+   */
+  async prepareRuntimeGuards(rt, { fresh = false } = {}) {
+    const task = rt.task
+    if (fresh && this.config.gitIgnoreGuard !== false) {
+      try {
+        const guard = await ensureArtexGitignored(task.cwd)
+        if (guard.changed) {
+          this.addActivity(rt, { intentId: null, worker: 'engine', kind: 'system', summary: guard.note })
+        }
+      } catch (error) {
+        this.logger.warn?.(`[artex] gitignore guard failed: ${error?.message || error}`)
+      }
+    }
+    if (task.policy.skillPacks.length > 0) {
+      rt.skillPacks = await loadSkillPacks(task.cwd, task.policy.skillPacks)
+      if (task.policy.allowedTools.length === 0) {
+        const packTools = rt.skillPacks.flatMap(p => p.tools)
+        if (packTools.length > 0) task.policy.allowedTools = [...new Set(packTools)]
+      }
+      this.addActivity(rt, {
+        intentId: null,
+        worker: 'engine',
+        kind: 'system',
+        summary: `装载技能包：${rt.skillPacks.map(p => p.name).join(', ')}`,
+      })
+    }
   }
 
   async dispose() {
@@ -606,6 +693,126 @@ export class ArtexEngine {
   recordUsage(rt, role, usage) {
     recordUsageImpl(this, rt, role, usage)
     this.checkTokenBudget(rt)
+    this.checkIntentTokenBudget(rt, role)
+  }
+
+  /* ----------------------------------------------------------------- guards */
+
+  /** scope 越界处置档位：任务 policy > 插件配置，默认 warn。 */
+  scopeEnforcement(task) {
+    return task?.policy?.scopeEnforcement || this.config.scopeEnforcement || 'warn'
+  }
+
+  /**
+   * P0-1 引擎级 scope 越界处置（session-indexer 在 worker 工具调用事件上调用）：
+   * 记录 → 当场提醒 worker → 唤醒 planner；stop 档直接停止任务。
+   * 注意边界：DSH 不给插件 OS 级路径/网络沙箱，这里是"检测+提醒+停任务"，
+   * 无法在工具调用执行前抢占拦截——抢占靠 allowed_tools 白名单与 read_only。
+   */
+  flagScopeViolation(rt, role, toolName, verdict) {
+    if (!rt || rt.finished || !verdict || verdict.misses.length === 0) return
+    const task = rt.task
+    const enforcement = this.scopeEnforcement(task)
+    const entry = graphAddViolation(task, {
+      tool: toolName,
+      intentId: role?.intentId ?? null,
+      targets: verdict.targets,
+      misses: verdict.misses,
+      enforcement,
+    })
+    this.addActivity(rt, {
+      intentId: entry.intentId,
+      worker: 'engine',
+      kind: 'violation',
+      summary: `scope 越界：${toolName} 目标 ${entry.misses.join(', ')} 不在 allowed_targets 内`,
+      detail: `工具：${toolName}\n提取目标：${entry.targets.join(', ') || '-'}\n越界目标：${entry.misses.join(', ')}\n处置档位：${enforcement}`,
+    })
+    const childId = role?.intentId ? rt.children.get(`intent-${role.intentId}`) : undefined
+    if (childId) {
+      void this.nudge(rt, childId, violationNudgePrompt({ tool: toolName, misses: entry.misses, enforcement }))
+    }
+    this.pushEvent(rt, { kind: 'violation', summary: `意图 #${role?.intentId ?? '-'} 越界（${entry.misses.join(', ')}）` })
+    if (enforcement === 'stop') {
+      this.finish(rt, 'stopped', `scope 越界停止：${entry.misses.join(', ')} 不在 allowed_targets 内`)
+      return
+    }
+    void this.persist(rt)
+  }
+
+  /**
+   * P3-2 意图级 token 预算门禁：单意图超 cap → 先收尾提醒，宽限后硬停。
+   * 每意图只触发一次（tokenCapNudged 去重），由 finishWorker 按正常终态收尾。
+   */
+  checkIntentTokenBudget(rt, role) {
+    const cap = Number(rt?.task?.policy?.maxTokensPerIntent) || Number(this.config.maxTokensPerIntent) || 0
+    if (cap <= 0 || !role?.intentId || !rt || rt.finished) return false
+    if (rt.tokenCapNudged.has(role.intentId)) return false
+    const bucket = rt.task.usage?.by_intent?.[`#${role.intentId}`]
+    const total = (bucket?.input_tokens || 0) + (bucket?.output_tokens || 0)
+    if (total <= cap) return false
+    rt.tokenCapNudged.add(role.intentId)
+    this.addActivity(rt, {
+      intentId: role.intentId,
+      worker: 'engine',
+      kind: 'system',
+      summary: `意图 #${role.intentId} 超过意图级 token 预算（${total} > ${cap}），要求收尾`,
+    })
+    const childId = rt.children.get(`intent-${role.intentId}`)
+    if (childId) {
+      void this.nudge(rt, childId, tokenCapSettlePrompt({ intentId: role.intentId, used: total, cap }))
+      const grace = Math.max(5000, Number(rt.task.limits.settleGraceMs) || 30000)
+      const timer = setTimeout(() => {
+        if (!rt.finished && rt.running.has(role.intentId)) this.interruptChild(rt, childId)
+      }, grace)
+      timer.unref?.()
+    }
+    void this.persist(rt)
+    return true
+  }
+
+  /** P3-2 成本水位：planner 每轮看到的燃烧率与预算余量。 */
+  costView(rt) {
+    const task = rt.task
+    const usage = task.usage || { input_tokens: 0, output_tokens: 0, calls: 0 }
+    const total = (usage.input_tokens || 0) + (usage.output_tokens || 0)
+    const mark = rt.costMark || { total: 0 }
+    const sinceLast = Math.max(0, total - mark.total)
+    rt.costMark = { total, round: task.round }
+    const rounds = Math.max(1, task.round)
+    const view = {
+      total_tokens: total,
+      calls: usage.calls || 0,
+      since_last_round: sinceLast,
+      per_round_avg: Math.round(total / rounds),
+    }
+    if (task.limits.maxTokens > 0) {
+      view.max_tokens = task.limits.maxTokens
+      view.remaining_tokens = Math.max(0, task.limits.maxTokens - total)
+      view.est_rounds_left = view.per_round_avg > 0 ? Math.floor(view.remaining_tokens / view.per_round_avg) : undefined
+    }
+    const cap = Number(task.policy?.maxTokensPerIntent) || Number(this.config.maxTokensPerIntent) || 0
+    if (cap > 0) view.per_intent_cap = cap
+    return view
+  }
+
+  /* ---------------------------------------------------------------- approval */
+
+  requestApproval(task, intentId, request = {}) {
+    return requestApprovalImpl(this, task, intentId, request)
+  }
+
+  resolveApproval(task, intentId, decision, note = '') {
+    return resolveApprovalImpl(this, task, intentId, decision, note)
+  }
+
+  /* ---------------------------------------------------------------- campaign */
+
+  async campaignStatus(campaign) {
+    return campaignStatusImpl(this, campaign)
+  }
+
+  async campaignList() {
+    return campaignListImpl(this)
   }
 
   cleanupRoles(rt) {

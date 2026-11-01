@@ -1149,10 +1149,10 @@ try {
     assert.equal(noAgent.kind, 'error', '缺会话 id 必须报错而不是写到空键')
   }
 
-  // N48：presenter 卡片——全部 artex_* 标题带 🧭 前缀；23 个工具都有中文标签（不回退裸名）
+  // N48：presenter 卡片——全部 artex_* 标题带 🧭 前缀；25 个工具都有中文标签（不回退裸名）
   {
     const names = createTools({ engine: { roleOf: () => undefined }, config: DEFAULTS }).map(t => t.name)
-    assert.equal(names.length, 23)
+    assert.equal(names.length, 25)
     for (const name of names) {
       const def = artifact({ name, description: 'x', parameters: { type: 'object' }, execute: async () => '' })
       const view = def.presentCall({ goal: 'g' })

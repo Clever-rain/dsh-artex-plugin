@@ -1,7 +1,9 @@
 /**
  * 探索图领域模型：目标 / 意图 / 事实 / 发现 / 提示 / 待办 / brief / 分析。
- * 纯数据函数，不依赖文件系统。
+ * 纯数据函数，不依赖文件系统（guard.js 同样是纯函数层，可互引）。
  */
+
+import { redactText } from './guard.js'
 
 const now = () => Date.now()
 
@@ -9,13 +11,29 @@ function emptyStats() {
   return { intents: 0, facts: 0, findings: 0, hints: 0, resources: 0, activities: 0 }
 }
 
-/** 任务级工具/沙箱策略：任务参数的规范化形状（真实门禁在 spawn 的 toolFilter/cwd，提示词进 prompt）。 */
+/** 任务级工具/沙箱策略：任务参数的规范化形状（真实门禁在 spawn 的 toolFilter/cwd/引擎 scope 校验，提示词进 prompt）。 */
 export function normalizePolicy(policy = {}) {
   const clean = value => (Array.isArray(value) ? [...new Set(value.map(v => String(v).trim()).filter(Boolean))] : [])
+  const enforcement = ['warn', 'stop', 'off'].includes(policy.scopeEnforcement ?? policy.scope_enforcement)
+    ? (policy.scopeEnforcement ?? policy.scope_enforcement)
+    : undefined
+  const maxTokensPerIntent = Number(policy.maxTokensPerIntent ?? policy.max_tokens_per_intent)
   return {
     allowedTools: clean(policy.allowedTools ?? policy.allowed_tools),
     readOnly: policy.readOnly === true || policy.read_only === true,
     allowedPaths: clean(policy.allowedPaths ?? policy.allowed_paths),
+    // P0 防线：目标白名单（域名/IP/CIDR），引擎在 worker 工具调用上做确定性越界检测。
+    allowedTargets: clean(policy.allowedTargets ?? policy.allowed_targets),
+    // 越界处置：warn=记录+提醒；stop=停任务；off=只提示词约束。undefined=继承插件配置。
+    scopeEnforcement: enforcement,
+    // 交战绑定：.artex/engagements/<id>.json（授权说明/目标集/时间窗）。
+    engagement: policy.engagement ? String(policy.engagement).trim() : '',
+    // 证据脱敏：undefined=继承插件配置（默认开）；false=任务显式关闭。
+    redactEvidence: policy.redactEvidence ?? policy.redact_evidence,
+    // 意图级 token 预算（0/NaN=不限）。
+    maxTokensPerIntent: Number.isFinite(maxTokensPerIntent) && maxTokensPerIntent > 0 ? maxTokensPerIntent : 0,
+    // 技能包：声明加载的打法与工具面（skills.js）。
+    skillPacks: clean(policy.skillPacks ?? policy.skill_packs),
   }
 }
 
@@ -31,6 +49,12 @@ export function createTask(input) {
     ownerSession: input.ownerSession,
     cwd: input.cwd,
     outDir: input.outDir,
+    // 战役归属（跨任务聚合视图）；交战绑定摘要与目标审查留痕随快照持久化。
+    campaign: input.campaign ? String(input.campaign).trim() : undefined,
+    engagement: input.engagement && typeof input.engagement === 'object' ? input.engagement : undefined,
+    riskConfirm: input.riskConfirm && typeof input.riskConfirm === 'object' ? input.riskConfirm : undefined,
+    // scope 越界事件（引擎写入，持久化供报告与审计；有界截断）。
+    violations: [],
     status: 'created',
     mode: input.mode === 'audit' ? 'audit' : 'objective',
     viewMode: ['planner', 'hybrid', 'analyst'].includes(input.viewMode) ? input.viewMode : undefined,
@@ -125,19 +149,29 @@ export function addIntents(task, items, options = {}) {
       out.push({ id: dup.id, duplicate: true, state: dup.state, summary })
       continue
     }
+    const kind = raw?.kind === 'enumerate' || raw?.kind === 'pursue'
+      ? raw.kind
+      : (task.mode === 'audit' ? 'enumerate' : 'pursue')
+    // 深挖档：仅 objective 模式的 pursue 允许 depth>1（audit 要逐项独立证据链，不允许链式推进）。
+    const wantsDepth = Number.isFinite(Number(raw?.depth)) ? Math.floor(Number(raw.depth)) : 1
+    const depth = (kind === 'pursue' && task.mode === 'objective') ? Math.max(1, Math.min(3, wantsDepth)) : 1
+    // 高风险意图可由 planner 显式挂审批：owner 批准前不会被领取。
+    const requiresApproval = raw?.requires_approval === true || raw?.requiresApproval === true
     const intent = {
       id: nextNodeId(task),
       summary,
       state: raw?.state === 'blueprint' ? 'blueprint' : 'open',
-      kind: raw?.kind === 'enumerate' || raw?.kind === 'pursue'
-        ? raw.kind
-        : (task.mode === 'audit' ? 'enumerate' : 'pursue'),
+      kind,
       pathParent: normalizeIntentRef(task, raw?.path_parent ?? raw?.pathParent),
       priority: Number.isFinite(raw?.priority) ? raw.priority : 5,
       resourceIds: normalizeIds(raw?.resource_ids),
       parents: normalizeIds(raw?.parents),
       // 显式串行依赖：全部依赖完成后才可被领取（草地：依赖以外部校验保证存在）。
       dependsOn: normalizeIds(raw?.depends_on ?? raw?.dependsOn),
+      depth,
+      approval: requiresApproval
+        ? { pending: true, request: { reason: 'planner 标记为高风险动作', by: 'planner', at: now() }, decision: undefined }
+        : undefined,
       createdAt: now(),
       startedAt: undefined,
       endedAt: undefined,
@@ -235,6 +269,71 @@ export function intentDepsDead(task, intent) {
   })
 }
 
+/* ---------------------------------------------------------------- approval */
+
+/** 意图是否在等待人工审批（owner 批准前不可被领取）。 */
+export function intentAwaitingApproval(intent) {
+  return intent?.approval?.pending === true
+}
+
+/** worker 或 planner 发起审批请求：意图挂起，owner 批准前不再派发。 */
+export function requestApproval(task, intentId, request = {}) {
+  const intent = intentById(task, intentId)
+  if (!intent) throw new Error(`意图 #${intentId} 不存在`)
+  if (!['open', 'running'].includes(intent.state)) {
+    throw new Error(`意图 #${intentId} 已终态（state=${intent.state}），不能再请求审批`)
+  }
+  intent.approval = {
+    pending: true,
+    request: {
+      reason: String(request.reason || '').slice(0, 400),
+      action: String(request.action || '').slice(0, 400),
+      by: String(request.by || 'worker'),
+      at: now(),
+    },
+    decision: undefined,
+  }
+  task.updatedAt = now()
+  return intent
+}
+
+/**
+ * owner 裁决审批：approve → 意图恢复可领取；reject → 意图终止。
+ * @returns {{intent:object, decision:string}}
+ */
+export function resolveApproval(task, intentId, decision, note = '') {
+  const intent = intentById(task, intentId)
+  if (!intent) throw new Error(`意图 #${intentId} 不存在`)
+  if (!intentAwaitingApproval(intent)) throw new Error(`意图 #${intentId} 当前没有待审批请求`)
+  const result = decision === 'approve' ? 'approved' : 'rejected'
+  intent.approval.pending = false
+  intent.approval.decision = { result, note: String(note || '').slice(0, 400), at: now() }
+  if (result === 'rejected') {
+    intent.state = 'stopped'
+    intent.endedAt = now()
+    intent.reason = 'approval_rejected'
+  }
+  task.updatedAt = now()
+  return { intent, decision: result }
+}
+
+/** 记录一次 scope 越界事件（有界截断，随快照持久化）。 */
+export function addViolation(task, input) {
+  task.violations = Array.isArray(task.violations) ? task.violations : []
+  const entry = {
+    tool: String(input.tool || ''),
+    intentId: input.intentId ? Number(input.intentId) : null,
+    targets: (Array.isArray(input.targets) ? input.targets : []).slice(0, 10),
+    misses: (Array.isArray(input.misses) ? input.misses : []).slice(0, 10),
+    enforcement: input.enforcement || 'warn',
+    at: now(),
+  }
+  task.violations.push(entry)
+  if (task.violations.length > 200) task.violations.splice(0, task.violations.length - 200)
+  task.updatedAt = now()
+  return entry
+}
+
 export function claimIntent(task, id, worker) {
   const intent = intentById(task, id)
   if (!intent || intent.state !== 'open') return undefined
@@ -278,14 +377,20 @@ function trimCollection(task, key, max) {
   task[key] = keep
 }
 
+/** 证据脱敏：任务策略未显式关闭时，敏感值（口令/token/私钥）写图前打码。 */
+function maybeRedact(task, value) {
+  if (task.policy?.redactEvidence === false) return value
+  return redactText(value)
+}
+
 export function recordFact(task, input) {
   const summary = String(input?.summary ?? '').trim()
   if (!summary) throw new Error('fact.summary 不能为空')
   const fact = {
     id: nextNodeId(task),
     summary,
-    detail: input.detail ? String(input.detail) : '',
-    evidence: input.evidence ? String(input.evidence) : '',
+    detail: input.detail ? String(maybeRedact(task, input.detail)) : '',
+    evidence: input.evidence ? String(maybeRedact(task, input.evidence)) : '',
     confidence: input.confidence === 'inferred' ? 'inferred' : 'observed',
     outcome: ['found', 'none', 'inconclusive', 'blueprint'].includes(input.outcome) ? input.outcome : undefined,
     intentId: input.intentId ? Number(input.intentId) : null,
@@ -311,9 +416,11 @@ export function reportFinding(task, input) {
   const finding = {
     id: nextNodeId(task),
     title: String(input.title || input.summary || '').trim(),
-    detail: input.detail ? String(input.detail) : '',
+    detail: input.detail ? String(maybeRedact(task, input.detail)) : '',
     severity: input.severity ? String(input.severity) : 'unknown',
-    evidence: input.evidence ? String(input.evidence) : '',
+    evidence: input.evidence ? String(maybeRedact(task, input.evidence)) : '',
+    // 原始证据绑定：步骤 id（过程库）与工件（path+sha256），graph-ops 校验后传入。
+    evidenceRefs: input.evidenceRefs && typeof input.evidenceRefs === 'object' ? input.evidenceRefs : undefined,
     intentId: input.intentId ? Number(input.intentId) : null,
     resourceIds: normalizeIds(input.resourceIds),
     // 生命周期：open → verified / rejected（artex_retest_finding 驱动）。

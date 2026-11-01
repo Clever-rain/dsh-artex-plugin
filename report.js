@@ -63,8 +63,18 @@ export function formatReport(task) {
   const capped = (lines, limit) => lines.length > limit
     ? [...lines.slice(0, limit), `- …另 ${lines.length - limit} 条（见任务快照）`]
     : lines
+  const refLine = (f) => {
+    const refs = f.evidenceRefs
+    if (!refs) return ''
+    const parts = []
+    if (refs.steps?.length > 0) parts.push(`steps ${refs.steps.map(id => `#${id}`).join(' ')}`)
+    if (refs.artifacts?.length > 0) {
+      parts.push(`artifacts ${refs.artifacts.map(a => `${a.path}${a.sha256 ? ` (sha256:${a.sha256.slice(0, 12)}…)` : ''}`).join(', ')}`)
+    }
+    return parts.length > 0 ? `\n  - 证据绑定：${parts.join('；')}` : ''
+  }
   const findingLines = task.findings.length > 0
-    ? capped(task.findings.map(f => `- [finding#${f.id}] ${f.title}（severity=${f.severity}, intent#${f.intentId ?? '-'}）`), 30).join('\n')
+    ? capped(task.findings.map(f => `- [finding#${f.id}] ${f.title}（severity=${f.severity}, intent#${f.intentId ?? '-'}）${refLine(f)}`), 30).join('\n')
     : '- （无）'
   const intentLine = (i) => `- [intent#${i.id}] ${i.state}${i.kind ? `/${i.kind}` : ''}${i.reason ? `（${i.reason}）` : ''} · writes(facts=${i.writes.facts},findings=${i.writes.findings}) · ${i.summary}`
   const intentLines = task.intents.length > 0
@@ -85,12 +95,36 @@ export function formatReport(task) {
   const supersededCount = task.facts.filter(f => f.supersededBy).length
   const retractedNote = retractedCount > 0 ? `，其中已撤回 ${retractedCount}` : ''
   const supersededNote = supersededCount > 0 ? `、已被取代 ${supersededCount}` : ''
+  // 防线留痕：交战绑定 / 目标审查确认 / scope 越界事件，报告里一眼可查。
+  const engagementLine = task.engagement
+    ? `\n- 交战绑定：${task.engagement.id}（授权：${task.engagement.authorization || '见交战文件'}${task.engagement.window?.not_after ? `；窗口至 ${task.engagement.window.not_after}` : ''}）`
+    : ''
+  const riskLine = task.riskConfirm
+    ? `\n- 目标审查：命中 ${task.riskConfirm.hits.map(h => h.label).join('、')}，已于 ${new Date(task.riskConfirm.confirmedAt).toISOString()} 经 confirm 原文确认`
+    : ''
+  const campaignLine = task.campaign ? `\n- 战役：${task.campaign}` : ''
+  const scopeLine = task.policy?.allowedTargets?.length > 0
+    ? `\n- scope：${task.policy.allowedTargets.join(', ')}（处置档位 ${task.policy.scopeEnforcement || 'warn'}）`
+    : ''
+  const violations = Array.isArray(task.violations) ? task.violations : []
+  const violationBlock = violations.length > 0
+    ? `\n\n## scope 越界事件（${violations.length}）\n${capped(violations.map(v => `- [${new Date(v.at).toISOString()}] intent#${v.intentId ?? '-'} ${v.tool} → 越界 ${v.misses.join(', ')}（处置 ${v.enforcement}）`), 20).join('\n')}`
+    : ''
+  const approvals = task.intents.filter(i => i.approval)
+  const approvalBlock = approvals.length > 0
+    ? `\n\n## 人工审批记录\n${approvals.map((i) => {
+      const a = i.approval
+      const req = a.request ? `申请（${a.request.by}）：${a.request.action || a.request.reason || '-'}` : 'planner 标记'
+      const dec = a.decision ? ` → ${a.decision.result === 'approved' ? '✔ 批准' : '✘ 拒绝'}${a.decision.note ? `（${a.decision.note}）` : ''}` : (a.pending ? ' → ⏳ 待裁决' : '')
+      return `- [intent#${i.id}] ${i.summary.slice(0, 80)}：${req}${dec}`
+    }).join('\n')}`
+    : ''
   return `# ARTEX 任务 ${task.id} 结束：${task.status}（${task.mode || 'objective'} 模式）
 
 - 目标：${task.goal}
 - 描述：${task.description}
-- 用时：${elapsed}s · 规划轮次：${task.round} · 意图状态：${JSON.stringify(stateCount)}
-- 事实 ${task.stats.facts} 条（内存保留 ${task.facts.length}${retractedNote}${supersededNote}） · 发现 ${task.stats.findings} 个${findingStatusNote} · 资源 ${task.stats.resources} 个 · 过程步骤 ${task.stats.activities} 条${usageLine}${usageBlock}${coverageBlock}${conflictLines}
+- 用时：${elapsed}s · 规划轮次：${task.round} · 意图状态：${JSON.stringify(stateCount)}${campaignLine}${engagementLine}${riskLine}${scopeLine}
+- 事实 ${task.stats.facts} 条（内存保留 ${task.facts.length}${retractedNote}${supersededNote}） · 发现 ${task.stats.findings} 个${findingStatusNote} · 资源 ${task.stats.resources} 个 · 过程步骤 ${task.stats.activities} 条${usageLine}${usageBlock}${coverageBlock}${conflictLines}${violationBlock}${approvalBlock}
 
 ## 全局认知（planner brief）
 ${brief ? '```markdown\n' + brief + '\n```' : '（未建立）'}

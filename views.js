@@ -3,7 +3,7 @@
  * 只读投影，不修改图。
  */
 
-import { intentById, nodeById, nodeKind, openIntents, runningIntents, truncate, intentDepsSatisfied } from './model.js'
+import { intentById, nodeById, nodeKind, openIntents, runningIntents, truncate, intentDepsSatisfied, intentAwaitingApproval } from './model.js'
 
 /* ---------------------------------------------------------------- queries */
 
@@ -22,6 +22,8 @@ function briefIntent(task, i) {
     parents: i.parents,
     yields: intentYields(task, i.id),
     writes: i.writes,
+    depth: i.depth > 1 ? i.depth : undefined,
+    awaiting_approval: intentAwaitingApproval(i) || undefined,
   }
 }
 
@@ -68,6 +70,8 @@ export function overview(task, options = {}) {
     findings_truncated: task.findings.length > 50 || undefined,
     hints: task.hints.map(h => ({ id: h.id, text: h.text })),
     todos: task.todos,
+    pending_approvals: task.intents.filter(i => intentAwaitingApproval(i)).map(i => ({ id: i.id, summary: truncate(i.summary, 100) })),
+    scope_violations: Array.isArray(task.violations) ? task.violations.length : 0,
     stats: {
       round: task.round,
       intents_total: task.stats.intents,
@@ -156,6 +160,8 @@ export function plannerView(task, options = {}) {
     if (intent.kind === 'pursue') row.kind = 'pursue'
     if (intent.pathParent) row.path_parent = intent.pathParent
     if (intent.parents.length > 0) row.parents = intent.parents
+    if (intent.depth > 1) row.depth = intent.depth
+    if (intentAwaitingApproval(intent)) row.awaiting_approval = true
     if (Array.isArray(intent.dependsOn) && intent.dependsOn.length > 0) {
       row.depends_on = intent.dependsOn
       if (!intentDepsSatisfied(task, intent)) row.blocked_by_deps = true
@@ -175,6 +181,13 @@ export function plannerView(task, options = {}) {
     stale_brief: options.staleBrief === true,
     digest: options.digest || digestOf(task),
     delta: options.delta,
+    // 成本水位：燃烧率与预算余量（P3-2），planner 据此决定收敛或坚持。
+    cost: options.cost || undefined,
+    // 待审批意图：owner 没点头前不会被领取，planner 不要干等这条路径。
+    pending_approvals: task.intents.filter(i => intentAwaitingApproval(i)).map(i => ({ id: i.id, summary: truncate(i.summary, 100), request: i.approval?.request?.reason || i.approval?.request?.action || '' })),
+    scope_violations: (Array.isArray(task.violations) && task.violations.length > 0)
+      ? task.violations.slice(-5).map(v => ({ tool: v.tool, intent_id: v.intentId, misses: v.misses }))
+      : undefined,
     // analysis 由提示词正文单独渲染，避免在 JSON 里重复一遍。
     analysis_round: task.analysis?.round ?? undefined,
     analysis_runs: task.analysisRuns || 0,
