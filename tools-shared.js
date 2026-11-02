@@ -79,6 +79,9 @@ const TOOL_LABELS = {
   artex_coverage_report: 'ARTEX 覆盖',
   artex_request_approval: 'ARTEX 请求审批',
   artex_resolve_approval: 'ARTEX 审批裁决',
+  artex_emit: 'ARTEX 触发注入',
+  artex_decide_trigger: 'ARTEX 触发裁决',
+  artex_update_policy: 'ARTEX 策略更新',
 }
 
 /** 时间线上一眼可辨：所有 artex_* 卡片统一带 🧭 前缀。 */
@@ -95,6 +98,9 @@ const TOOL_KINDS = {
   artex_trace: 'read',
   artex_request_approval: 'execute',
   artex_resolve_approval: 'execute',
+  artex_emit: 'execute',
+  artex_decide_trigger: 'execute',
+  artex_update_policy: 'execute',
 }
 
 const clip = (value, max = 48) => {
@@ -249,6 +255,7 @@ export const RUN_PARAMETERS = {
   debounce_ms: integer('图变动合并窗口（毫秒，默认 800）。'),
   settle_grace_ms: integer('预算耗尽后等待收尾的宽限期（毫秒，默认 90000）。'),
   breakthrough_grace_ms: integer('突破后等待其它 pursue 写回现场的宽限期（毫秒，默认 30000），到期硬停。'),
+  trigger_mode: { type: 'string', enum: ['off', 'observe', 'auto'], description: '可选：外部触发闸门（两级过滤，默认 auto）——off=artex_emit 一律拒收；observe=触发只研判留档、不允许接单；auto=准入的触发由 planner 评估接单/忽略。运行期可用 artex_update_policy 热改。' },
 }
 
 /* ------------------------------------------------------------- factories */

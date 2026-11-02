@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-artex",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -53,7 +53,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs && node test/audit-regressions-smoke.mjs && node test/view-api-smoke.mjs && node test/roadmap-smoke.mjs",
+    "test": "node test/graph-smoke.mjs && node test/engine-smoke.mjs && node test/modes-smoke.mjs && node test/persistence-smoke.mjs && node test/security-smoke.mjs && node test/audit-regressions-smoke.mjs && node test/view-api-smoke.mjs && node test/roadmap-smoke.mjs && node test/patterns-smoke.mjs",
     "bench": "node test/prompt-size.mjs"
   },
   "dsh": {

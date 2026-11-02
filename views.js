@@ -185,6 +185,10 @@ export function plannerView(task, options = {}) {
     cost: options.cost || undefined,
     // 待审批意图：owner 没点头前不会被领取，planner 不要干等这条路径。
     pending_approvals: task.intents.filter(i => intentAwaitingApproval(i)).map(i => ({ id: i.id, summary: truncate(i.summary, 100), request: i.approval?.request?.reason || i.approval?.request?.action || '' })),
+    // 两级过滤：待决触发与 Mandate 版本（策略变更后旧章意图会被领取闸终结）。
+    policy_rev: task.policyRev ?? 1,
+    trigger_mode: task.triggerMode ?? 'auto',
+    pending_triggers: (Array.isArray(task.triggers) ? task.triggers : []).filter(t => t.status === 'pending').map(t => ({ id: t.id, kind: t.kind, source: t.source, text: truncate(t.text, 120) })),
     scope_violations: (Array.isArray(task.violations) && task.violations.length > 0)
       ? task.violations.slice(-5).map(v => ({ tool: v.tool, intent_id: v.intentId, misses: v.misses }))
       : undefined,

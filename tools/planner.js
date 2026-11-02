@@ -33,6 +33,7 @@ export function plannerTools({ engine, config }) {
                 parents: { type: 'array', items: { type: 'integer' }, description: '派生自哪些 fact/finding 节点 id' },
                 resource_ids: { type: 'array', items: { type: 'integer' }, description: '锚定的资源 id' },
                 depends_on: { type: 'array', items: { type: 'integer' }, description: '显式串行依赖：只在前置意图全部 done 后才可被领取，失败的前置要靠你改路线。只能引用此前已存在的意图 id。' },
+                trigger_id: integer('可选：接单某条待决触发（两级过滤第二级）——触发必须是 pending 且 trigger_mode=auto；接单后触发终态为 accepted 并绑定本意图'),
                 depth: integer('深挖档 1-3（仅 objective 的 pursue 生效，audit 强制 1）：预算与超时按 depth 放宽，worker 按阶段落检查点 fact 后链式推进。主路径深挖用 2，别滥用到 3。'),
                 requires_approval: { type: 'boolean', description: 'true=高风险动作挂人工审批：owner 用 artex_resolve_approval 批准前该意图不会被领取。修改目标状态/横向移动/破坏性验证/触发告警的扫描都应挂上。' },
               },
@@ -67,6 +68,29 @@ export function plannerTools({ engine, config }) {
         return `已创建 ${created.length} 条意图：${created.map(r => `#${r.id} ${r.summary}`).join('；') || '（无）'}`
           + (duplicates.length > 0 ? `\n跳过重复 ${duplicates.length} 条：${duplicates.map(d => `${d.summary}（已有 #${d.id}，${d.state}）`).join('；')}` : '')
           + (dropped > 0 ? `\n仅提交前 4 条，另有 ${dropped} 条未提交` : '')
+      },
+    }),
+    artifact({
+      name: 'artex_decide_trigger',
+      description: `规划者专用：对一条待决触发做**负裁决**（两级过滤第二级）——评估后认为不值得接单时忽略它并留档（status=ignored，附理由）。
+正裁决（接单）不走这里：用 artex_add_intent 的 trigger_id 字段创建意图，触发自动落 accepted 并绑定意图。
+纪律：每条 pending 触发都要有终局——接单或忽略，不要让它悬在多轮提示里反复出现。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id'),
+          trigger_id: { type: 'integer', required: true, description: '要忽略的触发 id（见态势 pending_triggers）' },
+          reason: describe('忽略理由一句话（留档可审计）'),
+        },
+        required: ['trigger_id'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, role, task } = await resolve(engine, exec, args.task_id)
+        requireRole(agent, role, task, ['planner'])
+        liveRuntime(engine, task)
+        const trigger = engine.decideTrigger(task, { trigger_id: args.trigger_id, reason: args.reason || '' })
+        return `触发 #${trigger.id} 已忽略（status=ignored）${args.reason ? `：${args.reason}` : ''}`
       },
     }),
     artifact({

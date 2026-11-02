@@ -75,6 +75,11 @@ export function createTask(input) {
     todos: [],
     activities: [],
     conflicts: [],
+    // 两级过滤（移植自 dsh-superagent）：触发收件箱与闸门模式（off/observe/auto）。
+    triggers: [],
+    triggerMode: ['off', 'observe', 'auto'].includes(input.triggerMode) ? input.triggerMode : 'auto',
+    // Mandate 版本化：artex_update_policy 每次变更 +1；意图创建时盖章 mandateRev。
+    policyRev: 1,
     stats: emptyStats(),
     usage: { input_tokens: 0, output_tokens: 0, calls: 0, by_role: {}, by_intent: {} },
     report: undefined,

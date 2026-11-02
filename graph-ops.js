@@ -3,7 +3,8 @@
  */
 
 import { oneLine } from './util.js'
-import { intentById, danglingParents, findDuplicateFact, findSameSummaryFact, requestApproval as graphRequestApproval, resolveApproval as graphResolveApproval } from './model.js'
+import { intentById, danglingParents, findDuplicateFact, findSameSummaryFact, requestApproval as graphRequestApproval, resolveApproval as graphResolveApproval, normalizePolicy, intentAwaitingApproval } from './model.js'
+import { admitTriggers, ingestTriggers, acceptTrigger, ignoreTrigger } from './triggers.js'
 import { addIntents as graphAddIntents, addHint as graphAddHint, proveGoal as graphProveGoal, setTodos as graphSetTodos, setBrief as graphSetBrief, setAnalysis as graphSetAnalysis, promoteIntent as graphPromoteIntent, recordFact as graphRecordFact, reportFinding as graphReportFinding, retestFinding as graphRetestFinding, recordConflict as graphRecordConflict, retractFact as graphRetractFact } from './graph.js'
 import { bindArtifacts, bindSteps } from './evidence.js'
 
@@ -49,10 +50,31 @@ export async function addIntents(engine, task, items, options = {}) {
       if (missing.length > 0) {
         throw new Error(`depends_on 引用了不存在的意图：${missing.map(id => `#${id}`).join(' ')}（先派前置意图，再挂依赖）`)
       }
+      // 两级过滤接单前置校验：trigger 必须存在且可接（observe 模式在此硬拒）。
+      const triggerId = item?.trigger_id ?? item?.triggerId
+      if (triggerId != null) {
+        const trigger = (rt.task.triggers || []).find(t => t.id === Number(triggerId))
+        if (!trigger) throw new Error(`trigger_id #${triggerId} 不存在（先用 artex_emit 注入触发）`)
+        const mode = rt.task.triggerMode === 'observe' || trigger.status === 'observed'
+        if (mode) throw new Error(`trigger_mode=observe：trigger #${trigger.id} 只允许研判留档，不允许接单`)
+        if (trigger.status !== 'pending') throw new Error(`trigger #${trigger.id} 已裁决（status=${trigger.status}）`)
+      }
     }
     const results = graphAddIntents(rt.task, items, { max: options.max })
     const created = results.filter(r => r.id > 0).map(r => r.id)
     if (created.length > 0) {
+      // Mandate 盖章（移植 dsh-superagent）：意图绑定创建时的 policyRev；
+      // trigger 接单落终态（accepted + 绑定意图）。
+      for (const r of results) {
+        if (r.id <= 0) continue
+        const intent = intentById(rt.task, r.id)
+        if (intent) intent.mandateRev = rt.task.policyRev ?? 1
+      }
+      items.forEach((item, index) => {
+        const triggerId = item?.trigger_id ?? item?.triggerId
+        const intentId = results[index]?.id
+        if (triggerId != null && intentId > 0) acceptTrigger(rt.task, triggerId, intentId)
+      })
       engine.addActivity(rt, {
         intentId: null,
         worker: 'planner',
@@ -69,19 +91,163 @@ export async function addIntents(engine, task, items, options = {}) {
     return results
   }
 
-export function addHint(engine, task, texts) {
+/** 订阅直通路由前缀：`#<intentId> 内容` 与显式 intent_id 参数等价。 */
+const HINT_ROUTE_RE = /^#(\d+)\s*[:：]?\s+/
+
+/**
+ * 注入提示（移植 dsh-superagent 的订阅直通）：
+ * - 带 intent_id（或文本以 `#<id>` 开头）且目标意图**正在运行** → 直接 nudge 该 worker
+ *   子会话，**不唤醒 planner**（省下整轮规划的 token）；提示照常落 hints/activity，
+ *   planner 下一轮自然苏醒时可见路由记录。
+ * - 其余情况走原路径：进 hints 并唤醒 planner。
+ * @returns {{hints: object[], routed: Array<{intentId: number}>, queued: number}}
+ */
+export function addHint(engine, task, texts, options = {}) {
     const rt = engine.runtimeForTask(task)
     const added = []
-    for (const text of texts) {
+    const routed = []
+    let queued = 0
+    const items = Array.isArray(texts) ? texts : [texts]
+    for (const raw of items) {
+      let text = String(raw ?? '').trim()
+      let targetId = options.intent_id ?? options.intentId ?? null
+      const prefix = text.match(HINT_ROUTE_RE)
+      if (targetId == null && prefix) {
+        targetId = Number(prefix[1])
+        text = text.slice(prefix[0].length).trim()
+      }
       const hint = graphAddHint(rt.task, text)
-      if (hint) added.push(hint)
+      if (!hint) continue
+      added.push(hint)
+      // 直通判定：目标意图在跑（rt.children 里有活的 worker 子会话）才直投。
+      const intent = targetId != null ? rt.task.intents.find(i => i.id === Number(targetId)) : null
+      const childId = intent && intent.state === 'running' ? rt.children.get(`intent-${intent.id}`) : undefined
+      if (intent && childId) {
+        routed.push({ intentId: intent.id })
+        engine.addActivity(rt, {
+          intentId: intent.id,
+          worker: 'human',
+          kind: 'hint-routed',
+          summary: `提示直通 worker（意图 #${intent.id}）：${oneLine(text, 120)}`,
+        })
+        void engine.nudge(rt, childId, `[订阅直通] 任务所有者给你的提示（不经过 planner，照常写回）：\n${text}`)
+      } else {
+        queued += 1
+      }
     }
     if (added.length > 0) {
-      engine.addActivity(rt, { intentId: null, worker: 'human', kind: 'hint', summary: `新增提示：${oneLine(added.map(h => h.text).join('；'), 200)}` })
-      engine.pushEvent(rt, { kind: 'hint', summary: added.map(h => oneLine(h.text, 100)).join('；') })
+      if (queued > 0) {
+        engine.addActivity(rt, { intentId: null, worker: 'human', kind: 'hint', summary: `新增提示：${oneLine(added.map(h => h.text).join('；'), 200)}` })
+        engine.pushEvent(rt, { kind: 'hint', summary: added.map(h => oneLine(h.text, 100)).join('；') })
+      }
       void engine.persist(rt)
     }
-    return added
+    return { hints: added, routed, queued }
+  }
+
+/* ------------------------------------------------------ 两级过滤：触发注入与裁决 */
+
+/**
+ * artex_emit 的核心（owner-only）：第一级确定性准入 → 落 task.triggers → auto 模式唤醒
+ * planner（第二级 = 规划者接单/忽略，decision 全量留档）。
+ */
+export function emitTriggers(engine, task, items) {
+    const rt = engine.runtimeForTask(task)
+    const { admitted, decisions } = admitTriggers(rt.task, items)
+    const ingested = ingestTriggers(rt.task, admitted)
+    if (ingested.length > 0) {
+      engine.addActivity(rt, {
+        intentId: null,
+        worker: 'human',
+        kind: 'trigger',
+        summary: `触发准入 ${ingested.length} 条：${ingested.map(t => `#${t.id}[${t.kind}]`).join(' ')}`,
+        detail: decisions.map(d => `${d.decision}${d.reason ? `(${d.reason})` : ''}: ${d.text ?? ''}`).join('\n'),
+      })
+      // auto=pending 的触发唤醒第二级（planner）；observe 仅留档不唤醒（省 token，
+      // planner 下次自然苏醒时评估，且接单被 acceptTrigger 硬拒）。
+      const pending = ingested.filter(t => t.status === 'pending')
+      if (pending.length > 0) {
+        engine.pushEvent(rt, { kind: 'trigger', summary: `${pending.length} 条触发待裁决：${pending.map(t => `#${t.id}[${t.kind}] ${oneLine(t.text, 60)}`).join('；')}` })
+      }
+      void engine.persist(rt)
+    }
+    return { admitted: ingested, decisions }
+  }
+
+/** 规划者对触发做负裁决（接单走 artex_add_intent 的 trigger_id 正裁决）。 */
+export function decideTrigger(engine, task, { trigger_id, reason = '' }) {
+    const rt = engine.runtimeForTask(task)
+    const trigger = ignoreTrigger(rt.task, trigger_id, reason)
+    engine.addActivity(rt, {
+      intentId: null,
+      worker: 'planner',
+      kind: 'trigger',
+      summary: `触发 #${trigger.id} 被忽略${reason ? `：${oneLine(reason, 100)}` : ''}`,
+    })
+    void engine.persist(rt)
+    return trigger
+  }
+
+/* ------------------------------------------------------ Mandate 版本化：策略热更新 */
+
+/**
+ * artex_update_policy 的核心（owner-only，移植 dsh-superagent 的 Policy 版本化）：
+ * 合并补丁 → policyRev+1 → 吊销所有待审批授权（随旧 Mandate 失效）→ 唤醒 planner。
+ * 领取闸（scheduler.dispatchWorkers）会把 mandateRev 过期的意图终结为 mandate_revoked。
+ */
+export function updatePolicy(engine, task, patch = {}) {
+    const rt = engine.runtimeForTask(task)
+    const oldRev = rt.task.policyRev ?? 1
+    const current = rt.task.policy || {}
+    // 合并：只接受白名单字段；normalizePolicy 负责清洗（与启动路径同一套规范化）。
+    const merged = normalizePolicy({
+      allowedTools: current.allowedTools,
+      readOnly: current.readOnly,
+      allowedPaths: current.allowedPaths,
+      allowedTargets: current.allowedTargets,
+      scopeEnforcement: current.scopeEnforcement,
+      engagement: current.engagement,
+      redactEvidence: current.redactEvidence,
+      maxTokensPerIntent: current.maxTokensPerIntent,
+      skillPacks: current.skillPacks,
+      ...(patch.allowed_tools !== undefined ? { allowedTools: patch.allowed_tools } : {}),
+      ...(patch.allowed_targets !== undefined ? { allowedTargets: patch.allowed_targets } : {}),
+      ...(patch.read_only !== undefined ? { readOnly: patch.read_only } : {}),
+      ...(patch.allowed_paths !== undefined ? { allowedPaths: patch.allowed_paths } : {}),
+      ...(patch.scope_enforcement !== undefined ? { scopeEnforcement: patch.scope_enforcement } : {}),
+      ...(patch.max_tokens_per_intent !== undefined ? { maxTokensPerIntent: patch.max_tokens_per_intent } : {}),
+    })
+    rt.task.policy = merged
+    if (Array.isArray(patch.constraints)) {
+      rt.task.constraints = patch.constraints.map(c => String(c).trim()).filter(Boolean)
+    }
+    if (patch.trigger_mode !== undefined) {
+      if (!['off', 'observe', 'auto'].includes(patch.trigger_mode)) {
+        throw new Error(`trigger_mode 只能是 off/observe/auto，收到 ${patch.trigger_mode}`)
+      }
+      rt.task.triggerMode = patch.trigger_mode
+    }
+    const newRev = oldRev + 1
+    rt.task.policyRev = newRev
+    // 吊销待审批授权：旧 Mandate 签发的批准一律失效（superagent：mandateRevoked）。
+    let revoked = 0
+    for (const intent of rt.task.intents) {
+      if (intentAwaitingApproval(intent)) {
+        intent.approval.pending = false
+        intent.approval.decision = { result: 'revoked', note: `policyRev ${oldRev}→${newRev}，授权随策略变更失效`, at: Date.now() }
+        revoked += 1
+      }
+    }
+    engine.addActivity(rt, {
+      intentId: null,
+      worker: 'human',
+      kind: 'policy',
+      summary: `策略更新：policyRev ${oldRev}→${newRev}${revoked > 0 ? `，吊销 ${revoked} 项待审批授权` : ''}`,
+      detail: Object.keys(patch).map(k => `${k}=${JSON.stringify(patch[k]).slice(0, 120)}`).join('\n'),
+    })
+    engine.pushEvent(rt, { kind: 'policy', summary: `策略已变更（rev ${oldRev}→${newRev}）：旧 Mandate 意图将在领取时被吊销，请按新策略重派` })
+    void engine.persist(rt)
+    return { policyRev: newRev, revokedApprovals: revoked, policy: merged }
   }
 
 export function proveGoal(engine, task, goalId, evidenceId, reason, allowNegative = false, options = {}) {
@@ -182,6 +348,8 @@ export function roleForIntent(engine, taskId, intentId) {
 export function requestApproval(engine, task, intentId, request = {}) {
     const rt = engine.runtimeForTask(task)
     const intent = graphRequestApproval(rt.task, intentId, request)
+    // Mandate 盖章：审批授权绑定当前 policyRev，策略变更时被 updatePolicy 整体吊销。
+    intent.approval.request.rev = rt.task.policyRev ?? 1
     engine.addActivity(rt, {
       intentId: intent.id,
       worker: request.by || 'worker',

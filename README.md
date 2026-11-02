@@ -111,6 +111,16 @@ DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：
 | `artex_record_conflict` | 两条给出相反结论的节点落成结构化冲突 | worker / analyst / planner / 所有者 |
 | `artex_retract_fact` | 撤回事实（留档但不可再作证明） | planner / 所有者 |
 | `artex_coverage_report` | 确定性覆盖矩阵（audit 收口前查缺口） | 任意（按读权限） |
+| `artex_emit` | 注入外部触发（两级过滤第一级：schema/去重/模式/速率/scope 确定性准入） | 所有者 |
+| `artex_decide_trigger` | 忽略一条待决触发并留档（接单走 `artex_add_intent` 的 `trigger_id`） | planner / 所有者 |
+| `artex_update_policy` | 热更新任务策略，policyRev+1，旧 Mandate 意图领取时终结、待审批授权吊销 | 所有者 |
+
+### 移植自 dsh-superagent 的四个设计模式（v1.1，详见 `docs/superagent-patterns-port.md`）
+
+- **两级过滤**：`artex_emit` 是外部事件（CI 钩子/定时器/人工上报）进入编排循环的开放入口。第一级确定性准入（去重键 = kind+source+text 哈希，`trigger_mode` 闸门 off/observe/auto，20 条/10 分钟速率上限，allowed_targets scope 过滤）；第二级 = planner 评估，每条触发的终局（accepted/ignored/observed/rejected）全量留档。
+- **订阅直通**：`artex_add_hint` 传 `intent_id`（或文本以 `#<id>` 开头）时，目标意图在跑就直接 nudge 该 worker，**不唤醒 planner**（对单 worker 的纠偏不再烧一整轮规划）；提示照常落 hints/activity，planner 事后可见。
+- **Mandate 版本化**：意图创建时盖章 `mandateRev = task.policyRev`；`artex_update_policy` 热改策略使 rev+1——旧章意图在领取闸终结为 `mandate_revoked`（planner 按新策略重派），待审批授权整体吊销。运行中的 worker 不打断（mandate 管执行授权，不管记忆写回）。功能上线前的存量未盖章意图豁免。
+- **Effects 队列**：副作用（当前投递器：`log` 落过程库、`webhook` POST 到外部 URL）先写 `.artex/tasks/<id>/effects.jsonl` 再投递；按 key 幂等，失败留档，`artex_resume_task` 重放 pending。DSH 插件 API 不允许向根会话推送（sendMessage 只走父子相邻边），因此对外通知走 webhook 出口。
 
 ---
 
@@ -194,10 +204,10 @@ max_workers: 3
 「这个会话用没用 ARTEX」从隐式变显式，分三层：
 
 - **开关**：会话里输入 `/artex on | off | status`（人类命令，不进模型上下文；`command/run` 连参数落在会话日志里，命令行本身就是切换的可见标记），或点输入框左侧的 **🧭 ARTEX chip**（client 半边，与命令共用同一份状态）。off 之后本会话发起的 `artex_*` 调用一律被 `tools.guard` 拦截并提示如何重开；**运行中的任务不受影响**（它们的写回来自子会话，子会话有自己的会话 id，默认开）。状态持久化在 profile 级 `~/.dsh/artex-session-flags.json`（默认开，装了插件即可用，向后兼容；文件损坏容错为全开）。
-- **标识**：25 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
+- **标识**：28 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
 - **数据通道**：`/api/artex`（POST，只收本机回环来源）——`state {sessionId, cwd?}` 返回 `{enabled, tasks: 轻量摘要[]}`，`setEnabled {sessionId, enabled}` 切换开关；插件自己的 client 半边与任何本地消费方都可用。
 
-硬摘 schema（`tools.restrict` 按会话隐藏 25 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
+硬摘 schema（`tools.restrict` 按会话隐藏 28 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
 
 **配置**（写在 `cordis.patch.yml` 的 config 里，装好之后也可以再改）：
 

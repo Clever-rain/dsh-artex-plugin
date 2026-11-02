@@ -33,6 +33,9 @@ export const TOOL_NAMES = [
   'artex_coverage_report',
   'artex_request_approval',
   'artex_resolve_approval',
+  'artex_emit',
+  'artex_decide_trigger',
+  'artex_update_policy',
 ]
 
 /** 每个角色允许调用的 artex 工具（读工具可被多个角色共享）。 */
@@ -42,6 +45,7 @@ export const ROLE_ALLOW = {
     'artex_set_brief', 'artex_add_intent', 'artex_promote_intent',
     'artex_prove_goal', 'artex_set_todos', 'artex_plan',
     'artex_retract_fact', 'artex_coverage_report', 'artex_retest_finding',
+    'artex_decide_trigger',
   ],
   worker: [
     'artex_graph_overview', 'artex_node_detail', 'artex_trace',
@@ -119,7 +123,7 @@ export function assertPolicyCoverage(toolNames) {
     }
   }
   const ownerOnly = toolNames.filter(n => !assigned.has(n))
-  const expectedOwnerOnly = ['artex_run_task', 'artex_start_task', 'artex_task_status', 'artex_stop_task', 'artex_add_hint', 'artex_resume_task', 'artex_resolve_approval']
+  const expectedOwnerOnly = ['artex_run_task', 'artex_start_task', 'artex_task_status', 'artex_stop_task', 'artex_add_hint', 'artex_resume_task', 'artex_resolve_approval', 'artex_emit', 'artex_update_policy']
   if (ownerOnly.length !== expectedOwnerOnly.length || expectedOwnerOnly.some(n => !ownerOnly.includes(n))) {
     throw new Error(`owner-only 工具集合变化：${ownerOnly.join(', ')}`)
   }

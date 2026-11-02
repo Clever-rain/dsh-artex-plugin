@@ -50,6 +50,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           confirm: args.confirm,
           campaign: args.campaign,
           signal: exec.signal,
+          triggerMode: args.trigger_mode,
         })
         const stop = () => { void engine.stopTask(rt.task.id, '调用方中断') }
         exec.signal?.addEventListener?.('abort', stop, { once: true })
@@ -82,6 +83,7 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
           confirm: args.confirm,
           campaign: args.campaign,
           signal: exec.signal,
+          triggerMode: args.trigger_mode,
         })
         const scopeLine = rt.task.policy.allowedTargets.length > 0
           ? `\nscope：${rt.task.policy.allowedTargets.join(', ')}（越界处置：${engine.scopeEnforcement(rt.task)}）`
@@ -227,13 +229,15 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
     }),
     artifact({
       name: 'artex_add_hint',
-      description: '给运行中的 ARTEX 任务注入战略提示（会立刻唤醒规划者写入本轮态势，并在后续每轮的 hints 里可见）。用于人在环路纠偏：换重点、排除某方向、提醒某条已知线索。可一次给多条。',
+      description: `给运行中的 ARTEX 任务注入战略提示（人在环路纠偏：换重点、排除某方向、提醒已知线索）。可一次给多条。
+**订阅直通**（移植 dsh-superagent）：传 intent_id 或文本以 \`#<意图id>\` 开头时，若该意图正在运行，提示**直接送达该 worker 子会话，不唤醒 planner**（省下整轮规划开销）；规划者下一轮自然苏醒时能在 hints/活动流里看到路由记录。不带目标或目标不在跑时走原路径：唤醒 planner。`,
       parameters: {
         type: 'object',
         properties: {
           task_id: describe('可选：任务 id；省略时用调用者所属任务'),
           hints: strings('要注入的提示（优先用数组批量提交）'),
           text: describe('[单条] 提示内容'),
+          intent_id: integer('可选：订阅直通目标意图 id——该意图在跑时直接 nudge 它的 worker，不唤醒 planner'),
         },
         additionalProperties: false,
       },
@@ -245,9 +249,96 @@ ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}
           ? args.hints
           : args.text ? [args.text] : []
         if (texts.length === 0) throw new Error('hints 或 text 至少给一个')
-        const added = engine.addHint(task, texts.map(String))
+        const result = engine.addHint(task, texts.map(String), { intent_id: args.intent_id })
         void role
-        return `已注入 ${added.length} 条提示：${added.map(h => `#${h.id}`).join(' ')}。规划者已被唤醒。`
+        const parts = [`已注入 ${result.hints.length} 条提示：${result.hints.map(h => `#${h.id}`).join(' ')}`]
+        if (result.routed.length > 0) parts.push(`其中 ${result.routed.length} 条订阅直通 worker（意图 ${result.routed.map(r => `#${r.intentId}`).join(' ')}），未唤醒 planner`)
+        if (result.queued > 0) parts.push(`${result.queued} 条走规划者路径，planner 已被唤醒`)
+        return parts.join('；') + '。'
+      },
+    }),
+    artifact({
+      name: 'artex_emit',
+      description: `向 ARTEX 任务注入外部触发（owner-only，移植 dsh-superagent 的两级过滤）。
+第一级（确定性准入，零模型）：schema 校验 → 内容哈希去重 → trigger_mode 闸门（off=拒收/observe=只研判留档/auto=可接单）→ 速率上限（20 条/10 分钟）→ scope 过滤（任务声明 allowed_targets 时文本中的目标必须在范围内）。
+第二级（planner 评估）：准入的触发持久化为待决（pending）并唤醒规划者；规划者用 artex_add_intent(trigger_id=...) 接单，或 artex_decide_trigger 忽略。每个触发的裁决终态（accepted/ignored/observed/rejected）全量留档可审计。
+用途：CI 钩子、定时器、人工上报、其它会话/插件把事件推进编排循环。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id；省略时用调用者所属任务'),
+          triggers: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                kind: { type: 'string', enum: ['issue', 'alert', 'webhook', 'schedule', 'note'], description: '触发类型（默认 note）' },
+                source: describe('可选：来源标识（默认 manual），参与去重键'),
+                text: { type: 'string', required: true, description: '触发内容（≤4000 字符）' },
+                meta: { type: 'object', description: '可选：结构化附加信息，随触发留档' },
+              },
+              required: ['text'],
+              additionalProperties: false,
+            },
+            required: true,
+            description: '要注入的触发列表',
+          },
+        },
+        required: ['triggers'],
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, task } = await resolve(engine, exec, args.task_id)
+        requireOwner(agent, task)
+        liveRuntime(engine, task)
+        const { admitted, decisions } = engine.emitTriggers(task, args.triggers)
+        const admittedLine = admitted.length > 0
+          ? `准入 ${admitted.length} 条：${admitted.map(t => `#${t.id}[${t.kind}]${t.status === 'observed' ? '(observe 留档)' : '(待裁决)'}`).join(' ')}`
+          : '本批无准入'
+        const rejected = decisions.filter(d => d.decision === 'rejected')
+        const rejectedLine = rejected.length > 0
+          ? `\n拒收 ${rejected.length} 条：${rejected.map(d => `${d.reason}（${String(d.text ?? '').slice(0, 40)}）`).join('；')}`
+          : ''
+        return `${admittedLine}。trigger_mode=${task.triggerMode ?? 'auto'}${admitted.some(t => t.status === 'pending') ? '，planner 已唤醒评估' : ''}${rejectedLine}`
+      },
+    }),
+    artifact({
+      name: 'artex_update_policy',
+      description: `热更新 ARTEX 任务策略（owner-only，移植 dsh-superagent 的 Mandate/Policy 版本化）。
+每次变更使 policyRev+1：此后新派意图盖新章；**旧章意图在领取闸被终结为 mandate_revoked**，由规划者按新策略重派；所有待审批授权随旧 Mandate 整体吊销（worker 重派后需重新申请）。运行中的 worker 不打断（其写回仍受理），但下一轮调度起按新策略执行。
+可改字段：constraints / allowed_targets / allowed_tools / allowed_paths / read_only / scope_enforcement / max_tokens_per_intent / trigger_mode。未传的字段保持现值。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: describe('可选：任务 id；省略时用调用者所属任务'),
+          constraints: strings('可选：整量替换硬约束列表'),
+          allowed_targets: strings('可选：整量替换目标白名单（精确主机、*.后缀域名、IPv4、CIDR）'),
+          allowed_tools: strings('可选：整量替换子会话宿主工具白名单'),
+          allowed_paths: strings('可选：整量替换子会话路径白名单'),
+          read_only: { type: 'boolean', description: '可选：只读模式开关' },
+          scope_enforcement: { type: 'string', enum: ['warn', 'stop', 'off'], description: '可选：scope 越界处置' },
+          max_tokens_per_intent: integer('可选：意图级 token 预算（0=不限）'),
+          trigger_mode: { type: 'string', enum: ['off', 'observe', 'auto'], description: '可选：触发闸门模式' },
+        },
+        additionalProperties: false,
+      },
+      async execute(args, exec) {
+        const { agent, task } = await resolve(engine, exec, args.task_id)
+        requireOwner(agent, task)
+        liveRuntime(engine, task)
+        const patch = Object.fromEntries(Object.entries({
+          constraints: args.constraints,
+          allowed_targets: args.allowed_targets,
+          allowed_tools: args.allowed_tools,
+          allowed_paths: args.allowed_paths,
+          read_only: args.read_only,
+          scope_enforcement: args.scope_enforcement,
+          max_tokens_per_intent: args.max_tokens_per_intent,
+          trigger_mode: args.trigger_mode,
+        }).filter(([, v]) => v !== undefined))
+        if (Object.keys(patch).length === 0) throw new Error('至少给一个要变更的策略字段')
+        const result = engine.updatePolicy(task, patch)
+        return `策略已更新：policyRev → ${result.policyRev}${result.revokedApprovals > 0 ? `；吊销 ${result.revokedApprovals} 项待审批授权` : ''}。旧 Mandate 意图将在领取时被终结（mandate_revoked），planner 已收到事件。`
       },
     }),
     artifact({

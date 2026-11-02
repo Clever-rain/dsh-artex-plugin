@@ -23,13 +23,14 @@ import { runLoop as runLoopImpl, finish as finishImpl, completeGracefully as com
 import { maybeRunAnalyst as maybeRunAnalystImpl } from './analyst.js'
 import { queueVerifier as queueVerifierImpl } from './verifier.js'
 import { recordUsage as recordUsageImpl } from './usage.js'
-import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl, retestFinding as retestFindingImpl, recordConflict as recordConflictImpl, retractFact as retractFactImpl, requestApproval as requestApprovalImpl, resolveApproval as resolveApprovalImpl } from './graph-ops.js'
+import { addIntents as addIntentsImpl, addHint as addHintImpl, proveGoal as proveGoalImpl, setTodos as setTodosImpl, setBrief as setBriefImpl, setAnalysis as setAnalysisImpl, promoteIntent as promoteIntentImpl, roleForIntent as roleForIntentImpl, recordFacts as recordFactsImpl, recordFinding as recordFindingImpl, addResources as addResourcesImpl, runtimeForTask as runtimeForTaskImpl, retestFinding as retestFindingImpl, recordConflict as recordConflictImpl, retractFact as retractFactImpl, requestApproval as requestApprovalImpl, resolveApproval as resolveApprovalImpl, emitTriggers as emitTriggersImpl, decideTrigger as decideTriggerImpl, updatePolicy as updatePolicyImpl } from './graph-ops.js'
 import { snapshot as snapshotImpl, status as statusImpl, report as reportImpl, campaignStatus as campaignStatusImpl, campaignList as campaignListImpl } from './reporting.js'
 import { handleSessionEvent as handleSessionEventImpl } from './session-indexer.js'
 import { lintGoalTexts } from './guard.js'
 import { loadEngagement, validateEngagement, ensureArtexGitignored } from './engagement.js'
 import { loadSkillPacks } from './skills.js'
 import { violationNudgePrompt, tokenCapSettlePrompt } from './prompts.js'
+import { EffectOutbox } from './effects.js'
 import { sleep } from './util.js'
 import { normalizeConfig } from './config.js'
 import { TOOL_NAMES, denyForRole, policyDenyForTask } from './policy.js'
@@ -62,6 +63,42 @@ export class ArtexEngine {
     this.providerName = this.config.provider
     this.disposed = false
     this.toolNames = [...TOOL_NAMES]
+    // Effects 队列（移植自 dsh-superagent）：副作用先落盘、后投递、崩溃重放、按 key 幂等。
+    this.effects = new EffectOutbox({
+      dirFor: (taskId) => {
+        const rt = this.tasks.get(String(taskId))
+        const cwd = rt?.task?.cwd ?? process.cwd()
+        return this.storeFor(cwd).tasks.taskDir(taskId)
+      },
+      onError: (error) => this.logger.warn?.(`[artex] effects outbox error: ${error?.message || error}`),
+    })
+    this.effects.registerDeliverer('log', async () => { /* 落盘即投递 */ })
+    // webhook：对外副作用的唯一真实出口（DSH 插件 API 不允许向根会话推送——
+    // sendMessage 只走父子相邻边，根会话只有浏览器 queue 路径），投递失败留档重放。
+    this.effects.registerDeliverer('webhook', async (effect) => {
+      const url = String(effect.payload?.url ?? '').trim()
+      if (!/^https?:\/\//i.test(url)) throw new Error('webhook effect 需要 payload.url（http/https）')
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: effect.kind, task: effect.payload?.task, summary: effect.payload?.summary, detail: effect.payload?.detail, at: effect.firstAt }),
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!response.ok) throw new Error(`webhook ${response.status}`)
+    })
+  }
+
+  /**
+   * 发出一个持久化副作用（先落盘、后投递；同 key 幂等）。
+   * 投递失败留 pending/failed，resumeTask/插件重启后重放。
+   */
+  emitEffect(rt, { kind, key, payload, deliver = true }) {
+    return this.effects.emit(rt.task.id, { kind, key, payload, deliver })
+  }
+
+  /** status 视图用：effects 队列水位。 */
+  effectsSummary(taskId) {
+    return this.effects.summary(taskId)
   }
 
   /** 真实注册的工具名（index.js 注册后注入；缺省用 policy 的静态清单）。 */
@@ -224,7 +261,7 @@ export class ArtexEngine {
     }
   }
 
-  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, policy = {}, confirm, campaign, signal }) {
+  async startTask({ agent, goal, description, goals, constraints, mode, viewMode, analyst, limits = {}, policy = {}, confirm, campaign, signal, triggerMode }) {
     if (this.disposed) throw new Error('ARTEX 插件已卸载')
     if (!agent) throw new Error('ARTEX 需要调用它的 agent 会话')
     if (!String(goal || '').trim()) throw new Error('goal 不能为空')
@@ -300,6 +337,7 @@ export class ArtexEngine {
       campaign,
       engagement: engagementMeta,
       riskConfirm,
+      triggerMode,
       outDir: stores.tasks.taskDir(id),
       limits: {
         maxWorkers: Math.max(0, Number(merged.maxWorkers) || 0),
@@ -433,6 +471,8 @@ export class ArtexEngine {
     })
     rt.deadlineTimer = setTimeout(() => { void this.beginSettling(rt, { reason: '任务级预算耗尽' }) }, budget)
     rt.deadlineTimer.unref?.()
+    // Effects 重放：崩溃/暂停期间未投递的副作用补投（幂等 key 防重复）。
+    void this.effects.replay(id)
     void signal
     return rt
   }
@@ -473,6 +513,7 @@ export class ArtexEngine {
     for (const rt of this.tasks.values()) {
       try { rt.abort.abort('plugin disposed') } catch { /* already aborted */ }
       this.interruptChildren(rt)
+      this.effects.drop(rt.task.id)
     }
     await Promise.race([
       Promise.allSettled([...this.tasks.values()].map(rt => rt.done)),
@@ -638,8 +679,23 @@ export class ArtexEngine {
     return addIntentsImpl(this, task, items, options)
   }
 
-  addHint(task, texts) {
-    return addHintImpl(this, task, texts)
+  addHint(task, texts, options = {}) {
+    return addHintImpl(this, task, texts, options)
+  }
+
+  /** 两级过滤（移植 dsh-superagent）：外部触发注入（owner-only），stage-1 确定性准入。 */
+  emitTriggers(task, items) {
+    return emitTriggersImpl(this, task, items)
+  }
+
+  /** 触发负裁决（planner）：忽略一条待决触发并留档。 */
+  decideTrigger(task, input) {
+    return decideTriggerImpl(this, task, input)
+  }
+
+  /** Mandate 版本化（移植 dsh-superagent）：策略热更新 + policyRev 递增 + 吊销旧授权。 */
+  updatePolicy(task, patch) {
+    return updatePolicyImpl(this, task, patch)
   }
 
   proveGoal(task, goalId, evidenceId, reason, allowNegative = false, options = {}) {

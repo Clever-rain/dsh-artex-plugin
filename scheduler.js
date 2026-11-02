@@ -352,6 +352,20 @@ export function dispatchWorkers(engine, rt) {
     while (rt.running.size < t.limits.maxWorkers) {
       const intent = selectNextIntent(t)
       if (!intent) break
+      // Mandate 领取闸（移植 dsh-superagent）：意图盖章的 policyRev 过期 → 终结为
+      // mandate_revoked，由 planner 按新策略重派。未盖章的旧意图（功能上线前的存量）豁免。
+      const currentRev = t.policyRev ?? 1
+      if (intent.mandateRev != null && intent.mandateRev !== currentRev) {
+        finishIntent(t, intent.id, { state: 'stopped', output: '', reason: 'mandate_revoked', writes: intent.writes })
+        engine.addActivity(rt, {
+          intentId: intent.id,
+          worker: 'engine',
+          kind: 'policy',
+          summary: `意图 #${intent.id} 的 Mandate 已过期（rev ${intent.mandateRev}≠${currentRev}），终结为 mandate_revoked`,
+        })
+        engine.pushEvent(rt, { kind: 'policy', summary: `意图 #${intent.id} Mandate 过期被吊销，请按新策略（rev ${currentRev}）重派` })
+        continue
+      }
       // 单调递增的全任务序号：跨轮不重名，日志/血缘里不再出现"两个 work#2"。
       rt.workerSeq = (rt.workerSeq || 0) + 1
       const workerName = `work#${rt.workerSeq}`

@@ -40,6 +40,10 @@ function renderTriggers(triggers) {
         return `- 意图变化：${ev.summary || ''}`
       case 'done':
         return `- 意图 #${ev.intentId} 结束（${ev.state || 'done'}）：${ev.summary || ''}`
+      case 'trigger':
+        return `- 外部触发待裁决（两级过滤第二级）：${ev.summary || ''}`
+      case 'policy':
+        return `- 任务策略已变更（Mandate 版本递增）：${ev.summary || ''}`
       case 'budget':
         return '- 任务预算即将耗尽，进入收尾。'
       case 'final':
@@ -78,6 +82,11 @@ export function plannerPrompt({ task, view, triggers, round }) {
   const briefText = task.brief?.text?.trim() || '（尚未建立——本轮必须创建）'
   const analysisText = task.analysis?.text?.trim()
   const stale = view?.stale_brief === true
+  // 两级过滤第二级：待决触发清单（确定性准入已过，等你接单或忽略）。
+  const pendingTriggers = (task.triggers || []).filter(t => t.status === 'pending')
+  const triggerSection = pendingTriggers.length > 0
+    ? `\n## 待决触发（外部事件 · 已过确定性准入）\n\n${pendingTriggers.map(t => `- trigger#${t.id} [${t.kind}] ${t.text.length > 160 ? `${t.text.slice(0, 160)}…` : t.text}（来源 ${t.source}）`).join('\n')}\n\n**每条都要有终局**：接单 → \`artex_add_intent\` 带 \`trigger_id\`（触发落 accepted 并绑定意图）；不值得做 → \`artex_decide_trigger\` 忽略并写理由。不要让它悬在多轮提示里。\n`
+    : ''
   const modeRules = mode === 'audit'
     ? `## audit 模式规则
 - **覆盖 = 任务声明的 goals**：goals 就是验收维度，每条有正/负证据即可 \`prove_goal\`；不要自行扩张出新的验收维度。
@@ -127,7 +136,7 @@ ${analysisText}
 > 它**不具决策权**：采纳或驳回由你决定，并在 brief 里写清采纳了哪条、为什么；分析里引用的事实需你自行核对。` : ''}
 
 ${modeRules}
-
+${triggerSection}
 ## 每轮流程
 
 1. **整合**：读 delta（上轮新增事实/发现/结束的意图）、digest（确定性计数与失败路径）、brief。
@@ -135,6 +144,7 @@ ${modeRules}
 3. **判目标**：用 \`artex_prove_goal(goal_id, evidence_id, reason)\` 逐条证明；最后一条证明后任务自动完成。量化目标先核对实测值。**证据红线**：\`confidence=inferred\` 的推断事实不能作证据（服务端硬拒）；blueprint、outcome=none（除非目标本身是负向结论且显式 allow_negative）同样被拒。证据不够就派意图去验证，不要硬证。
 4. **派意图**：一次 \`artex_add_intent\`（≤4 条），summary 写清"对什么做什么、为什么"，用 \`parents\` 引用 brief/事实里的依据（只能引用仍存在的 fact/finding id，过期被截断的节点会被服务端拒收）。深挖主路径给 pursue 意图加 \`depth:2\`（最多 3，仅 objective）：预算与超时成比例放宽，worker 会按阶段落检查点 fact。
 5. **高风险动作挂审批**：意图需要修改目标系统状态 / 横向移动 / 破坏性验证 / 触发告警的扫描时，加 \`requires_approval:true\`——owner 批准前该意图不会被领取（态势 \`pending_approvals\` 可见）。worker 也会自己挂审批（意图结束原因 \`awaiting_approval\`），批准后由 owner 放行，你照常调度，不要重复派同方向意图。
+   - **策略变更（policy 事件）**：owner 热更新策略后，旧 Mandate 意图已被终结为 \`mandate_revoked\`——按新策略重派同方向意图（换打法/收窄范围），不要原样重派被吊销的意图。
 6. **更新待办**：\`artex_set_todos\` 整体替换。
 
 ## 工具
