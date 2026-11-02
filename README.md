@@ -101,7 +101,7 @@ DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：
 | `artex_set_brief` | 整体替换跨轮全局认知 brief | planner / 所有者 |
 | `artex_prove_goal` | 用 fact/finding 证明目标（inferred 默认拒，allow_inferred 放行） | planner / 所有者 |
 | `artex_set_todos` | 整体替换跨轮规划待办 | planner / 所有者 |
-| `artex_record_fact` | 写回结论（evidence + confidence + outcome；found 必给 evidence） | worker / 所有者 |
+| `artex_record_fact` | 写回结论（evidence + confidence + outcome；found 必给 evidence） | worker / verifier / 所有者 |
 | `artex_report_finding` | 登记已验证成果（evidence 硬门必填；evidence_refs 绑定步骤/工件 sha256） | worker / 所有者 |
 | `artex_request_approval` | 高风险动作申请人工审批（意图挂起等裁决） | worker / 所有者 |
 | `artex_resolve_approval` | 裁决待审批意图（approve 放行 / reject 终止） | 所有者 |
