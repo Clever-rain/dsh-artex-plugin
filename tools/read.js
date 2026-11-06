@@ -4,18 +4,25 @@
 
 import { artifact, describe, integer, resolve, requireRead } from '../tools-shared.js'
 import { overview, detail, listTraces, searchTraces, getTrace } from '../graph.js'
+import { OVERVIEW_MAX_CHARS, clampInt, filterOverview, truncatedViewResponse, writeJsonAtomic } from './status-format.js'
 
 export function readTools({ engine, config }) {
   return [
     artifact({
       name: 'artex_graph_overview',
-      description: '读 ARTEX 任务的完整探索图态势（比规划者每轮看到的投影更全）：目标与状态、open/running/recent_done 意图（含血缘 parents/yields 与写回计数）、最近事实、最近发现、提示、跨轮待办。可用 facts_q 在事实全文里检索，facts_limit 调整返回条数。只读。',
+      description: `读 ARTEX 任务的探索图态势投影：目标与状态、open/running/recent_done 意图（含血缘 parents/yields 与写回计数）、最近事实、最近发现、提示、跨轮待办。**默认有界**：facts_limit 默认 10 条，整段 JSON 超过 max_chars（默认 6000）时把完整态势落盘到 \`<task.outDir>/overview_latest.json\`，只返回一个带 preview + 文件路径的可解析包装，避免单次读取把整张图灌进上下文。sections 可只要其中几块；要全量细节读落盘文件或 artex_node_detail。只读。`,
       parameters: {
         type: 'object',
         properties: {
           task_id: describe('可选：任务 id'),
           facts_q: describe('可选：在事实摘要/详情里做关键字过滤'),
-          facts_limit: integer('返回多少条最近事实（默认 20，最大 50）'),
+          facts_limit: integer('返回多少条最近事实（默认 10，最大 50）'),
+          sections: {
+            type: 'array',
+            items: { type: 'string', enum: ['goals', 'intents', 'facts', 'findings', 'hints', 'todos', 'stats', 'pending_approvals', 'scope'] },
+            description: '可选：只保留这些顶层块（缺省=全量；task 与非空 pending_approvals 始终保留）',
+          },
+          max_chars: integer('单次返回字符硬上限（默认 6000，clamp 256..200000）'),
         },
         additionalProperties: false,
       },
@@ -23,10 +30,32 @@ export function readTools({ engine, config }) {
       async execute(args, exec) {
         const { agent, role, task } = await resolve(engine, exec, args.task_id)
         requireRead(agent, role, task, config)
-        return JSON.stringify(overview(task, {
-          factsLimit: args.facts_limit ?? 20,
+        const maxChars = clampInt(args.max_chars, OVERVIEW_MAX_CHARS, 256, 200000)
+        const factsLimit = clampInt(args.facts_limit, 10, 1, 50)
+        const full = overview(task, {
+          factsLimit,
           factsQ: args.facts_q,
-        }))
+        })
+        const filtered = filterOverview(full, args.sections)
+        const inline = JSON.stringify(filtered)
+        if (inline.length <= maxChars) return inline
+        // 超限：完整（未按 sections 过滤）态势落盘，返回可解析包装。
+        // bytes 一律指「完整 view」的字节数：写盘成功=落盘文件大小；失败=等价 JSON 大小。
+        const outDir = typeof task.outDir === 'string' ? task.outDir : ''
+        let file = null
+        let bytes = Buffer.byteLength(JSON.stringify(full), 'utf8')
+        if (outDir) {
+          try {
+            const info = await writeJsonAtomic(outDir, 'overview_latest.json', full)
+            file = info.path
+            bytes = info.bytes
+          } catch { /* 落盘失败时仍返回 preview，file 为 null */ }
+        }
+        return truncatedViewResponse(inline, {
+          bytes,
+          file,
+          note: file ? '完整态势已落盘；用 read/grep 按需取，或 artex_node_detail 按 id 取节点' : '完整态势落盘失败；用 sections/facts_limit 缩小查询或 artex_node_detail 按 id 取节点',
+        }, maxChars)
       },
     }),
     artifact({

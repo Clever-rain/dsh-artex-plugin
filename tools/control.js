@@ -3,6 +3,7 @@
  */
 
 import { artifact, callerOf, describe, integer, strings, isOwner, resolve, requireOwner, requireRead, pickLimits, liveRuntime, RUN_PARAMETERS } from '../tools-shared.js'
+import { STATUS_MAX_CHARS, capText, clampInt, formatStatusSummary, writeJsonAtomic } from './status-format.js'
 
 /** run/start 共用：把参数收拢成 startTask 的 policy 形状（防线字段一并透传）。 */
 function policyFromArgs(args) {
@@ -17,6 +18,44 @@ function policyFromArgs(args) {
     maxTokensPerIntent: args.max_tokens_per_intent,
     skillPacks: args.skill_packs,
   }
+}
+
+/**
+ * 单任务状态：摘要 + 全量快照落盘指针。
+ *
+ * 默认（detail=summary）只把有界摘要返回会话，完整 snapshot 尽力写到
+ * `<out_dir>/status_latest.json`；写盘失败降级为一行提示，不拖垮监控。
+ * detail=full 要求必须写成功（显式要全量却没盘可读，直接报错更诚实）。
+ */
+async function taskStatusReply(snapshot, args, maxChars) {
+  const detail = args.detail === 'full' ? 'full' : 'summary'
+  const summary = formatStatusSummary(snapshot, {
+    findingsLimit: clampInt(args.findings_limit, 10, 0, 50),
+    sections: args.sections,
+  })
+  const outDir = typeof snapshot?.out_dir === 'string' ? snapshot.out_dir : ''
+  let file
+  let failure
+  if (outDir) {
+    try {
+      file = await writeJsonAtomic(outDir, 'status_latest.json', snapshot)
+    } catch (error) {
+      failure = String(error?.message || error)
+    }
+  }
+  if (detail === 'full' && !file) {
+    throw new Error(`完整快照落盘失败${outDir ? `（${outDir}）` : '（任务快照缺少 out_dir）'}：${failure || '未知原因'}`)
+  }
+  const lines = [summary]
+  if (file) {
+    lines.push(`${detail === 'full' ? '完整快照已写入' : '完整快照'}：${file.path}（${file.bytes} 字节；read/grep 按需取）`)
+  } else if (failure) {
+    lines.push(`（快照落盘失败：${String(failure).slice(0, 80)}）`)
+  }
+  const note = file
+    ? `…（输出已截断至 ${maxChars} 字符；完整快照：${file.path}）`
+    : `…（输出已截断至 ${maxChars} 字符）`
+  return capText(lines.join('\n'), maxChars, note).text
 }
 
 export function controlTools({ engine, config }) {
@@ -99,40 +138,49 @@ mode：objective（默认，首个充分突破即收官，可并行 pursue）或
     }),
     artifact({
       name: 'artex_task_status',
-      description: '查看 ARTEX 任务状态：状态/轮次/目标达成情况/意图计数/事实与发现/待办/上限。不传 task_id 时列出本会话内存里的所有任务（以及当前工作区磁盘上的历史任务 id）。传 campaign 时给出该战役的跨任务聚合视图（目标达成/发现/成本/越界计数）；list_campaigns=true 列出索引知悉的全部战役。',
+      description: `查看 ARTEX 任务状态。**默认只回有界摘要**（状态/轮次/goals/意图计数/事实/发现标题/pending_approvals/结束原因），完整 snapshot 落盘到 \`<out_dir>/status_latest.json\`，会话里只留路径指针——长任务反复轮询也不会把运行态灌进上下文。需要细节时用 read/grep 读落盘文件，或 artex_node_detail 按 id 取节点；不要靠反复轮询拿全量。
+不传 task_id 时列出本会话内存里的所有任务（以及当前工作区磁盘上的历史任务 id）。传 campaign 时给出该战役的跨任务聚合视图；list_campaigns=true 列出索引知悉的全部战役。
+detail:"full" 强制写 status_latest.json（失败即报错）并返回路径+字节数；summary 模式落盘失败只降级提示。sections 可只要其中几块；findings_limit 控制标题清单条数；max_chars 是单次返回硬上限（默认 4000）。`,
       parameters: {
         type: 'object',
         properties: {
           task_id: describe('可选：任务 id；省略则列出任务'),
           campaign: describe('可选：战役 id——聚合该战役下全部任务（P3-1）'),
           list_campaigns: { type: 'boolean', description: '可选：true=列出索引知悉的全部战役名' },
+          detail: { type: 'string', enum: ['summary', 'full'], description: 'summary=只回摘要（默认，尽力落盘）；full=强制写 <out_dir>/status_latest.json 并返回路径+字节数' },
+          findings_limit: integer('发现标题清单条数（默认 10，0=不列标题，仅保留计数）'),
+          sections: {
+            type: 'array',
+            items: { type: 'string', enum: ['goals', 'intents', 'facts', 'findings', 'usage', 'hints', 'todos', 'scope'] },
+            description: '可选：只输出这些摘要块（缺省=goals+findings；header/审批/结束原因/落盘指针始终保留）',
+          },
+          max_chars: integer('单次返回字符硬上限（默认 4000，clamp 256..200000）'),
         },
         additionalProperties: false,
       },
       concurrent: true,
       async execute(args, exec) {
         const { agent, role } = callerOf(engine, exec)
+        const maxChars = clampInt(args.max_chars, STATUS_MAX_CHARS, 256, 200000)
         if (args.list_campaigns === true) {
           const names = await engine.campaignList()
-          return names.length > 0 ? `索引知悉的战役：\n${names.map(n => `- ${n}`).join('\n')}` : '索引里还没有任何战役。'
+          const text = names.length > 0 ? `索引知悉的战役：\n${names.map(n => `- ${n}`).join('\n')}` : '索引里还没有任何战役。'
+          return capText(text, maxChars, '…（输出已截断）').text
         }
         if (args.campaign) {
           const view = await engine.campaignStatus(String(args.campaign))
           const lines = view.tasks.map(t => `- ${t.id} [${t.status}${t.live ? '/live' : ''}] goals ${t.goals_met}/${t.goals_total} · facts ${t.facts} · findings ${t.findings_total}（verified ${t.findings_verified}）· tokens ${t.tokens}${t.violations > 0 ? ` · ⚠越界 ${t.violations}` : ''} · ${t.description}`)
-          return `## 战役 ${view.campaign}（${view.totals.tasks} 个任务，${view.totals.running} 个在跑）
+          const text = `## 战役 ${view.campaign}（${view.totals.tasks} 个任务，${view.totals.running} 个在跑）
 目标达成：${view.totals.goals_met}/${view.totals.goals_total} · 事实 ${view.totals.facts} · 发现 ${view.totals.findings_total}（verified ${view.totals.findings_verified}）· tokens ${view.totals.tokens} · 越界 ${view.totals.violations}
 
 ${lines.length > 0 ? lines.join('\n') : '（索引里没有该战役的任务）'}`
+          return capText(text, maxChars, `…（输出已截断至 ${maxChars} 字符；单任务全量用 artex_task_status(task_id=...)）`).text
         }
         if (args.task_id) {
           const task = await engine.resolveTask(String(args.task_id))
           requireRead(agent, role, task, config)
           const snapshot = await engine.status(String(task.id))
-          return `${snapshot.task_id} [${snapshot.status}] (${snapshot.mode}/${snapshot.view_mode}) ${snapshot.goal}
-轮次 ${snapshot.rounds} · 意图 ${JSON.stringify(snapshot.intents.by_state)} · 事实 ${snapshot.facts} · 发现 ${snapshot.findings_total ?? snapshot.findings.length} · 资源 ${snapshot.resources}${snapshot.brief_round ? ` · brief@r${snapshot.brief_round}` : ''}
-用时 ${Math.round(snapshot.elapsed_ms / 1000)}s${snapshot.finish_detail ? ` · ${snapshot.finish_detail}` : ''}
-
-${JSON.stringify(snapshot)}`
+          return taskStatusReply(snapshot, args, maxChars)
         }
         const all = await engine.status(undefined, { ownerSession: agent.id, taskIds: role ? [role.taskId] : [] })
         const live = all.filter(s => String(s.owner_session) === String(agent.id) || (role && String(s.task_id) === String(role.taskId)))
@@ -140,7 +188,7 @@ ${JSON.stringify(snapshot)}`
         const onDisk = await engine.storeFor(cwd).tasks.ids()
         const liveIds = new Set(all.map(t => t.task_id))
         const listing = live.length > 0
-          ? live.map(t => `- ${t.task_id} [${t.status}] rounds=${t.rounds} facts=${t.facts} findings=${t.findings.length} · ${t.goal}`).join('\n')
+          ? live.map(t => `- ${t.task_id} [${t.status}] rounds=${t.rounds} facts=${t.facts} findings=${t.findings.length} · ${String(t.goal ?? '').slice(0, 100)}`).join('\n')
           : '- （本进程内没有活动任务）'
         const history = []
         for (const id of onDisk.slice(0, 50)) {
@@ -159,9 +207,10 @@ ${JSON.stringify(snapshot)}`
           } catch { /* 跳过损坏或不可读的快照 */ }
           if (history.length >= 10) break
         }
-        return `## 本进程任务
+        const text = `## 本进程任务
 ${listing}
 ${history.length > 0 ? `\n## 磁盘上其它任务\n${history.map(id => `- ${id}`).join('\n')}` : ''}`
+        return capText(text, maxChars, '…（输出已截断）').text
       },
     }),
     artifact({

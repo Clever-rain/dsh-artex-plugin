@@ -88,11 +88,11 @@ DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：
 |---|---|---|
 | `artex_run_task` | 前台跑完整编排，返回报告（阻塞） | 所有者 |
 | `artex_start_task` | 后台启动，立即返回 task_id | 所有者 |
-| `artex_task_status` | 状态快照 / 列出任务 | 任意 |
+| `artex_task_status` | 状态**摘要**（有界）+ 完整 snapshot 落盘指针；`detail:"full"` 强制落盘；`sections`/`findings_limit`/`max_chars` 可调 | 所有者 / 任务子会话 |
 | `artex_stop_task` | `mode=stop` 终止；`mode=pause` 暂停保留现场 | 所有者 |
 | `artex_resume_task` | 重挂 paused/stopped 任务续跑（必须重给 budget_ms） | 所有者 |
 | `artex_add_hint` | 注入战略提示，立刻唤醒规划者 | 所有者 |
-| `artex_graph_overview` | 态势快照（目标、意图、事实、发现、血缘） | 任意 |
+| `artex_graph_overview` | 态势投影（默认 facts 10 条；`sections` 过滤；超 `max_chars` 自动落盘 `overview_latest.json` + 可解析包装） | 所有者 / 任务子会话 |
 | `artex_node_detail` | 某个节点的完整内容与证据 | 任意 |
 | `artex_trace` | 列出 work / 关键字检索过程 / 取某几步原文 | 任意 |
 | `artex_add_intent` | 批量派意图（≤4；kind=pursue/enumerate，state=open/blueprint，支持 depends_on） | planner / 所有者 |
@@ -225,6 +225,54 @@ max_workers: 3
 | `gitIgnoreGuard` | true | 启动时自动把 `.artex/` 补进 git 仓库的 `.gitignore` |
 | `maxTokensPerIntent` | 0 | 意图级 token 预算（0=不限，超限先收尾再硬停） |
 | `requireEngagement` | false | 是否强制任务必须绑定交战 |
+
+## 4.0.6 上下文治理：摘要式状态 + 落盘指针 + 提前压缩（1.1.0 / 2026-11-05）
+
+长任务监控的上下文膨胀源不是「任务状态本身」，而是**插件把服务端已经落盘的状态每次全量倒进会话**（旧版 `artex_task_status` 返回 `JSON.stringify(snapshot)`，`artex_graph_overview` 返回整张图 JSON）。本版按「运行态外置、会话只放指针」改造：
+
+### 工具契约
+
+`artex_task_status`（单任务模式）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `detail` | `summary` | `summary`=有界摘要（≤4000 字符，典型约 1.5KB）+ 尽力把完整 snapshot 写到 `<out_dir>/status_latest.json`；`full`=强制写成功（失败抛错），返回路径+字节数 |
+| `findings_limit` | 10 | 发现标题条数（clamp 0..50；0=只留计数）；`severity/id/title` 仍保留，细节用 `artex_node_detail` 或读文件 |
+| `sections` | `goals,findings` | 可选块：`goals,intents,facts,usage,hints,todos,scope,findings`（intents 块只给计数——snapshot 不携带意图摘要，要摘要见 `artex_graph_overview`）；header/审批/结束原因/指针始终保留 |
+| `max_chars` | 4000 | 单次返回硬上限（clamp 256..200000），超限截断并给落盘路径 |
+
+补充语义：**每次单任务查询都会覆写** `status_latest.json`（轮询即写盘，多并发写安全）；`max_chars` 同样作用于无参列表 / `campaign` / `list_campaigns` 三种模式（列表里 goal 截 100 字符）；`overview_latest.json` 落的是**当前 overview 投影**——`facts.recent` 受 `facts_limit` 限制，要更早的事实用 `facts_limit` 调大或直接读 `facts.jsonl`。
+
+默认输出形如：
+
+```text
+tmw... [running] (audit/hybrid) · live
+轮次 9 · goals 3/6 · 意图 {"open":1,"running":2,"done":6} · 事实 40 · 发现 60 · 资源 5
+用时 1800s · pending_approvals 0 · brief@r8
+- [goal#4] open …
+- #60 [high] VULN-…
+…还有 50 条（artex_node_detail 按 id 取，或 detail:"full" 后读 status_latest.json / findings.jsonl）
+完整快照：.artex/tasks/<id>/status_latest.json（15893 字节；read/grep 按需取）
+```
+
+`artex_graph_overview`：`facts_limit` 默认 **10**（原 20）；`sections` 过滤顶层块（`goals,intents,facts,findings,hints,todos,stats,pending_approvals,scope`；`findings` 会伴随带出 `findings_total` 等计数）；超过 `max_chars`（默认 6000）时把**未按 sections 过滤的完整投影**原子写到 `<task.outDir>/overview_latest.json`，返回 `{"truncated":true,"bytes":…,"file":…,"preview":"…"}` 可解析包装（任意 max_chars 下长度都不超限）。
+
+**不裁剪清单**（防退化）：状态/轮次/goals met-total、发现数量+标题+severity、pending_approvals、finish_detail、brief 版本号与落盘路径、hint/stop/resume 能力、按 id/文件取细节的通道。planner/worker 子会话与报告链路不走这两个工具，不受影响。
+
+### 压缩配置（DSH 侧，需重启/新会话生效）
+
+- `compaction-basic`：`thresholdRatio: 0.5`、`retainRatio: 0.16`（W=524288 时约 256K 触发；默认是 0.8）；
+- `tool-result-pruner`：`thresholdChars: 4096`、`headChars: 2048`、`tailChars: 512`（默认 8192/4096/1024）；
+- `llm-pi-ai.providers.sse-kimi.models`：给 `kimi-k3` / `deepseek-v4-flash` 显式配 `contextWindow: 524288`、`maxTokens: 8192`。
+- **版本差异（实测）**：随桌面端发布的 `dsh-compaction-basic`（0.2.1-rc.5）**支持** `headroomTokens`（默认 65536），触发阈值是 `floor(min(W×thresholdRatio, W−O−headroomTokens))`；开发版源码树（0.1.6-alpha.2）已移除该键。本仓库配置不显式写它（默认值即 65536，行为等价），跨版本改配置时以**实际安装版本**为准。
+- **agent preset 文件不吃 profile `cordis.patch.yml` 补丁**：压缩配置要直接改实际 preset 文件（形如 `<profile>/node_modules/<bundle>/preset/<preset>/agent.cordis.yml`，或 `~/.dsh/.agent-presets/<name>/agent.cordis.yml`）。`contextWindow` 属于 llm-pi-ai 的 profile 层，写在 profile `cordis.patch.yml` 即可。
+- `524288` 是**保守校准值**：实测输入 369,294 token 时上游仍接受请求（故 262,144 偏低），取 512K + 50% 阈值 = 256K 触发，能在真实窗口下限之上提前压缩；待确认上游真实窗口后可上调。
+
+### 验证
+
+- `node test/status-output-smoke.mjs`：默认输出体积、关键字段、禁区字段、落盘文件可解析、sections/findings_limit/max_chars、overview 默认 10 条与超限包装；
+- 旧回归（`security-smoke` 的极简 snapshot、`audit-regressions-smoke` 的 history 10 条）必须保持全绿。
+- 真实任务实测：一条 `task.json` 78KB 的长任务，完整 snapshot 19.8KB → 默认摘要 **928 字符 / 1.3KB**，落盘 23KB 可读。
 
 ---
 
@@ -399,6 +447,7 @@ node test/modes-smoke.mjs          # objective/audit、突破停兄弟、证明�
 node test/persistence-smoke.mjs    # 分片、JSONL 回填、合并写、索引
 node test/security-smoke.mjs       # 读 ACL、策略一致性、配置归一化
 node test/audit-regressions-smoke.mjs  # 审计回归
+node test/status-output-smoke.mjs  # 上下文治理：摘要体积/落盘/sections/max_chars/overview 有界
 ```
 
 `test/engine-smoke.mjs` 用脚本化的假子会话驱动真实引擎：规划者按态势派意图，worker 写回事实和发现，规划者再用证据标记目标，最后断言 `status=completed`、写回计数、trace 检索命中，以及子会话确实收到了越界工具的 deny 列表。
