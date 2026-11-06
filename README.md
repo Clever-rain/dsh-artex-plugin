@@ -1,209 +1,254 @@
-# dsh-artex — 把 ARTEX 的 agent 编排搬进 DSH
+# dsh-artex
 
-用 DSH 原生的 subagent 机制，把 ARTEX（`Autumn-27/ARTEX`）那套「双图 + 事件驱动」的 planner/worker 编排搬过来，做成一个 Host 插件。装上之后，模型会多出 23 个 `artex_*` 工具，能做四件事：
+[![test](https://github.com/Clever-rain/dsh-artex-plugin/actions/workflows/test.yml/badge.svg)](https://github.com/Clever-rain/dsh-artex-plugin/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- **一个总目标一路跑到底**：规划者（planner）每轮派意图，多个执行者（worker）并发领取，图上一有变化就唤醒规划者，直到目标有证据支撑。
-- **结论沉淀成图**：中间结论写成可检索的事实、发现、资源，而不是散落在对话里。
-- **按执行过程复用**：执行者之间可以互查「这条命令别人跑过没有」，不必只看最终结论。
-- **串行链不被打散**：规划者的待办跨轮保留，有依赖的多步计划只派「前置已满足」的那一步。
+**把「目标 → 计划 → 并发执行 → 证据 → 报告」这条长链路，做成 DSH 里的一个插件。**
 
-> 本仓库是插件的源码与测试目录，安装后对整个 profile 生效。
->
-> ⚠️ 插件会驱动子会话在宿主机上执行命令，仅限用于自有或已获书面授权的系统。使用前请先读文末的「免责声明与合法使用」。
+装上之后，模型多出 25 个 `artex_*` 工具和一套会话级开关。你给一个目标，它自己拆成意图、并发派子会话去做、把中间结论写成图上的事实与发现，最后按证据判定目标是否达成并输出报告。适合跨几十步、需要多路并发的任务：梳理一个陌生代码库、把接口文档和实现对齐、按覆盖清单做只读审计、整理一批资料的矛盾点。
+
+> ⚠️ 这是一个**编排框架**，不含扫描器、exploit 或攻击载荷；但子会话会以你的身份执行宿主命令。请只用于自有或已获书面授权的环境，先读文末[使用边界](#使用边界与许可)。
 
 ---
 
-## 1. ARTEX 的编排骨架
+## 目录
 
-ARTEX 是 Go 写的一套多智能体系统。它的编排不是「一个 agent 循环调工具」，而是**两张图 + 一个事件驱动引擎 + 三类角色**。
-
-| ARTEX 机制 | 代码位置 | 本质 |
-|---|---|---|
-| 探索图（每任务） | `db/schema.sql` `exploration_nodes/edges/anchors` | goal / intent / fact / finding / hint 节点，加 `spawns/derived_from/yields/proves` 血缘边 |
-| 资源图（跨任务共享） | `assets` 表 | 由程序去重、维护父子关系的「真值库」，agent 只提交原始信息 |
-| 引擎主循环 | `server/engine.go:800-914` | `select` 三路：边沿唤醒、心跳、退出；每任务 1 个 planner goroutine，加 N 个 worker goroutine |
-| 边沿去抖 | `engine.go:390, 810-819` | 唤醒后固定 **800ms** 窗口，把突发通知合并成一轮 |
-| 心跳巡检 | `engine.go:781-787` | `max(plan_heartbeat_seconds, 600s)`，防死锁，顺带复查在跑的 work |
-| frontier 领取 | `engine.go:1237-1245`、`exploration.go:1173-1181` | `open` 意图按 `priority DESC, id ASC` 出队，`UPDATE ... WHERE state='open'` CAS 抢占为 `running` |
-| 并发上限 | `manager.go:284` | 每任务 worker 数默认 **3** |
-| 事件源 | `manager.go:1762-1851` | worker 完成发 `done`；`report_finding` 落库当场 `notifyFinding`（不等 worker 结束）；goal、hint、删除、编辑也会唤醒 |
-| 意图状态机 | `engine.go:1135-1152` + `terminalreason.go` | `open→running→done/exhausted/blocked/stopped`；err 转 blocked，预算耗尽转 exhausted |
-| 预算与收尾 | `engine_timeout.go`、`worker.go:423-428`、`wrapup.go` | 任务 deadline 夹逼单轮预算；命中后先跑一轮**收尾**（停用 Bash、要求写回）；`settleDrainGrace=90s` |
-| 跨 work 过程复用 | `activity` 表、`tools.go:1821-1971` | 每一步工具调用和结果入库；`search_all_worker_traces(q)` 自动排掉自己那条意图；`get_worker_trace(intent_id, step_ids≤5)` 取原文 |
-| planner 跨轮待办 | `planner.go:43-48, 106-144, 432` | 每个任务一个 `TodoStore`，每次唤醒都把清单渲染进 user 提示；串行链只派「前置已满足」的那一步 |
-| 角色工具绑定 | `toolcatalog.go:34-50` + DB `tools` 绑定 | planner 只有 `add_intent/prove_goal/...`；worker 只有 `record_fact/insert_assets/report_finding/...`；`add_hint` 只给 mainagent |
-
-角色分工和提示词纪律（`planner.go:298-340`、`worker.go:230-243`）才是这套系统真正的「智能」所在：
-
-- **规划者只产意图，不动手**。不许自己 curl，不许自己枚举，只能派意图或者判目标。0 条意图必须有正当理由：目标没达成、又没有 open/running 意图时，必须给出方向。
-- **执行者一次只做一条意图，边发现边写回**。越界的线索写成 fact 交给规划者，不要自己追下去。fact 是观察，finding 才是已验证的成果，必须真的触发过、能复现。
-- **去重与血缘**。`parents` 只能挂 fact/finding，`yields` 记录意图的产出，规划者据此判断某个方向从哪儿来、能不能综合。
-- **深度优先于覆盖面**。同时保持 2–3 条机理不同的路线，但多样性要服从操作约束。
-- **`prove_goal` 是唯一的收官方式**。逐条用 fact/finding 作证据标记目标，标完最后一条任务自动结束；量化目标要先核对实测值。
+- [它解决什么问题](#它解决什么问题)
+- [与 ARTEX 的关系](#与-artex-的关系)
+- [环境要求](#环境要求)
+- [安装](#安装)
+- [在 DSH 里使用](#在-dsh-里使用)
+- [工具清单](#工具清单)
+- [配置](#配置)
+- [数据落盘与上下文治理](#数据落盘与上下文治理)
+- [已知边界与排障](#已知边界与排障)
+- [开发与测试](#开发与测试)
+- [使用边界与许可](#使用边界与许可)
 
 ---
 
-## 2. 映射到 DSH
+## 它解决什么问题
 
-DSH 里没有 Go goroutine，也没有 Postgres，但有三样够用的原语：子会话（`ctx.subagents.startActivation`）、工具注册表（`ctx.tools.register`）、会话事件流（`session/event`）。对应关系如下。
+一次长任务里，模型最容易坏在四件事上：忘了目标、重复劳动、结论散落在对话里、上下文越滚越大。dsh-artex 用四个机制对着治：
 
-| ARTEX | 本插件 | 说明 |
+| 问题 | 机制 |
+|---|---|
+| 忘了目标 | 目标是图上的节点，只能用 fact/finding 逐条证明（`artex_prove_goal`），没证据就是没完成 |
+| 重复劳动 | 每一步工具调用都索引进过程库，执行者之间能查「这条命令跑过没有」（`artex_trace`） |
+| 结论散落 | fact / finding / resource 落成可检索的节点与血缘边，而不是只留在对话里 |
+| 上下文爆掉 | 状态查询默认只回有界摘要，全量快照落盘给指针（见[上下文治理](#数据落盘与上下文治理)） |
+
+它**不是**：扫描器、doom loop 防护、沙箱。边界控制仍由 DSH 的沙箱/审批/工具白名单负责，本插件只在这些边界之内做编排。
+
+---
+
+## 与 ARTEX 的关系
+
+本插件是 [ARTEX](https://github.com/Autumn-27/ARTEX)（Go + Postgres 的多智能体系统）在 DSH 上的重写，而不是移植同一份代码：DSH 没有 goroutine，也没有数据库，但提供了子会话、工具注册表和会话事件流，足以复刻它的编排骨架。
+
+### 继承的核心机制
+
+| ARTEX 机制 | 在本插件里的形态 |
+|---|---|
+| 双图：每任务一张探索图 + 跨任务共享的资源图 | `.artex/tasks/<id>/` 下的图快照 + 跨任务 `resources.json`，节点类型 goal/intent/fact/finding/hint/resource 与血缘边保持一致 |
+| planner 与 worker 的角色分离，且**规划者不动手** | 每轮一个 planner 子会话，只产意图/判目标；每条意图一个 worker 子会话，只做一件事并写回 |
+| 边沿驱动唤醒 + 心跳巡检 | 事件入队后按 `debounceMs`（默认 800ms）合并成一拍；`heartbeatMs`（默认 600s）兜底防死锁，并复查静默的在跑 worker |
+| frontier 领取（`priority DESC, id ASC`，CAS 抢占） | 意图按 `open → running` 单线程领取；子会话本身是单线的，天然没有竞态 |
+| execution trace 复用 | `session/event` 里的 `tool/call`、`tool/result`、`assistant/message` 索引成过程库，`artex_trace` 支持关键字检索与取某几步原文 |
+| planner 跨轮待办 | `task.todos` + `artex_set_todos`，每轮渲染进提示，串行链只派「前置已满足」的那一步 |
+| `prove_goal` 作为唯一收官方式 | `artex_prove_goal`，默认只接受 observed 事实与 finding，推断结论必须先升级成证据 |
+
+### 工程上的改写
+
+| 差异点 | ARTEX | 本插件 |
 |---|---|---|
-| planner goroutine，每次唤醒新 session | `plannerRound()` → 每次 `startActivation` 一个 planner 子会话 | 全新会话 + 随附态势，相当于 ARTEX 的无状态唤醒 |
-| worker goroutine ×N | `dispatchWorkers()` → 每条意图一个 worker 子会话 | 并发上限 `maxWorkers`（默认 3） |
-| frontier / claimNext | `task.intents` 里 `state==='open'` 的节点，`claimIntent` 置 running | 单线程 JS，天然没有 CAS 竞争 |
-| 800ms 边沿去抖 | `waitEvent()` + `debounceMs`（默认 800） | 唤醒后先等一个窗口，再取事件队列 |
-| 心跳 ≥600s | `waitEvent(heartbeatMs)`，默认 600000 | 超时就跑一轮巡检规划，并复查在跑 worker 的静默量（唤醒→中断） |
-| `NotifyDone` / `notifyFinding` | `finishWorker` / `recordFinding` → `pushEvent` | finding 落库当场唤醒规划者，不等 worker 结束 |
-| `kill_work` / `steer_work` | `subagents.interrupt` / `subagents.sendMessage` | 预算耗尽先 steer 收尾，宽限期后再 interrupt |
-| settlement + 90s drain grace | `awaitChild()`：超时 → 发收尾词 → `settleGraceMs` → interrupt | 让已经识别出的结论有机会写回 |
-| `activity` + trace 检索 | `session/event` 的 `tool/call`、`tool/result`、`assistant/message` 索引成 activity | 执行者之间按过程互查；JSONL 全量落盘 |
-| planner 共享 TodoStore | `task.todos` + `artex_set_todos`（整体替换） | 跨唤醒保留，渲染进每一轮提示 |
-| 角色工具绑定 | `toolFilter.deny`（子会话）+ execute 内的身份校验 | 子会话**看不到**越界工具，绕过了也会被拒 |
-| Postgres 双图 | `.artex/` 下的 JSON 快照 + JSONL 过程日志 + 跨任务 `resources.json` | 无外部依赖，能 git diff，也能直接读 |
+| 并发单元 | planner/worker goroutine | `ctx.subagents` 子会话（`provider: spawn` 全新上下文，或 `fork` 继承） |
+| 存储 | Postgres 双图 | `.artex/` 下的 JSON 快照 + JSONL 分片，可 git diff、可直接读，无外部依赖 |
+| 角色工具绑定 | 数据库里按角色绑工具 | 子会话作用域内的 `toolFilter` 收掉越界工具，execute 里再按会话身份校验一次 |
+| 建任务 | 先起 goals 子代理把目标拆成可核验结果 | 省掉这一次调用，由调用方直接给 `goals` / `constraints`（也可只有单目标） |
+| 资源图去重 | 程序算 `root_domain→subdomain→service→endpoint` 层级 | 退化为 `(type, key‖name)` 去重 + 自由 `attrs`，因为通用场景没有固定层级 |
 
-### 角色与工具
+### 在 ARTEX 之外新增的
 
-| 角色 | 行为 | 工具 |
-|---|---|---|
-| **所有者会话**（调用 `artex_run_task` 的那个 DSH 会话） | 下目标、给约束、在环操舵、看报告 | 全部 23 个 |
-| **planner**（每轮一个新子会话） | 读态势 → 判目标 → 派 0..4 条意图 / 更新串行链待办 | `artex_add_intent`、`artex_prove_goal`、`artex_set_todos` + 读工具 |
-| **worker**（每条意图一个新子会话） | 只做这一条 → 边发现边写回 → 一句话总结 | `artex_record_fact`、`artex_report_finding`、`artex_add_resource` + 读工具 |
-| 其它无关子会话 | 什么都不能做（控制和写操作会被身份校验拒掉） | 读工具需显式带 `task_id` |
+运行态审批门、独立 verifier 子会话、覆盖矩阵与收口、交战绑定与目标审查、证据脱敏、会话级开关（`/artex` + chip）、上下文治理（摘要 + 落盘指针）。这些是为了适配 DSH 长会话与多角色共用同一宿主的现实，不是 ARTEX 原有能力。
 
-### 数据落地
+### 明确不做的
+
+层级 planner（过早引入会把 planner/worker 的分工烧掉）、报告导出 HTML/SARIF、跨任务只读继承、把 `steer/kill` 开放成 planner 工具。路线是「编排做深，武器不带」。
+
+---
+
+## 环境要求
+
+| 项 | 要求 |
+|---|---|
+| DSH | `>= 0.1.6-alpha.2`（`package.json` 的 `engines.dsh`） |
+| Node | 22 及以上（CI 跑 Node 22） |
+| 外部服务 | 无（不依赖 Postgres/Redis/网络端口） |
+
+---
+
+## 安装
+
+本仓库就是插件包的根目录：`package.json` 的 `dsh.bundle.patch` 指向同目录的 `cordis.patch.yml`。
+
+### 方式一：在会话里让插件管理器装（推荐）
+
+clone 到本机后，在 DSH 会话里让 agent 调用 `plugin_manager`：
 
 ```
-<workspace>/.artex/
-  resources.json                     # 跨任务资源图（按 type + key||name 去重）
-  tasks/<taskId>/task.json           # 探索图快照（goals/intents/facts/findings/hints/todos/stats）
-  tasks/<taskId>/activity.jsonl      # 全量过程日志（每步 tool/result）
+action: install_bundle
+target: <你 clone 的绝对路径>/dsh-artex-plugin
 ```
 
----
-
-## 3. 工具清单
-
-| 工具 | 作用 | 谁可以调 |
-|---|---|---|
-| `artex_run_task` | 前台跑完整编排，返回报告（阻塞） | 所有者 |
-| `artex_start_task` | 后台启动，立即返回 task_id | 所有者 |
-| `artex_task_status` | 状态**摘要**（有界）+ 完整 snapshot 落盘指针；`detail:"full"` 强制落盘；`sections`/`findings_limit`/`max_chars` 可调 | 所有者 / 任务子会话 |
-| `artex_stop_task` | `mode=stop` 终止；`mode=pause` 暂停保留现场 | 所有者 |
-| `artex_resume_task` | 重挂 paused/stopped 任务续跑（必须重给 budget_ms） | 所有者 |
-| `artex_add_hint` | 注入战略提示，立刻唤醒规划者 | 所有者 |
-| `artex_graph_overview` | 态势投影（默认 facts 10 条；`sections` 过滤；超 `max_chars` 自动落盘 `overview_latest.json` + 可解析包装） | 所有者 / 任务子会话 |
-| `artex_node_detail` | 某个节点的完整内容与证据 | 任意 |
-| `artex_trace` | 列出 work / 关键字检索过程 / 取某几步原文 | 任意 |
-| `artex_add_intent` | 批量派意图（≤4；kind=pursue/enumerate，state=open/blueprint，支持 depends_on） | planner / 所有者 |
-| `artex_plan` | 一轮结构化计划协议：一次提交 decision/todos/intents(≤12)/proofs | planner / 所有者 |
-| `artex_promote_intent` | 把 blueprint 提升为 open | planner / 所有者 |
-| `artex_set_brief` | 整体替换跨轮全局认知 brief | planner / 所有者 |
-| `artex_prove_goal` | 用 fact/finding 证明目标（inferred 默认拒，allow_inferred 放行） | planner / 所有者 |
-| `artex_set_todos` | 整体替换跨轮规划待办 | planner / 所有者 |
-| `artex_record_fact` | 写回结论（evidence + confidence + outcome；found 必给 evidence） | worker / 所有者 |
-| `artex_report_finding` | 登记已验证成果（evidence 硬门必填；evidence_refs 绑定步骤/工件 sha256） | worker / 所有者 |
-| `artex_request_approval` | 高风险动作申请人工审批（意图挂起等裁决） | worker / 所有者 |
-| `artex_resolve_approval` | 裁决待审批意图（approve 放行 / reject 终止） | 所有者 |
-| `artex_add_resource` | 登记跨任务复用的资源或实体 | worker / planner / 所有者 |
-| `artex_set_analysis` | 提交独立分析（只读输入，不改 brief） | analyst / 所有者 |
-| `artex_retest_finding` | finding 复测闭环（open → verified/rejected/needs_retest） | verifier / planner / 所有者 |
-| `artex_record_conflict` | 两条给出相反结论的节点落成结构化冲突 | worker / analyst / planner / 所有者 |
-| `artex_retract_fact` | 撤回事实（留档但不可再作证明） | planner / 所有者 |
-| `artex_coverage_report` | 确定性覆盖矩阵（audit 收口前查缺口） | 任意（按读权限） |
-
----
-
-## 4. 安装与使用
-
-本仓库既是独立仓库，也是插件包的根目录：`package.json` 里的 `dsh.bundle.patch` 就指向本目录的 `cordis.patch.yml`。
+### 方式二：命令行装到指定 profile
 
 ```powershell
-# 在本 profile 里安装：target 指向本仓库根目录
-# plugin_manager action: install_bundle, target: <path>/dsh-artex-plugin
+dsh plugin --profile <profile> add <你 clone 的绝对路径>\dsh-artex-plugin
 ```
 
-装好之后，新会话就能看到 `artex_*` 工具。举个例子：
+装完重启 DSH（或让插件层重载），新会话即可看到 `artex_*` 工具。
+
+### 升级
+
+重新 `git pull` 后重装同一条命令即可；配置写在 profile 的 patch 层，升级不会覆盖。装好之后可以在插件页随时启停。
+
+---
+
+## 在 DSH 里使用
+
+### 1. 跑一个任务
 
 ```
-用 artex_run_task 做这件事：把 docs/ 下所有接口文档和实现对齐，找出不一致；
+用 artex_run_task 做这件事：把 docs/ 下所有接口文档和实现对齐，找出不一致。
 goals: ["列出所有不一致项", "给出每项的修复建议"]
 constraints: ["只读，不修改代码"]
 max_workers: 3
 ```
 
-只想先看方案、不执行：给 `max_workers: 0`，只跑一轮规划，返回意图清单。
+关键入参（`artex_run_task` 与 `artex_start_task` 共用）：
 
-**成本与时长**：一轮规划对应一个 planner 子会话，一条意图对应一个 worker 子会话。3 轮 × 2 条意图的任务，大约 8 次模型调用。`max_rounds`、`budget_ms`、`max_tokens`、`worker_timeout_ms` 都是硬上限，`artex_stop_task` 可以随时止损。
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `goal` / `goals` | 必填其一 | 单个目标或可核验的目标清单 |
+| `constraints` | — | 最高优先级约束，注入 planner 与每个 worker（允许的主机/网段、禁止操作、只读要求） |
+| `mode` | `objective` | `objective`=首个充分突破即收官；`audit`=覆盖最大化，正负结果都写回 |
+| `max_workers` | 3 | 任务内并发 worker 数 |
+| `max_rounds` | 24 | 规划轮次上限 |
+| `budget_ms` | 0 | 任务墙钟预算（0=不限），子会话超时恒被它夹逼 |
+| `max_tokens` | 0 | 任务 token 预算（input+output），超限先收尾再硬停 |
+| `worker_timeout_ms` | 1200000 | 单 worker 预算 |
+| `read_only` | false | 子会话收掉写/执行类宿主工具（edit/write/pwsh/terminal/workflow…） |
+| `allowed_tools` | — | 子会话基础工具白名单；名单之外的同名工具一并收掉 |
+| `allowed_paths` | — | 路径白名单，作为纪律注入所有子会话 |
+| `allowed_targets` | — | 目标白名单（精确主机/后缀/IPv4/CIDR），越界按 `scope_enforcement` 处置 |
+| `engagement` | — | 绑定交战：`.artex/engagements/<id>.json` 里的授权说明与时间窗 |
+| `skill_packs` | — | 加载内置/自定义打法包（`recon`/`web-audit`/`report`，或 `.artex/skills/<name>.json`） |
+| `depth` | 1 | worker 深挖档（1–3，仅 objective 的 pursue 生效；每阶段落检查点 fact 再推进） |
+| `max_tokens_per_intent` | 0 | 单意图 token 上限（0=不限），超限先提醒收尾再硬停该 worker |
+| `breakthrough_grace_ms` | 30000 | 某条 pursue 证明目标后，其它在跑 pursue 的收尾宽限 |
+| `confirm` | — | goal 经确定性词表审查命中时，必须把 `confirm` 精确设为 goal 原文才能启动 |
+| `campaign` | — | 归属战役 id，供跨任务聚合 |
 
-## 4.0.1 P0 能力：暂停/恢复、token 预算、证据硬门、任务级沙箱
+**只想先看方案**：`max_workers: 0` —— 只跑一轮规划，返回意图清单，不派 worker。
 
-- **暂停/恢复**：`artex_stop_task(mode="pause")` 把任务以 `paused` 状态落盘（facts / findings / 意图 / brief / usage 全部保留；跑中意图回炉 open）。`artex_resume_task(task_id, budget_ms)` 重新挂载续跑——**必须显式给新预算**（旧 deadline 不继承），已完成任务不可恢复。跨进程重启也一样能从任务目录恢复。
-- **Token 预算**：`max_tokens`（input+output 合计）由 usage 事件实时累计；超限时先向全部子会话发"收尾证明"指令、宽限期内排干，再以 `timeout · token 预算耗尽（actual/max）` 收口。报告按 **角色 / 意图 / 工具调用计数** 三个维度给成本分解。
-- **证据硬门**：服务端强约束而不是提示词纪律——
-  - `artex_report_finding` 必须给 `evidence`；
-  - `outcome=found` 的 fact 必须给 `evidence`；
-  - `prove_goal` 默认只接受 observed 事实 / finding，`confidence=inferred` 需显式 `allow_inferred=true`，`outcome=none` 需显式 `allow_negative=true`。
-- **任务级沙箱策略**（start/run 参数落成 spawn 边界，不只是提示词）：
-  - `read_only: true` → 子会话的已知写/执行类宿主工具（edit/write/pwsh/terminal/workflow 等）全部经 toolFilter 收掉；
-  - `allowed_tools: [...]` → 基础工具白名单，名单之外的同名工具同样收掉；
-  - `allowed_paths: [...]` → 路径白名单，作为纪律约束注入所有子会话 prompt。
+**成本量级**：一轮规划 = 一个 planner 子会话，一条意图 = 一个 worker 子会话。3 轮 × 2 条意图的任务约 8 次模型调用；`enableVerifier` 开启后每落一条 finding 再多一次。
 
-## 4.0.2 P1 能力：覆盖闭环、生命周期、结构化计划、独立验证者
+### 2. 两种模式怎么选
 
-- **覆盖矩阵 + 收口门禁（audit）**：`coverageOf()` 按 goal 关键字确定性统计相关 fact/finding，`gap=true` 的目标在 audit 终态时随报告落盘（`report.coverage`），让"覆盖不透明"变成一行可核对的数据；planner 可用 `artex_coverage_report` 随时自查。
-- **finding 生命周期**：`open → verified / rejected / needs_retest`，由 `artex_retest_finding` 驱动。报告按状态分组（verified/open/rejected/needs_retest），不再只有"found/not found"两种视角。
-- **fact 生命周期**：`supersedes / contradicts / retracted`。`artex_record_conflict` 把两条相互矛盾的节点落成图上结构化对象（而不是只剩 planner 嘴上说说）；`artex_retract_fact` 撤回被证伪的旧结论（留档但不能再作 prove 证据）。
-- **意图显式依赖**：`depends_on: [意图id...]`。调度器只领依赖全部 done 的意图；依赖落在 failed/exhausted/blocked 的路线会在视图里标 `blocked_by_deps`，planner 负责改路线而不是让它悄悄饿死。
-- **结构化计划协议**：`artex_plan` 一次提交 `{ decision, todos, intents[≤12], proofs }`，服务端按 todos → intents → proofs 固定顺序执行；单段失败只记该段，不吞后续段，比一轮里散打 4 个工具更稳也更好审。
-- **独立 verifier**（`enable_verifier: true` 开启）：每落一条 finding 就按串行链派一个 verifier 子会话复核，工具面只有"只读 + retest + record_fact"，**不能派意图、不能改 brief**——验证和规划从结构上分离，防止角色膨胀。开启会让每 finding 多花一次模型调用，默认关。
+| mode | 目标函数 | 意图类型 | 完成判据 |
+|---|---|---|---|
+| `objective`（默认） | 首个充分突破 | `pursue`：追一条路径，成功即停；失败写 `outcome=none` 再回溯 | 目标有证据支撑 |
+| `audit` | 覆盖最大化 | `enumerate`：逐项验证，命中了也不停，正负结果都写回 | 每个覆盖维度都有证据 |
 
-## 4.0.3 P2：暂不实现
+`objective` 的路径是棵树：pursue 可带 `path_parent`，某条路径判死后规划者沿它向上找「还有未尝试 blueprint 的祖先」，从那儿派下一条（`artex_promote_intent` 把 blueprint 提升为 open）。任意一条 pursue 证明目标后引擎冻结派发，给其它在跑的 pursue 发「停止并回报」，等 `breakthrough_grace_ms` 后硬停——它们的事实与发现保留，报告里单列「被中止或判死的路径」。
 
-报告导出 HTML/JSON/SARIF、npm 发布、层级 planner，这条路线图明确**不做**：层级 planner 过早引入会把 planner/worker 的梯度烧掉（见 ARTEX 自身的双图设计边界）；导出/分发看后续真有消费方再排。（UI client 已由 §4.0.4 的开关 chip / 会话行徽章与 @local/dsh-artex-view 会话视图落地。）
 
-## 4.0.5 Phantom 启发路线图：P0 防线 / P1 审计 / P2 能力 / P3 运营
+### 3. 长任务怎么盯
 
-2026-11 参照 Phantom 事件教训落地的第二批路线图（详见《Phantom 对 dsh-artex 的设计启发》）。设计红线：**提示词约束是写给模型看的，防线必须落在引擎的确定性代码路径上**。
+后台跑（`artex_start_task`）之后，**不要反复拉全量状态**——那正是上下文膨胀的来源：
 
-### P0 防线（启动期机器校验，不经过模型）
+| 想知道 | 用什么 |
+|---|---|
+| 现在到哪了 | `artex_task_status(task_id)`：有界摘要（默认 ≤4000 字符）+ 全量快照落盘路径 |
+| 要更细 | `artex_graph_overview(task_id, facts_limit=30)` 看态势投影；或直接 read/grep 落盘文件 |
+| 某个节点 | `artex_node_detail(task_id, node_id)` |
+| 某一步干了什么 | `artex_trace(task_id, query=...)` / `artex_trace(task_id, intent_id, step_ids=[...])` |
+| 覆盖缺口 | `artex_coverage_report(task_id)`（audit 收口前必看） |
+| 在环纠偏 | `artex_add_hint(task_id, hint)` —— 立即唤醒 planner |
+| 停下来 | `artex_stop_task(task_id, mode="stop")`；`mode="pause"` 保留现场，之后 `artex_resume_task(task_id, budget_ms)` 续跑 |
 
-- **scope guard（`allowed_targets`）**：目标白名单支持四种写法——精确主机（`example.com`）、后缀（`*.corp.internal`，含根域）、IPv4、CIDR（`10.0.0.0/8`）。引擎在 worker 每次宿主工具调用事件上提取网络目标（URL 主机/IP/裸域名），越界按 `scope_enforcement` 处置：`warn`（默认，记录+提醒 worker+唤醒 planner）/ `stop`（停任务）/ `off`（只提示词约束）。越界事件持久化在 `task.violations` 并进报告。**边界**：DSH 不给插件抢占拦截能力，这里是"检测+提醒+停任务"，抢占靠 `allowed_tools` 白名单与 `read_only`。
-- **交战绑定（`engagement`）**：`.artex/engagements/<id>.json` 声明 `{ authorization, targets[], window{not_before,not_after} }`；启动期校验授权说明非空、时间窗有效、任务 `allowed_targets` 必须是交战目标集子集——**scope 不能比授权更宽**。未给 `allowed_targets` 时交战目标集即默认 scope。插件配置 `requireEngagement: true` 可强制所有任务必须绑定。
-- **目标审查（goal lint + `confirm`）**：goal/goals/constraints 经确定性词表审查（勒索/加密器/免杀载荷/破坏性动作/僵尸网络/显式未授权/数据变现；**不标**"渗透/漏洞/提权"等合法红队语言）。命中时必须把 `confirm` 精确设为 goal 原文，确认与命中词随任务留痕（`risk_confirm`）并进报告。
-- **证据脱敏（`redact_evidence`，默认开）**：写回边界的确定性打码——password/token/Authorization/cookie/AWS/GitHub/Slack key、PEM 私钥块等值替换为 `前缀…[已脱敏 N 字符]`，保留键与上下文，证据链仍可核对。任务可显式关闭。
-- **`.artex` 防裸奔（`gitIgnoreGuard`，默认开）**：启动时检测 cwd 是 git 仓库且 `.gitignore` 未覆盖 `.artex/` → 自动追加并留一条过程库记录。证据含目标与凭据片段，绝不能进提交。
+### 4. 审批
 
-### P1 审计
+高风险动作可以要求人工裁决：planner 派意图时带 `requires_approval: true`，或 worker 自查后调 `artex_request_approval(reason, action)` 挂起本轮。你在会话里用 `artex_resolve_approval(intent_id, approve|reject, note)` 裁决，批示会注入重新派发的 worker 提示词；`pending_approvals` 在状态、态势与报告里都可见。
 
-- **finding ↔ 原始证据绑定（`evidence_refs`）**：`artex_report_finding` 可附 `{ steps: [过程库步骤id], artifacts: [{path, note}] }`；服务端校验步骤真实存在（用 `artex_trace` 查 id）、工件必须位于任务工作区内并自动计算 sha256（>64MB 只记大小）。校验失败整体拒收。报告 finding 行直接渲染证据绑定。
-- **运行时审批门**：两类入口——planner 派意图时 `requires_approval: true`（owner 批准前不被领取）；worker 自查高风险动作（改目标状态/横向移动/破坏性验证/触发告警扫描）调 `artex_request_approval(reason, action)` 挂起并结束本轮。owner 用 `artex_resolve_approval(intent_id, approve|reject, note)` 裁决：批准 → 意图带批示重新派发（批示注入 worker 提示词）；拒绝 → 意图终止（`approval_rejected`）。全部裁决落过程库，`pending_approvals` 在状态查询/规划态势/报告里可见。
+### 5. 会话级开关
 
-### P2 能力
+```
+/artex on | off | status
+```
 
-- **worker 深挖档（意图 `depth: 1..3`）**：仅 objective 模式的 pursue 生效（audit 要逐项独立证据链，强制 1）。墙钟预算按 depth 成比例放宽；worker 提示词注入链式推进段——**每阶段落检查点 fact（observed+evidence）再推进**，支线照旧只写 blueprint。主路径深挖用 2，别滥用 3。
-- **技能包（`skill_packs`）**：任务级声明加载"打法+工具面"模块。内置 `recon` / `web-audit` / `report`；自定义放 `.artex/skills/<name>.json`（形状 `{ prompt, tools[] }`）。包 prompt 注入每个 worker；任务未显式给 `allowed_tools` 时并入包声明的工具白名单。**纪律**：技能包只封装打法与工具面，不内置任何攻击载荷——能力模块化 ≠ 弹药内置（Phantom 的 WormGPT-MCP 是反面教材）。
+或在输入框左侧点 **🧭 ARTEX chip**。off 之后本会话发起的 `artex_*` 调用会被 `tools.guard` 拦下并提示重开；**已经在跑的任务不受影响**（它们由子会话写回）。状态存在 profile 级 `~/.dsh/artex-session-flags.json`，默认开。
 
-### P3 运营
+同一份状态也通过 `POST /api/artex` 暴露给本地消费方（`state {sessionId, cwd?}` 取开关与任务摘要，`setEnabled` 切换）——只接受回环来源，Host 必须是 `localhost`/`127.0.0.1`/`[::1]` 且 Origin 同源，用来挡 DNS rebinding 与跨站写请求。
 
-- **campaign 聚合（`campaign`）**：任务归属战役 id（进全局索引）；`artex_task_status(campaign=...)` 跨任务聚合——任务列表（状态/目标达成/发现/成本/越界计数）+ totals；`list_campaigns: true` 列全部战役。
-- **成本门禁**：`max_tokens_per_intent`（参数或配置 `maxTokensPerIntent`）——单意图超 cap 先发收尾提醒（点明成本原因），宽限后硬停该 worker；每意图只触发一次。planner 每轮态势新增 `cost`：燃烧率（`since_last_round` / `per_round_avg`）、`remaining_tokens`、`est_rounds_left`——逼近 0 时 planner 被明确告知转收尾。
+### 6. 结果去哪了
 
-## 4.0.4 会话级开关与调用标识
+`artex_run_task` 直接返回报告；后台任务用 `artex_task_status` 看摘要与结束原因，报告正文由引擎在收官时渲染（目标达成与证据、发现按 verified/open/rejected/needs_retest 分组、被中止或判死的路径、覆盖矩阵、成本分解）。落盘文件都在 `.artex/tasks/<id>/`，可以自己读或交给下游插件。
 
-「这个会话用没用 ARTEX」从隐式变显式，分三层：
+---
 
-- **开关**：会话里输入 `/artex on | off | status`（人类命令，不进模型上下文；`command/run` 连参数落在会话日志里，命令行本身就是切换的可见标记），或点输入框左侧的 **🧭 ARTEX chip**（client 半边，与命令共用同一份状态）。off 之后本会话发起的 `artex_*` 调用一律被 `tools.guard` 拦截并提示如何重开；**运行中的任务不受影响**（它们的写回来自子会话，子会话有自己的会话 id，默认开）。状态持久化在 profile 级 `~/.dsh/artex-session-flags.json`（默认开，装了插件即可用，向后兼容；文件损坏容错为全开）。
-- **标识**：25 个 `artex_*` 工具卡片统一 **🧭** 前缀，时间线上一眼可辨；会话列表里有 ARTEX 任务的会话行头显示 **🧭** 徽章（悬停给任务数/运行中数，client 半边轮询 `/api/artex`）。
-- **数据通道**：`/api/artex`（POST，只收本机回环来源）——`state {sessionId, cwd?}` 返回 `{enabled, tasks: 轻量摘要[]}`，`setEnabled {sessionId, enabled}` 切换开关；插件自己的 client 半边与任何本地消费方都可用。
+## 工具清单
 
-硬摘 schema（`tools.restrict` 按会话隐藏 25 个工具以省上下文）验证过机制存在，但 schema 动态性对事件回放的影响未定论，当前只做软门禁。
+25 个工具，按「谁能调」分三档：所有者会话、planner/analyst/verifier 子会话、worker 子会话。越界调用会被身份校验拒绝，而不只是提示词劝阻。
 
-**配置**（写在 `cordis.patch.yml` 的 config 里，装好之后也可以再改）：
+| 工具 | 作用 | 可调用角色 |
+|---|---|---|
+| `artex_run_task` | 前台跑完整编排，返回报告（阻塞） | 所有者 |
+| `artex_start_task` | 后台启动，立即返回 task_id | 所有者 |
+| `artex_task_status` | 状态摘要（有界）+ 快照落盘指针；`detail:"full"`、`sections`、`findings_limit`、`max_chars` 可调 | 所有者 / 任务子会话 |
+| `artex_stop_task` | `mode=stop` 终止；`mode=pause` 暂停保留现场 | 所有者 |
+| `artex_resume_task` | 重挂 paused/stopped 任务续跑（必须重给 `budget_ms`） | 所有者 |
+| `artex_add_hint` | 注入战略提示，立刻唤醒规划者 | 所有者 |
+| `artex_graph_overview` | 态势投影（默认 facts 10 条；`sections` 过滤；超 `max_chars` 落盘 `overview_latest.json`） | 所有者 / 任务子会话 |
+| `artex_node_detail` | 某个节点的完整内容与证据 | 任意（按读权限） |
+| `artex_trace` | 列出 work / 关键字检索过程 / 取某几步原文 | 任意（按读权限） |
+| `artex_add_intent` | 派意图（≤4；`kind`=pursue/enumerate，`state`=open/blueprint，支持 `depends_on`） | planner |
+| `artex_plan` | 一轮结构化计划：`{decision, todos, intents≤12, proofs}` 一次提交 | planner |
+| `artex_promote_intent` | 把 blueprint 提升为 open | planner |
+| `artex_set_brief` | 整体替换跨轮全局认知 brief | planner |
+| `artex_set_todos` | 整体替换跨轮规划待办 | planner |
+| `artex_prove_goal` | 用 fact/finding 证明目标（`allow_inferred` / `allow_negative` 需显式放行） | planner |
+| `artex_retract_fact` | 撤回事实（留档、不可再作证明，引用它的目标回退 open） | planner |
+| `artex_record_fact` | 写回结论（`outcome=found` 必给 evidence） | worker |
+| `artex_report_finding` | 登记已验证成果（evidence 硬门；`evidence_refs` 可绑步骤与工件 sha256） | worker |
+| `artex_add_resource` | 登记跨任务复用的资源/实体 | worker / planner |
+| `artex_record_conflict` | 两条相反结论落成结构化冲突 | worker / analyst / planner |
+| `artex_request_approval` | 高风险动作申请人工审批（挂起意图） | worker |
+| `artex_resolve_approval` | 裁决待审批意图（approve/reject） | 所有者 |
+| `artex_set_analysis` | 提交独立分析（只读输入，不改 brief） | analyst |
+| `artex_retest_finding` | finding 复测闭环（open → verified/rejected/needs_retest） | verifier / planner |
+| `artex_coverage_report` | 确定性覆盖矩阵（audit 收口前查缺口） | 任意（按读权限） |
+
+### 角色分工
+
+| 角色 | 做什么 | 工具面 |
+|---|---|---|
+| 所有者会话 | 下目标、给约束、在环纠偏、看报告 | 全部 25 个 |
+| planner（每轮一个新子会话） | 读态势 → 判目标 → 派意图 / 更新待办 | 派意图、证明目标、待办与 brief |
+| worker（每条意图一个新子会话） | 只做这一条，边发现边写回 | 写事实/发现/资源 + 读工具 |
+| analyst（可选，周期性） | 只读重综合，输出一致性检查与优先级建议 | 只读 + `artex_set_analysis` |
+| verifier（`enable_verifier: true`） | 复核每条 finding | 只读 + `artex_retest_finding` |
+
+---
+
+## 配置
+
+写在 profile 的 `cordis.patch.yml`（或插件行 config）里，随时可改；改完对新会话生效。
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `provider` | `spawn` | 子会话 provider（`spawn` 全新上下文 / `fork` 继承上下文） |
+| `provider` | `spawn` | 子会话 provider：`spawn` 全新上下文 / `fork` 继承上下文 |
 | `maxWorkers` | 3 | 任务内并发 worker |
 | `maxRounds` | 24 | 规划轮次上限 |
 | `maxStalls` | 2 | 连续空转多少轮后停 |
@@ -211,274 +256,143 @@ max_workers: 3
 | `heartbeatMs` | 600000 | 巡检间隔 |
 | `workerTimeoutMs` | 1200000 | 单 worker 预算 |
 | `plannerTimeoutMs` | 900000 | 单轮 planner 预算 |
-| `mode` | `objective` | 默认任务模式：`objective` / `audit` |
-| `viewMode` | `hybrid` | 全局视野策略：`planner` / `hybrid` / `analyst` |
+| `budgetMs` | 0 | 任务总预算（0=不限） |
+| `mode` | `objective` | 默认模式：`objective` / `audit` |
+| `viewMode` | `hybrid` | 全局视野：`planner` / `hybrid` / `analyst` |
 | `enableHybrid` | true | hybrid 总开关，false 强制 planner |
+| `enableVerifier` | false | 每条 finding 派 verifier 复核（多一次调用） |
+| `analystEveryRounds` | 3 | audit 每 N 轮触发一次 analyst |
+| `analystFactThreshold` | 8 | 新增事实达到 N 条触发 analyst |
+| `analystMaxRuns` | 4 | 单任务 analyst 运行上限 |
+| `analystCooldownMs` | 30000 | analyst 冷却 |
+| `analystTimeoutMs` | 180000 | 单次 analyst 预算 |
 | `saveDebounceMs` | 500 | 快照合并写延迟 |
-| `plannerRetries` | 2 | planner 瞬态失败的重试次数 |
-| `allowCrossTaskRead` | false | 是否允许跨 owner/角色读取任务 |
+| `plannerRetries` | 2 | planner 瞬态失败重试 |
 | `settleGraceMs` | 90000 | 收尾宽限 |
-| `budgetMs` | 0 | 任务总预算（0 表示不限） |
-| `isolateWorkdir` | false | worker 是否在 `.artex/tasks/<id>/i<n>` 独立 cwd 里工作 |
-| `scopeEnforcement` | `warn` | scope 越界默认处置：`warn` / `stop` / `off` |
-| `redactEvidence` | true | 证据写回默认脱敏（口令/token/私钥打码） |
-| `gitIgnoreGuard` | true | 启动时自动把 `.artex/` 补进 git 仓库的 `.gitignore` |
-| `maxTokensPerIntent` | 0 | 意图级 token 预算（0=不限，超限先收尾再硬停） |
-| `requireEngagement` | false | 是否强制任务必须绑定交战 |
+| `isolateWorkdir` | false | worker 是否在 `.artex/tasks/<id>/i<n>` 独立 cwd 工作 |
+| `allowCrossTaskRead` | false | 是否允许跨 owner/角色读取任务 |
+| `scopeEnforcement` | `warn` | 目标越界处置：`warn` / `stop` / `off` |
+| `redactEvidence` | true | 证据写回脱敏（口令/token/私钥打码） |
+| `gitIgnoreGuard` | true | 启动时把 `.artex/` 补进所在 git 仓库的 `.gitignore` |
+| `maxTokensPerIntent` | 0 | 意图级 token 预算（0=不限） |
+| `requireEngagement` | false | 是否要求所有任务绑定交战 |
 
-## 4.0.6 上下文治理：摘要式状态 + 落盘指针 + 提前压缩（1.1.0 / 2026-11-05）
+**视野策略怎么选**：`planner` 最省；`hybrid`（默认）按条件触发 analyst，长审计里用于纠偏；`analyst` 每轮都跑，最贵。传统非审计用法 = `mode:"objective"` + `view_mode:"planner"`。
 
-长任务监控的上下文膨胀源不是「任务状态本身」，而是**插件把服务端已经落盘的状态每次全量倒进会话**（旧版 `artex_task_status` 返回 `JSON.stringify(snapshot)`，`artex_graph_overview` 返回整张图 JSON）。本版按「运行态外置、会话只放指针」改造：
+---
 
-### 工具契约
+## 数据落盘与上下文治理
 
-`artex_task_status`（单任务模式）：
+### 目录结构
 
-| 参数 | 默认 | 说明 |
+```
+<workspace>/.artex/
+  resources.json                        # 跨任务资源图（按 type + key‖name 去重）
+  engagements/<id>.json                 # 交战：授权说明、目标集、时间窗
+  skills/<name>.json                    # 自定义打法包 {prompt, tools[]}
+  tasks/<taskId>/
+    task.json                           # 元数据 + 图状态（goals/intents/hints/todos/stats）
+    facts.jsonl  findings.jsonl         # 结论与发现（追加写，超上限压实）
+    activity.jsonl                      # 全量过程日志（单卷 64MB 轮转）
+    status_latest.json                  # 最近一次状态查询的完整快照
+    overview_latest.json                # 最近一次超限态势投影
+```
+
+另有 profile 级 `~/.dsh/artex-index.json`（`taskId → cwd` + owner，最多 500 条，支持跨工作区按 id 找任务）与 `~/.dsh/artex-session-flags.json`（会话开关）。
+
+### 上下文治理：运行态外置
+
+长任务监控最容易把上下文灌爆，因为插件会把服务端已经落盘的状态每次全量倒进会话。这里改成「会话只放指针」：
+
+| 工具 | 默认行为 | 要全量时 |
 |---|---|---|
-| `detail` | `summary` | `summary`=有界摘要（≤4000 字符，典型约 1.5KB）+ 尽力把完整 snapshot 写到 `<out_dir>/status_latest.json`；`full`=强制写成功（失败抛错），返回路径+字节数 |
-| `findings_limit` | 10 | 发现标题条数（clamp 0..50；0=只留计数）；`severity/id/title` 仍保留，细节用 `artex_node_detail` 或读文件 |
-| `sections` | `goals,findings` | 可选块：`goals,intents,facts,usage,hints,todos,scope,findings`（intents 块只给计数——snapshot 不携带意图摘要，要摘要见 `artex_graph_overview`）；header/审批/结束原因/指针始终保留 |
-| `max_chars` | 4000 | 单次返回硬上限（clamp 256..200000），超限截断并给落盘路径 |
+| `artex_task_status` | 有界摘要（≤4000 字符，典型 1–2KB），完整快照尽力写 `status_latest.json` | `detail:"full"` 强制写成功并返回路径+字节数；`sections` 选块，`findings_limit` 控标题条数，`max_chars` 是硬上限 |
+| `artex_graph_overview` | `facts_limit` 默认 10，`max_chars` 默认 6000 | 超限时把完整投影原子写到 `overview_latest.json`，返回 `{truncated, bytes, file, preview}` 可解析包装 |
 
-补充语义：**每次单任务查询都会覆写** `status_latest.json`（轮询即写盘，多并发写安全）；`max_chars` 同样作用于无参列表 / `campaign` / `list_campaigns` 三种模式（列表里 goal 截 100 字符）；`overview_latest.json` 落的是**当前 overview 投影**——`facts.recent` 受 `facts_limit` 限制，要更早的事实用 `facts_limit` 调大或直接读 `facts.jsonl`。
+永不裁剪的字段（防退化）：状态、轮次、goals 达成数、发现数量+标题+severity、`pending_approvals`、结束原因、brief 版本号与落盘路径、以及「按 id / 读文件取细节」的通道。
 
-默认输出形如：
+### DSH 侧压缩（可选，按需调）
 
-```text
-tmw... [running] (audit/hybrid) · live
-轮次 9 · goals 3/6 · 意图 {"open":1,"running":2,"done":6} · 事实 40 · 发现 60 · 资源 5
-用时 1800s · pending_approvals 0 · brief@r8
-- [goal#4] open …
-- #60 [high] VULN-…
-…还有 50 条（artex_node_detail 按 id 取，或 detail:"full" 后读 status_latest.json / findings.jsonl）
-完整快照：.artex/tasks/<id>/status_latest.json（15893 字节；read/grep 按需取）
-```
+长任务还建议把 DSH 自身的压缩阈值调紧，命中前就压，而不是等窗口打满：
 
-`artex_graph_overview`：`facts_limit` 默认 **10**（原 20）；`sections` 过滤顶层块（`goals,intents,facts,findings,hints,todos,stats,pending_approvals,scope`；`findings` 会伴随带出 `findings_total` 等计数）；超过 `max_chars`（默认 6000）时把**未按 sections 过滤的完整投影**原子写到 `<task.outDir>/overview_latest.json`，返回 `{"truncated":true,"bytes":…,"file":…,"preview":"…"}` 可解析包装（任意 max_chars 下长度都不超限）。
+- `compaction-basic`：`thresholdRatio: 0.5`、`retainRatio: 0.16`；
+- `tool-result-pruner`：`thresholdChars: 4096`、`headChars: 2048`、`tailChars: 512`；
+- 模型行显式给 `contextWindow` / `maxTokens`（例如 512K 窗口配 8K 输出）。
 
-**不裁剪清单**（防退化）：状态/轮次/goals met-total、发现数量+标题+severity、pending_approvals、finish_detail、brief 版本号与落盘路径、hint/stop/resume 能力、按 id/文件取细节的通道。planner/worker 子会话与报告链路不走这两个工具，不受影响。
-
-### 压缩配置（DSH 侧，需重启/新会话生效）
-
-- `compaction-basic`：`thresholdRatio: 0.5`、`retainRatio: 0.16`（W=524288 时约 256K 触发；默认是 0.8）；
-- `tool-result-pruner`：`thresholdChars: 4096`、`headChars: 2048`、`tailChars: 512`（默认 8192/4096/1024）；
-- `llm-pi-ai.providers.sse-kimi.models`：给 `kimi-k3` / `deepseek-v4-flash` 显式配 `contextWindow: 524288`、`maxTokens: 8192`。
-- **版本差异（实测）**：随桌面端发布的 `dsh-compaction-basic`（0.2.1-rc.5）**支持** `headroomTokens`（默认 65536），触发阈值是 `floor(min(W×thresholdRatio, W−O−headroomTokens))`；开发版源码树（0.1.6-alpha.2）已移除该键。本仓库配置不显式写它（默认值即 65536，行为等价），跨版本改配置时以**实际安装版本**为准。
-- **agent preset 文件不吃 profile `cordis.patch.yml` 补丁**：压缩配置要直接改实际 preset 文件（形如 `<profile>/node_modules/<bundle>/preset/<preset>/agent.cordis.yml`，或 `~/.dsh/.agent-presets/<name>/agent.cordis.yml`）。`contextWindow` 属于 llm-pi-ai 的 profile 层，写在 profile `cordis.patch.yml` 即可。
-- `524288` 是**保守校准值**：实测输入 369,294 token 时上游仍接受请求（故 262,144 偏低），取 512K + 50% 阈值 = 256K 触发，能在真实窗口下限之上提前压缩；待确认上游真实窗口后可上调。
-
-### 验证
-
-- `node test/status-output-smoke.mjs`：默认输出体积、关键字段、禁区字段、落盘文件可解析、sections/findings_limit/max_chars、overview 默认 10 条与超限包装；
-- 旧回归（`security-smoke` 的极简 snapshot、`audit-regressions-smoke` 的 history 10 条）必须保持全绿。
-- 真实任务实测：一条 `task.json` 78KB 的长任务，完整 snapshot 19.8KB → 默认摘要 **928 字符 / 1.3KB**，落盘 23KB 可读。
+注意两点：压缩配置属于 DSH 的 preset/profile 层，写在插件 config 里无效；`contextWindow` 要按你实际使用的模型与上游真实窗口填，别照抄数字。
 
 ---
 
-## 4.1 双模式与全局认知
+## 已知边界与排障
 
-### 两种成功语义
+**边界**
 
-| mode | 目标函数 | 意图类型 | 完成判据 |
-|---|---|---|---|
-| `objective`（默认） | 首个充分突破 | `pursue`：追一条路径，成功即停；失败写 `outcome=none` 再回溯 | 目标有证据支撑 |
-| `audit` | 覆盖最大化 | `enumerate`：逐项验证，命中了也不停，正负结果都写回 | 覆盖维度（goals）都有证据 |
+- 不是抢占式拦截：`allowed_targets` 是「检测 + 提醒 + 可停任务」，真正的边界靠 `read_only` / `allowed_tools` 与 DSH 沙箱。
+- audit 的「覆盖闭合」靠目标证据实现，属于约束级而非引擎强制：报告里要看覆盖矩阵与未覆盖项，别只看 `completed`。
+- 插件重载会清空进程内任务状态；历史快照仍在 `.artex/tasks/<id>/`，可按 id 重新读。
+- 跨会话读取默认关闭；`allowCrossTaskRead: true` 才放开。
+- `.artex/` 可能含证据原文（主机名、端口、命令输出片段），不要提交到公开仓库——`gitIgnoreGuard` 会尽力补 `.gitignore`，但别依赖它。
 
-**objective 的路径树与回溯**：pursue 可以带 `path_parent`。某条路径判死后，规划者沿它往上找最近的、还有未尝试 `blueprint` 的祖先，从那儿派下一条。`blueprint` 是候选池，可以直接用 `state:"open"` 创建，也可以用 `artex_promote_intent` 提升。
+**排障**
 
-**突破即停，保留现场**：任意一条 pursue 证明目标后，引擎先冻结派发，给其它在跑的 pursue 发「停止并回报」指令，等 `breakthrough_grace_ms`（默认 30 秒）让它们把进度写回来，到期硬停。这些意图记为 `stopped/sibling_breakthrough`，它们的事实、发现和输出都保留，报告里单列「被中止或判死的路径」。
-
-### 全局认知（brief）
-
-规划者每轮维护一份跨轮持久的 `brief`（`artex_set_brief`，整体替换），引擎另外注入两样东西：
-
-- `delta`：上次规划之后新增或变化的事实、发现，以及结束的意图。
-- `digest`：确定性的 outcome 计数、意图状态分布、失败路径清单。
-
-`brief` 要覆盖整个任务的历史（audit 写覆盖地图，objective 写路径树），已确认的结论必须带 `fact#id`。落后超过一轮，下一轮的提示里会标「已过期」。历史信息有固定大小的载体，事实列表就不必随轮次线性膨胀。
-
-### 相关参数
-
-| 位置 | 参数 |
+| 现象 | 先查 |
 |---|---|
-| `artex_run_task` / `artex_start_task` | `mode`：`objective` / `audit`；`breakthrough_grace_ms` |
-| `artex_add_intent` | `kind`：`pursue` / `enumerate`；`state`：`open` / `blueprint`；`path_parent` |
-| `artex_record_fact` | `outcome`：`found` / `none` / `inconclusive` / `blueprint` |
-| `artex_prove_goal` | `allow_negative`：目标本身是负向结论时，允许 `outcome=none` 作证据 |
+| 看不到 `artex_*` 工具 | 插件是否安装并启用；profile 是否重启过；会话是否被 `/artex off` 关掉 |
+| 任务起了但不动 | `artex_task_status` 看 `pending_approvals` 与结束原因；`artex_trace` 看子会话是否报错 |
+| 子会话什么都没干 | 检查 `allowed_tools` / `read_only` 是否把需要的工具收掉了 |
+| 反复跑同一条命令 | 让 planner 先 `artex_trace(query=...)` 查过程库；或收紧 `constraints` |
+| 越跑越贵 | 设 `budget_ms` / `max_tokens` / `maxTokensPerIntent`；`view_mode:"planner"` 省掉 analyst |
+| 状态输出被截断 | 这是预期行为；读 `status_latest.json` 全文 |
 
-### 边界
+---
 
-- audit 的「覆盖闭合才算完成」是靠 goals 证据实现的，属于提示词级约束，不是引擎硬门禁。
-- 轮次用尽会补一次**收官证明轮**；预算耗尽、且已经有事实时，会补一次**收尾证明轮**，只做目标判定，不再派新意图。
-- 插件重载后，进程内的任务状态会清空；历史快照仍在 `.artex/tasks/<id>/` 下。
+## 开发与测试
 
-## 4.2 独立分析者（analyst）
-
-全局视野分三层：引擎 digest（确定性计数）、规划者 brief（战略权威）、analyst（周期性只读重综合）。analyst 通过 `artex_set_analysis` 提交分析，规划者读过之后自己决定采纳还是驳回，再写进 brief。**只有规划者能改 brief**，免得两边同时写、来回震荡。
-
-| `viewMode` | 行为 | 成本 |
-|---|---|---|
-| `hybrid`（默认） | 按触发条件运行：audit 每 3 轮或新增事实 ≥8；objective 出现 `failed` 路径；brief 过期 | 中 |
-| `planner` | 不启用 analyst | 最低 |
-| `analyst` | 每个规划轮都跑一次 | 最高 |
-
-触发条件和预算（config）：`analystMaxRuns=4`、`analystEveryRounds=3`、`analystFactThreshold=8`、`analystCooldownMs=30000`、`analystTimeoutMs=180000`。
-
-### 开关
-
-| 层级 | 字段 | 默认 | 作用 |
-|---|---|---|---|
-| 插件 | `enableHybrid` | `true` | 总开关；`false` 强制 `planner` |
-| 插件 | `viewMode` | `hybrid` | 精细策略：`planner` / `hybrid` / `analyst` |
-| 任务 | `analyst` | 继承 | `false` 关掉本任务的 analyst |
-| 任务 | `view_mode` | 继承 | 覆盖本任务的 `viewMode` |
-
-生效优先级：`analyst:false` 或 `enableHybrid:false` 一律回落到 `planner`；否则按 `view_mode` > `viewMode` > `hybrid` 取。
-
-传统非审计模式 = `mode:"objective"` + `analyst:false`：
-
-```json
-artex_run_task({ "goal": "...", "mode": "objective", "analyst": false, "view_mode": "planner" })
+```
+index.js / engine.js        插件入口、任务生命周期、注册表与存储
+scheduler.js / runner.js    主循环、规划轮、派发 worker、子会话 spawn/等待/中断
+graph-ops.js / graph.js     图操作与双图门面（model / views / store）
+model.js / store.js         领域模型（goal/intent/fact/finding/brief/analysis）、资源图与快照存储
+views.js / reporting.js     角色视图（planner/worker 投影）、状态与报告
+report.js                   收官报告渲染
+policy.js                   TOOL_NAMES + 角色白名单（拒哪些工具的唯一事实来源）
+config.js                   默认值与 normalizeConfig（未知键/非法枚举显式告警）
+usage.js                    按角色累计 provider usage
+session-indexer.js          子会话事件索引成过程库
+tools/*.js                  工具实现，按域分组：control / read / planner / worker / analysis
+tools/status-format.js      上下文治理：摘要渲染、原子写、输出硬上限
+prompts.js                  三类角色提示词
+view-api.js                 只读 Host Service，供视图插件读任务列表/快照
 ```
 
-analyst 的工具面被 `toolFilter` 收窄成「只读 + `artex_set_analysis`」：不能写事实和发现，不能派意图，不能证明目标，也不能改 brief。它的输出一般包括：一致性检查、被忽略的线索（带 trace id）、覆盖缺口或路径重排建议、下一步优先级。
-
-短任务基本不会触发 analyst。长审计里它主要用来纠偏：规划者的 brief 过时了、结论下得过强、或者资源锚点打架。
-
-## 4.3 数据、索引与权限
-
-- **分片持久化**：`task.json` 只存元数据和图状态，facts、findings、activities 分别落在 `facts.jsonl`、`findings.jsonl`、`activity.jsonl`。JSONL 行数超过内存上限两倍时压实，`task.json` 不回写全量集合。
-- **合并写**：运行中的高频改动走 `saveDebounceMs`（默认 500 毫秒）合并落盘；收官、停止、插件卸载时强制 flush。
-- **集合上限**：facts 2000、findings 500、hints 200；淘汰时保留 `goals[].evidence` 指向的节点，回读时同样保留。brief/analysis 的 citations 最多保留 200 条，所以事实内存保留量的上界是 `2000 + 200`（引用本身也被截到 200，防止保护集无界）。
-- **全局任务索引**：`~/.dsh/artex-index.json` 记录 `taskId → cwd` 和 owner，最多 500 条。换个工作区也能按 id 查到历史任务。
-- **读权限**：默认只有任务所有者和它的子会话能读；跨会话读取要打开 `allowCrossTaskRead: true`。
-- **只读 Host Service `artex`**：`view-api.js` 对外暴露 `ctx.provide('artex', api)`，供
-  `@local/dsh-artex-view` 一类视图插件读取：`listTasks({ sessionId, limit })` 返回该会话
-  拥有的任务（live + 磁盘索引，磁盘任务只读 `task.json` 元数据）；`taskSnapshot({ taskId,
-  sessionId })` 返回 `{ task, resources, resources_total, live, settling }`，磁盘任务复用
-  `engine.loadTask()` 合并 JSONL。方法只读、不落盘、不改引擎状态，鉴权口径与
-  `tools/read.js` 一致。视图插件再用 HTTP 路由把裁剪后的图/覆盖载荷推给浏览器。
-- **敏感数据**：`.artex/` 里可能有证据原文，不要提交到公开仓库。任务 id 经过白名单校验，不能拿来路径穿越。
-
-## 4.4 架构分层
-
-| 模块 | 职责 |
-|---|---|
-| `index.js` | 插件入口：建引擎、注册工具、订阅会话事件、生命周期 |
-| `config.js` | 默认值 + `normalizeConfig`（未知键、非法枚举、类型错误都会显式告警） |
-| `policy.js` | 角色工具策略的单一事实来源：`TOOL_NAMES` + `ROLE_ALLOW` 推导 deny |
-| `engine.js` | 门面：任务生命周期、注册表与存储、stop/dispose、persist |
-| `graph-ops.js` | 图操作门面：意图、事实、发现、brief、分析、目标、资源写回 |
-| `reporting.js` | snapshot / status / report |
-| `session-indexer.js` | 子会话事件索引（tool/call、tool/result、assistant/message） |
-| `scheduler.js` | 主循环、规划轮、派发 worker、突破停止、收尾与证明轮 |
-| `runner.js` | 子会话执行器：spawn、等待、中断、续跑提示 |
-| `analyst.js` | 独立分析的触发条件与只读运行 |
-| `usage.js` | 按角色累计 provider usage |
-| `graph.js` | 双图门面，re-export model / views / store |
-| `model.js` | 领域模型：goal / intent / fact / finding / brief / analysis |
-| `views.js` | 角色视图与查询：overview / plannerView / workerView / digest / delta / trace |
-| `store.js` | 资源图、任务快照、全局索引 |
-| `view-api.js` | 只读 Host Service `artex`：任务列表 / 任务快照（供视图插件） |
-| `prompts.js` | planner / worker / analyst 提示词 |
-| `report.js` | 最终报告渲染 |
-| `tools.js` | 23 个模型工具的组合入口 |
-| `tools/*.js` | 按域分组：control / read / planner / worker / analysis |
-| `tools-shared.js` | 工具共享层：schema、artifact、presenter、会话与角色校验、run 参数 |
-
-提示词走角色投影：`plannerView` 只留派意图、判目标要用的字段，`workerView` 只留「别重复、别越界」要用的字段；JSON 紧凑序列化，analysis 正文不在 JSON 里重复一遍。
-
-### 工程化
-
-- **CI**：`.github/workflows/test.yml`，push 和 PR 上跑 `npm test`（Node 22）。
-- **许可证**：MIT。
-- **版本约束**：`engines.dsh >= 0.1.6-alpha.2`。
-- **UI presenter**：`artifact` 统一注入 `presentCall` / `presentResult`，23 个工具都有中文标题、调用 kind 和完成/失败状态。
-- **打包**：`package.json` 的 `files` 覆盖全部运行模块、配置、图标、locale 和 LICENSE。
-
-## 4.5 安全与可靠性
-
-- `task_id` 走白名单，再加一层路径包含校验；非法 id 直接拒。
-- 读权限默认按 owner 和子会话收紧，跨任务读取要显式打开开关。
-- worker 只能写回自己领到的、正在运行的意图；批量写先整体校验再落图，失败不留半批。
-- `prove_goal` 拒绝负结果（目标本身是负向结论时要显式 `allow_negative`）、拒绝重复证明、拒绝拿 blueprint 作证据；**`confidence=inferred` 的推断事实也不能作证据**，想证就得先派意图把推断升级成 observed/finding。
-- **锚点硬校验**：意图的 `parents` 只能挂仍存在的 fact/finding，`resource_ids` 必须是已登记的资源 id；悬空引用整批拒绝，规划者按报错自纠。trim 证据淘汰保护集除了 `goals[].evidence` 还包括 brief/analysis 的 citations。
-- **事实服务端去重**：规范化 summary（小写、折叠空白）命中近期 500 条窗口、且**结局相同**时才跳过；结局不同（audit 里"先判无、重测命中"）按新证据入库，并双向标注 `supersedes` / `supersededBy`，报告里能看出结论被翻过。
-- **证据即时落盘**：fact/finding 写回立刻追加进 JSONL（不等合并写窗口），进程崩溃最多丢元数据指针，不丢已确认结论。
-- 事实写回不触发规划轮，避免事实风暴把 `maxRounds` 烧完；目标、意图、发现这三类事件按角色唤醒。
-- planner 瞬态失败按 `plannerRetries` + 错误分类退避重试（rate_limit 长冷却、context 类直接快速失败）；**子会话静默超时也计入重试**；持续失败且已经有事实时，以 `stopped` 收尾、保留现场。**态势投影构建失败走降级通道**：非强制轮不烧轮次直接跳过，连续 3 次才把错误交给收尾；强制轮用降级视图继续（planner 被提示只做收尾判定）。
-- **worker 启动瞬态错误自动重排一次**（rate_limit/server/network 回炉 open，下一拍重领）；启动后 provider 返回 `error` 的停止原因归一化成 `blocked` 而不是误判成 no_evidence。
-- **心跳查房**：在跑 worker 静默超过 2× 心跳先发自检提示，下个心跳仍静默则强制中断（记 `stopped`，可被 planner 重派）；只有真实子会话的写回/工具事件会重置静默时钟——引擎自己的巡检记录不算存活信号，否则中断永远不会发生。
-- **预算夹逼**：子会话墙钟恒等于 `min(timeoutMs, 任务剩余预算)`，planner、worker、analyst 一视同仁；任务结束回收持久化层内存状态，启动落盘失败不留孤儿 runtime。
-- worker 命名单调递增跨轮不重名；`activity.jsonl` 单卷超 64MB 轮转为 `activity.1.jsonl`；任务终态回收内存后不再追加 JSONL（避免已落盘 id 集被清空后整批重写）。
-- 写工具（`artex_record_fact` / `artex_add_intent` / `artex_report_finding`）在锚点校验阶段可能**异步拒绝**（校验要读资源图），调用方必须 `await`。
-- **`/api/artex` 来源校验**：回环地址只是必要条件——Host 必须是 `localhost`/`127.0.0.1`/`[::1]`（挡 DNS rebinding），Origin 缺省、`app:` 或与 Host 同源（含回环别名与端口漂移）才放行；跨站页面拿不到响应也发不出写请求。
-- **workspace store 有上限**：按 cwd 缓存的 store 最多 32 个（LRU），有活任务或有待写内容的条目不淘汰；HTTP 的 `cwd` 只接受绝对路径。
-- **列表不再按工作区总量读盘**：先按索引里的 `ownerSession` 过滤，只有索引缺失的才回退读 task.json；`loadMeta` 按 mtime 缓存。
-- **撤回会连带回退目标**：`artex_retract_fact` 之后，凡是拿这条 fact 作证据的 goal 一律回退 `open`、清空 evidence，并在报告里标 `evidence_retracted`；节点本身留档。
-- **恢复会重置轮次额度**：`artex_resume_task` 把 `round` 归零（累加 `resumes`）并解除终态写保护，恢复后产生的事实/发现照常追加 JSONL。
-- 运行状态、usage、settling、降级原因这些字段都写进任务快照/报告（含 goal 的 prove 理由与证据结局），`facts/findings` 的累计真值与内存窗口分开计数并标 `truncated`；被取代/被撤回的事实会在 planner 视图、worker 视图与 digest 里标注。
-- 索引写入用目录锁，锁内合并；`status` 的历史列表只列 owner 自己的任务。
-
----
-
-## 5. 与 ARTEX 的差异
-
-**有意做的简化**
-
-- **goals 子代理**：ARTEX 建任务时先起一个 `goals` agent 抽约束、把目标拆成可核验的结果。这里省掉这一次模型调用，改由调用方直接给 `goals`、`constraints`（也可以退化成单目标）；约束照样以最高优先级注入两个角色。
-- **资产图的程序化层级**：ARTEX 用程序算 `root_domain→subdomain→service→endpoint` 的父子关系和去重键。通用场景没有这种固定层级，这里退化成 `(type, key||name)` 去重加自由 `attrs`。
-- **pause/resume**：用 `artex_stop_task` 加重新 `artex_start_task` 代替；DSH 的子会话本身也能用 `send_message` 续跑。
-- **智能体边界**：ARTEX 靠数据库绑定实现「planner 看不到 worker 的工具」；这里用 spawn provider 的 `toolFilter` 在子会话作用域内收掉越界工具，再在 execute 里按会话身份校验一次。
-
-**还没做的**
-
-- reporter（发现后自动写 Markdown 报告）、retester（复测）、cold digest 冷压缩、coverage 覆盖度、跨任务只读继承（`source_task_ids`）、把 `steer_work`/`kill_work` 开放成 planner 工具（目前只由引擎在预算或停止时使用）、finding 与流量证据的绑定。
-
----
-
-## 6. 测试
-
-```powershell
-node test/graph-smoke.mjs          # 图内核、视图、23 个工具 schema、presenter
-node test/engine-smoke.mjs         # 完整闭环、usage、status/report、stop 守卫
-node test/modes-smoke.mjs          # objective/audit、突破停兄弟、证明轮、analyst
-node test/persistence-smoke.mjs    # 分片、JSONL 回填、合并写、索引
-node test/security-smoke.mjs       # 读 ACL、策略一致性、配置归一化
-node test/audit-regressions-smoke.mjs  # 审计回归
-node test/status-output-smoke.mjs  # 上下文治理：摘要体积/落盘/sections/max_chars/overview 有界
+```bash
+node test/graph-smoke.mjs               # 图内核、视图、25 个工具 schema、presenter
+node test/engine-smoke.mjs              # 完整闭环、usage、status/report、stop 守卫
+node test/modes-smoke.mjs               # objective/audit、突破停兄弟、证明轮、analyst
+node test/persistence-smoke.mjs         # 分片、JSONL 回填、合并写、索引
+node test/security-smoke.mjs            # 读 ACL、策略一致性、配置归一化
+node test/audit-regressions-smoke.mjs   # 审计回归
+node test/status-output-smoke.mjs       # 上下文治理：摘要体积/落盘/sections/max_chars
+node test/view-api-smoke.mjs            # 只读 service 的任务列表与快照
+node test/roadmap-smoke.mjs             # 防线/审计/能力/运营各层回归
 ```
 
-`test/engine-smoke.mjs` 用脚本化的假子会话驱动真实引擎：规划者按态势派意图，worker 写回事实和发现，规划者再用证据标记目标，最后断言 `status=completed`、写回计数、trace 检索命中，以及子会话确实收到了越界工具的 deny 列表。
+`npm test` 串起全部九项；CI 在 push 与 PR 上跑 Node 22。测试里的子会话是脚本化假实现，不需要真实模型调用。
 
 ---
 
-## 7. 免责声明与合法使用
+## 使用边界与许可
 
-本项目是**编排框架**，本身不含漏洞扫描器、exploit 或攻击载荷。它负责调度子会话、汇总证据、维护计划；真正干活的是宿主提供的工具（Shell、文件读写、HTTP 等）。换句话说，**模型生成的每一条命令，都是以您的身份、在您的权限下执行的**。
+本项目是**编排框架**：不含扫描器、exploit 或攻击载荷；真正干活的是宿主提供的工具，**模型生成的每条命令都以你的身份、在你的权限下执行**。
 
-### 可以用于
+可以用于：自有或已获书面授权的系统与代码仓库；自建靶场、CTF、隔离虚拟机；对自己项目的只读审计与一致性核对。
 
-- 您拥有、或已拿到**书面授权**的系统、资产和代码仓库。
-- 自建的实验环境、靶场、CTF，以及隔离的虚拟机或容器。
-- 对自己项目的代码、配置、日志做只读审计和一致性核对。
+不得用于：未授权对第三方系统做探测/枚举/利用/取数；绕过访问控制或规避审计；违反法律法规、云服务商条款或组织安全策略的行为。
 
-### 不得用于
+责任划分：使用后果由使用者承担；软件按 MIT「按原样」提供，不附带担保。**模型会出错**——它可能把"看起来像"当成"已验证"，也可能生成不可逆命令，执行前请复核，尽量在只读或一次性环境里跑。
 
-- 未经授权对任何第三方系统、网络、设备做探测、枚举、利用或数据获取。
-- 绕过访问控制、规避审计，或在生产环境执行破坏性操作。
-- 违反所在地区法律法规、云服务商条款，或所在组织安全策略的任何行为。
+几条实践建议：用 `constraints` 写死允许的网段/主机与禁止操作；用 `budget_ms`、`max_rounds`、`max_workers` 控制规模；生产环境先 dry-run；需要可核对结论时用 `mode:"audit"` 并读覆盖矩阵。
 
-### 责任划分
+---
 
-- 使用行为及其后果由您自行承担。作者与贡献者不对误用、数据丢失、服务中断、合规处罚或任何间接损失负责。软件按 **MIT 许可**「按原样」提供，不附带任何明示或默示担保。
-- **模型会出错**。它可能把「看起来像」当成「已验证」，也可能生成危险或不可逆的命令。执行前请自行复核，尽量在只读或一次性环境里跑。
-- 任务产物放在 `.artex/`（事实、发现、证据、完整过程日志），可能含主机名、端口、路径、命令输出甚至凭据片段。**不要提交到公开仓库**，仓库自带的 `.gitignore` 已经忽略了 `.artex/`。
-
-### 几条使用建议
-
-- 用 `constraints` 写死边界（允许的网段和主机、禁止的操作、只读要求）。它会以最高优先级注入规划者和每个执行者，压过一切探索偏好。
-- 用 `max_workers`、`max_rounds`、`budget_ms` 控制规模，别让它无止境地跑。
-- 在隔离环境（虚拟机或容器）里用最小权限账户运行；对生产环境先 dry-run，再人工复核。
-- 需要可核对的覆盖结论时用 `mode: "audit"`，并且去看报告里的「被中止或判死的路径」和未覆盖项，而不是只看一眼 `completed`。
+MIT © 见 [LICENSE](LICENSE)。上游项目：[ARTEX](https://github.com/Autumn-27/ARTEX)；宿主：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)。
